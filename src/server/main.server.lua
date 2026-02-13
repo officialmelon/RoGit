@@ -3,9 +3,9 @@ Full "rewrite" of git in luau
 ]]
 
 local arguments = require(script.Parent.arguments)
+local git = require(script.Parent.git)
 
-arguments.createArgument("version", "v", function ()
-    print "Version 0.33"
-end)
-
-arguments.executeArgument("v")
+--[[
+Test execution
+]]
+arguments.executeArgument("add", ".")

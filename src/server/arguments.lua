@@ -5,9 +5,15 @@ arguments.existingArguments = {
 }
 
 --[[
+Returns existingArguments
+]]
+function arguments.returnAllArguments()
+    return arguments.existingArguments
+end
+
+--[[
 Retrieves argument based on input
 ]]
-
 function arguments.retrieveArgument(argumentOrAlias)
     -- Checking before retrieving
     assert(type(argumentOrAlias) == "string", "argument (or alias) is either nil or not a string!, received: " .. argumentOrAlias)

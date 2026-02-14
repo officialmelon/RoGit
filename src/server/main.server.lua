@@ -9,5 +9,4 @@ local git = require(script.Parent.git)
 Test execution
 ]]
 arguments.executeArgument("init", ".")
-arguments.executeArgument("add", ".")
-arguments.executeArgument("pull")
+arguments.executeArgument("add", "Workspace.ExampleInstance")

@@ -126,6 +126,23 @@ local function warn_assert(condition, message)
     return
 end
 
+local function store_instance_hash(desc)
+    
+    assert(desc, "no instance supplied!")
+    local hash = calculate_hash(desc)
+    local dir = bash.createFolder(bash.getGitFolderRoot(), "objects/" .. string.sub(hash, 1, 2))
+        
+    -- create the file (create subfolder, first 2 chars of hash. then remove first 2 chars of content and set as name, compress)
+    bash.createFile(dir, string.sub(hash, 3), zlib.compressZlib(serialize_instance(desc)))
+    
+    -- Modify index, newline, hash and fullname
+    bash.modifyFileContents(bash.getGitFolderRoot(), "index", (
+        bash.getFileContents(bash.getGitFolderRoot(), "index") ..
+        "\n" ..
+        hash .. " " .. desc:GetFullName()
+    )) -- create index
+end
+
 --[[
 Commands:
 version
@@ -169,23 +186,34 @@ arguments.createArgument("add", "a", function (...)
     local getDirectoryOut = bash.getDirectoryOrFile(game.Workspace, packed[1])
     assert(getDirectoryOut, "fatal: pathspec '" .. packed[1] .. "' did not match any files ")
 
+    -- is root? set to game
     if packed[1] == "." then 
         local root = bash.trackingRoot
         for _, service in root do 
             for _, desc in service:GetDescendants() do 
-                if not desc:IsDescendantOf(bash.getGitFolderRoot()) then
-                    local hash = calculate_hash(desc)
-                    local dir = bash.createFolder(bash.getGitFolderRoot(), "objects/" .. string.sub(hash, 1, 2))
-                    
-                    -- create the file (create subfolder, first 2 chars of hash. then remove first 2 chars of content and set as name, compress)
-                    bash.createFile(dir, string.sub(hash, 3), zlib.compressZlib(serialize_instance(desc)))
+                if not desc:IsDescendantOf(bash.getGitFolderRoot()) then 
+                    store_instance_hash(desc)
+                end
+            end
+        end
+    else -- single file or folder
+        packed = string.split(packed[1], ".")
+        local currObj = game
+        for i = 1, #packed do
+            local path = packed[i]
+            if currObj and currObj:FindFirstChild(path) then 
+                currObj = currObj:FindFirstChild(path)
+            else 
+                 currObj = nil
+                 break
+            end
+        end
 
-                    -- Modify index, newline, hash and fullname
-                    bash.modifyFileContents(bash.getGitFolderRoot(), "index", (
-                        bash.getFileContents(bash.getGitFolderRoot(), "index") ..
-                        "\n" ..
-                        hash .. " " .. desc:GetFullName()
-                    )) -- create index
+        if currObj then 
+            store_instance_hash(currObj)
+            if #currObj:GetChildren() >= 1 then -- probably redundant, but had errors w/o
+                for _, desc in currObj:GetDescendants() do 
+                    store_instance_hash(desc)
                 end
             end
         end

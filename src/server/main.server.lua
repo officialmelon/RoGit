@@ -9,4 +9,5 @@ local git = require(script.Parent.git)
 Test execution
 ]]
 arguments.executeArgument("init", ".")
-arguments.executeArgument("add", "Workspace.ExampleInstance")
+arguments.executeArgument("add", ".")
+arguments.executeArgument("commit", "-m", '"Initial Commit"')

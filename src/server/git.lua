@@ -1,6 +1,7 @@
 local git = {}
 
 local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
 
 local config = require(script.Parent.config)
 local arguments = require(script.Parent.arguments)
@@ -280,6 +281,31 @@ arguments.createArgument("pull", "", function (...)
     end
 end)
 
+arguments.createArgument("commit", "", function (...)
+    local tuple = {...}
+
+    if tuple[1] == "-m" then -- commit message
+        bash.createFile(bash.getGitFolderRoot(), "COMMIT_EDITMSG", tuple[2]:gsub('"', '')) -- create file for edit msg
+    end
+
+    local index = bash.getFileContents(bash.getGitFolderRoot(), "index")
+    
+    local jointString = ""
+    local split_index = string.split(index, "\n")
+    split_index[1] = nil
+    
+    -- loop through index
+    for _, ind in split_index do  
+        local hash = string.split(ind, " ")[1] -- split by space
+        local fullName = string.split(string.split(ind, " ")[2], ".") -- split by space, then by .
+        
+        jointString = jointString .. "\n" .. hash
+    end
+
+    bash.createFile(bash.getGitFolderRoot().refs.heads, "master", jointString) -- create file for commiting
+    
+end)
+
 --[[
 commands:
 init
@@ -335,6 +361,76 @@ arguments.createArgument("init", "", function (...)
     -- this file is usually created at runtime (e.g. during add operations) however its much easier to just create it here.
     bash.createFile(bash.getGitFolderRoot(), "index", "") 
     
+end)
+
+--[[
+commands:
+clone
+
+clones a git repository
+]]
+
+function download(url, name, parent)
+    local sc = Instance.new("StringValue")
+    sc.Parent = parent 
+    sc.Name = name
+    local req = HttpService:RequestAsync({
+        Url = url
+    })
+    sc.Value = req.Body
+end
+
+function recursive_download(body, parent)
+    for _, file in body do
+        if not file.download_url and file.url then --// Is a folder 
+        
+            local req = HttpService:RequestAsync({
+                Url = file.url
+            })
+
+            bash.createFolder(parent, file.path)
+            
+            recursive_download(HttpService:JSONDecode(req.Body), parent)
+        else 
+            print("Cloning:", file.path, "Size:", file.size)
+            download(file.download_url, file.name, bash.getDirectoryOrFile(parent, file.path))
+        end
+    end
+end
+
+arguments.createArgument("clone", "", function (...)
+    assert((#{...} >= 1), "No argument supplied!")
+    local tuple = {...}
+
+    local repo = tuple[1]
+
+    if not string.find(repo, "github") then -- no non github support, since using their api directly ):
+        warn_assert("Sorry! Only GitHub repositories are supported, due to ROBLOX api limitations.")
+    end
+    -- cleaning time!
+    repo = repo:gsub("https://github.com/", "")
+    repo = repo:gsub("git@github.com:", "")
+    repo = repo:gsub(".git", "")
+
+    -- cloning :P
+
+    print("Cloning into '" .. string.split(repo, "/")[2] .. "'")
+    local base_url = "https://api.github.com"
+    
+    local req = HttpService:RequestAsync({
+        Url = "https://api.github.com/repos/" .. repo .. "/contents"
+    })
+
+    if not req.Success and req.StatusCode ~= 200 then 
+        warn_assert("Request error! Status: " .. req.StatusCode)
+    end
+ 
+    -- download contents
+    local body = HttpService:JSONDecode(req.Body)
+    local parent = bash.createFolder(workspace, string.split(repo, "/")[2])
+    recursive_download(body, parent)
+
+    print("Repository " .. "'" .. string.split(repo, "/")[2] .. "'" .. " Cloned")
 end)
 
 return git

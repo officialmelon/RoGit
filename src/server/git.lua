@@ -1,6 +1,7 @@
 local git = {}
 
 local HttpService = game:GetService("HttpService")
+local ScriptRegistrationService = game:GetService("ScriptRegistrationService")
 local Workspace = game:GetService("Workspace")
 
 local config = require(script.Parent.config)
@@ -9,6 +10,8 @@ local arguments = require(script.Parent.arguments)
 local hashlib = require(script.Parent.libs.hashlib)
 local zlib = require(script.Parent.libs.zlib)
 local bash = require(script.Parent.bash)
+
+local ignore_patterns = nil
 
 --[[
 Utilities
@@ -70,6 +73,66 @@ local function deserialize_property(prop, propType)
     return prop
 end
 
+-- based off git implementations
+local function write_object(typeName, content)
+    local header = typeName .. " " .. tostring(#content) .. "\0"
+    local full = header .. content
+    local sha = hashlib.sha1(full)
+
+    local dir = bash.createFolder(
+        bash.getGitFolderRoot(),
+        "objects/" .. string.sub(sha, 1, 2)
+    )
+
+    if not bash.getFileContents(dir, string.sub(sha, 3)) then
+        bash.createFile(
+            dir,
+            string.sub(sha, 3),
+            zlib.compressZlib(full)
+        )
+    end
+
+    return sha
+end
+
+local function read_object(sha)
+    local dir = bash.getGitFolderRoot().objects[string.sub(sha, 1, 2)]
+    local data = bash.getFileContents(dir, string.sub(sha, 1, 2))
+
+    local raw = zlib.decompressZlib(data)
+    local nullIndex = string.find(raw, "\0", 1, true)
+
+    local header = string.sub(raw, 1, nullIndex - 1)
+    local content = string.sub(raw, nullIndex + 1)
+
+    local typeName = string.split(header, "")[1]
+end
+
+local function write_blob(serializedInstance)
+    return write_object("blob", serializedInstance)
+end
+
+local function read_index()
+    local raw = bash.getFileContents(bash.getGitFolderRoot(), "index")
+    if raw == "" then
+        return {}
+    end
+
+    return HttpService:JSONDecode(raw)
+end
+
+local function write_index(tbl)
+    assert(tbl, "Index table is nil!")
+
+    local encoded = HttpService:JSONEncode(tbl)
+
+    bash.modifyFileContents(
+        bash.getGitFolderRoot(),
+        "index",
+        encoded
+    )
+end
+
 local function serialize_instance(instance)
     -- Check instance exists
     assert(typeof(instance) == "Instance", "no instance passed or instance is not a instance")
@@ -127,6 +190,154 @@ local function warn_assert(condition, message)
     return
 end
 
+local function stage_instance(instance, index)
+    local fullPath = instance:GetFullName()
+
+    local serialized = serialize_instance(instance)
+    local blobSha = write_blob(serialized)
+
+    index[fullPath] = {
+        mode = "100644",
+        sha = blobSha
+    }
+end
+
+local function load_ignore_patterns()
+    if ignore_patterns ~= nil then
+        return
+    end
+
+    ignore_patterns = {}
+    local ignore_file = bash.getGitFolderRoot().Parent:FindFirstChild(".rogitignore")
+    if ignore_file then
+        local content = ignore_file.Value
+        for line in string.gmatch(content, "[^\r\n]+") do
+            if string.sub(line, 1, 1) ~= "#" and #line > 0 then
+                table.insert(ignore_patterns, line)
+            end
+        end
+    end
+end
+
+local function is_ignored(path)
+    load_ignore_patterns()
+
+    for _, pattern in ipairs(ignore_patterns) do
+        if string.sub(path, 1, #pattern) == pattern then
+            return true
+        end
+    end
+    return false
+end
+
+local function stage_recursive(instance, index)
+    if is_ignored(instance:GetFullName()) then return end
+
+    stage_instance(instance, index)
+
+    for _, child in ipairs(instance:GetChildren()) do
+        if not child:IsDescendantOf(bash.getGitFolderRoot()) then
+            stage_recursive(child, index)
+        end
+    end
+end
+
+local function write_tree(index)
+    local tree_structure = {}
+    
+    for path, data in pairs(index) do 
+        local segments = string.split(path, ".")
+        local current_level = tree_structure
+        for i=1, #segments - 1 do 
+            local segment = segments[i]
+            current_level[segment] = current_level[segment] or {}
+            current_level = current_level[segment]
+        end
+        current_level[segments[#segments]] = {
+            type = "blob",
+            sha = data.sha,
+            mode = data.mode
+        }
+    end
+
+    local function build_tree_objects(structure)
+        local tree_content = ""
+        local entries = {}
+
+        for name, item in pairs(structure) do
+            table.insert(entries, {name=name, item=item})
+        end
+
+        for _, entry in entries do
+            local name = entry.name
+            local item = entry.item
+            local sha
+            local type
+
+            if item.type == "blob" then
+                sha=item.sha
+                type = "blob"
+                tree_content = string.format("%s %s\0%s", item.mode, name, hashlib.hex_to_bin(sha))
+            else
+                sha = build_tree_objects(item)
+                type = "tree"
+                tree_content = string.format("40000 %s\0%s", name, hashlib.hex_to_bin(sha))
+            end
+        end
+
+        return write_object("tree", tree_content)
+    end
+    
+    return build_tree_objects(tree_structure)
+end
+
+local function get_ref(ref_path)
+    local content = bash.getFileContents(bash.getGitFolderRoot(), ref_path)
+    if not content then return nil end
+
+    if string.sub(content, 1, 5) == "ref: " then -- sym ref
+        return get_ref(string.sub(content, 6))
+    else -- sha
+        return content
+    end
+end
+
+local function update_ref(ref_path, sha)
+    local function do_update(full_path, sha_content)
+        local segments = string.split(full_path, "/")
+        local filename = table.remove(segments)
+        
+        local parent_folder = bash.getGitFolderRoot()
+        if #segments > 0 then
+            local dir_path = table.concat(segments, "/")
+            parent_folder = bash.getDirectoryOrFile(parent_folder, dir_path)
+        end
+
+        if parent_folder and parent_folder:FindFirstChild(filename) then
+            bash.modifyFileContents(parent_folder, filename, sha_content)
+        else
+            bash.createFile(parent_folder, filename, sha_content)
+        end
+    end
+
+    local function get_file_content_by_path(path)
+        local file = bash.getDirectoryOrFile(bash.getGitFolderRoot(), path)
+        if file and file:IsA("StringValue") then
+            return file.Value
+        end
+        return nil
+    end
+
+    local content = get_file_content_by_path(ref_path)
+
+    if content and string.sub(content, 1, 5) == "ref: " then
+        local symbolic_path = string.sub(content, 6)
+        do_update(symbolic_path, sha)
+    else
+        do_update(ref_path, sha)
+    end
+end
+
 local function store_instance_hash(desc)
     
     assert(desc, "no instance supplied!")
@@ -178,48 +389,51 @@ Adds files to be commited
 ]]
 
 arguments.createArgument("add", "a", function (...)
-    -- Check and hint if no tuple supplied then or not initialized
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
-    warn_assert(..., "hint: Maybe you wanted to say 'git add .'?")
+    assert(bash.getGitFolderRoot(),
+        "fatal: not a git repository (or any of the parent directories): .git")
 
-    local packed = {...}
+    local args = {...}
+    warn_assert(#args > 0,
+        "hint: Maybe you wanted to say 'git add .'?")
 
-    local getDirectoryOut = bash.getDirectoryOrFile(game.Workspace, packed[1])
-    assert(getDirectoryOut, "fatal: pathspec '" .. packed[1] .. "' did not match any files ")
+    local target = args[1]
+    local index = read_index()
 
-    -- is root? set to game
-    if packed[1] == "." then 
-        local root = bash.trackingRoot
-        for _, service in root do 
-            for _, desc in service:GetDescendants() do 
-                if not desc:IsDescendantOf(bash.getGitFolderRoot()) then 
-                    store_instance_hash(desc)
+    -- git add . (.=root)
+    if target == "." then
+        for _, service in ipairs(bash.trackingRoot) do
+            for _, obj in ipairs(service:GetDescendants()) do
+                if not obj:IsDescendantOf(bash.getGitFolderRoot()) and not is_ignored(obj:GetFullName()) then
+                    stage_instance(obj, index)
                 end
             end
         end
-    else -- single file or folder
-        packed = string.split(packed[1], ".")
-        local currObj = game
-        for i = 1, #packed do
-            local path = packed[i]
-            if currObj and currObj:FindFirstChild(path) then 
-                currObj = currObj:FindFirstChild(path)
-            else 
-                 currObj = nil
-                 break
-            end
-        end
 
-        if currObj then 
-            store_instance_hash(currObj)
-            if #currObj:GetChildren() >= 1 then -- probably redundant, but had errors w/o
-                for _, desc in currObj:GetDescendants() do 
-                    store_instance_hash(desc)
-                end
-            end
+        write_index(index)
+        return
+    end
+
+    local segments = string.split(target, ".")
+    local currObj = game
+
+    for _, segment in ipairs(segments) do
+        if currObj and currObj:FindFirstChild(segment) then
+            currObj = currObj:FindFirstChild(segment)
+        else
+            currObj = nil
+            break
         end
     end
+
+    assert(currObj,
+        "fatal: pathspec '" .. target .. "' did not match any files")
+
+    -- stage la object + children 
+    stage_recursive(currObj, index)
+
+    write_index(index)
 end)
+
 
 --[[
 commands:
@@ -281,30 +495,88 @@ arguments.createArgument("pull", "", function (...)
     end
 end)
 
-arguments.createArgument("commit", "", function (...)
+arguments.createArgument("rm", "", function (...)
     local tuple = {...}
+    local is_cached = false
+    local path_to_remove
 
-    if tuple[1] == "-m" then -- commit message
-        bash.createFile(bash.getGitFolderRoot(), "COMMIT_EDITMSG", tuple[2]:gsub('"', '')) -- create file for edit msg
+    -- basic arg parsing
+    if tuple[1] == "--cached" then
+        is_cached = true
+        path_to_remove = tuple[2]
+    else
+        path_to_remove = tuple[1]
     end
 
-    local index = bash.getFileContents(bash.getGitFolderRoot(), "index")
-    
-    local jointString = ""
-    local split_index = string.split(index, "\n")
-    split_index[1] = nil
-    
-    -- loop through index
-    for _, ind in split_index do  
-        local hash = string.split(ind, " ")[1] -- split by space
-        local fullName = string.split(string.split(ind, " ")[2], ".") -- split by space, then by .
-        
-        jointString = jointString .. "\n" .. hash
+    assert(path_to_remove, "fatal: no path specified")
+
+    local index = read_index()
+
+    if not index[path_to_remove] then
+        warn("fatal: pathspec '" .. path_to_remove .. "' did not match any files")
+        return
     end
 
-    bash.createFile(bash.getGitFolderRoot().refs.heads, "master", jointString) -- create file for commiting
-    
+    -- remove from index
+    index[path_to_remove] = nil
+    write_index(index)
+
+    if not is_cached then
+        -- also remove from workspace
+        local segments = string.split(path_to_remove, ".")
+        local currObj = game
+        for _, segment in ipairs(segments) do
+            if currObj and currObj:FindFirstChild(segment) then
+                currObj = currObj:FindFirstChild(segment)
+            else
+                currObj = nil
+                break
+            end
+        end
+        if currObj and currObj ~= game then
+            currObj:Destroy()
+        end
+    end
+
+    print("rm '" .. path_to_remove .. "'")
 end)
+
+arguments.createArgument("commit", "", function(...)
+    local tuple = { ... }
+    local message = ""
+
+    if tuple[1] == "-m" and tuple[2] then
+        message = tuple[2]:gsub('"', '')
+    else
+        message = "default commit message"
+    end
+
+    local parent_sha = get_ref("HEAD")
+
+    local index = read_index()
+    local tree_sha = write_tree(index)
+
+    local commit_content = "tree " .. tree_sha .. "\n"
+
+    if parent_sha and parent_sha ~= "" then
+        commit_content = commit_content .. "parent " .. parent_sha .. "\n"
+    end
+
+    local timestamp = os.time()
+    commit_content = commit_content ..
+        string.format("author roGit <ro-git@example.com> %d +0000\n", timestamp)
+    commit_content = commit_content ..
+        string.format("committer roGit <ro-git@example.com> %d +0000\n", timestamp)
+
+    commit_content = commit_content .. "\n" .. message
+
+    local commit_sha = write_object("commit", commit_content)
+
+    update_ref("HEAD", commit_sha)
+
+    print("Committed to master, commit SHA: " .. commit_sha)
+end)
+
 
 --[[
 commands:
@@ -359,7 +631,8 @@ arguments.createArgument("init", "", function (...)
     ]])
 
     -- this file is usually created at runtime (e.g. during add operations) however its much easier to just create it here.
-    bash.createFile(bash.getGitFolderRoot(), "index", "") 
+    bash.createFile(bash.getGitFolderRoot(), "index", "")
+    bash.createFile(bash.getGitFolderRoot().Parent, ".rogitignore", "# Instances to ignore in ro-git\n")
     
 end)
 

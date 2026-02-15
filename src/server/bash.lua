@@ -80,9 +80,11 @@ function Bash.getFileContents(parent, name)
     assert(typeof(parent) == "Instance", "Parent doesnt exist, or not instance!")
     assert(name, "File name is nil!")
     
-    assert(parent:FindFirstChild(name), "File doesnt exist!")
+    local file = parent:FindFirstChild(name)
     
-    return parent:FindFirstChild(name).Value
+    if not file then return nil end
+
+    return file.value
 end
 
 function Bash.modifyFileContents(parent, name, content)

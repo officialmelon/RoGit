@@ -8,7 +8,4 @@ local git = require(script.Parent.git)
 --[[
 Test execution
 ]]
-arguments.executeArgument("init", ".")
-arguments.executeArgument("add", ".")
-arguments.executeArgument("commit", "-m", '"Initial Commit"')
--- workspace.ExampleInstance:Remove()
+arguments.executeArgument("clone", "https://github.com/officialmelon/openradar.git")

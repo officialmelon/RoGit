@@ -10,8 +10,11 @@ local arguments = require(script.Parent.arguments)
 local hashlib = require(script.Parent.libs.hashlib)
 local zlib = require(script.Parent.libs.zlib)
 local bash = require(script.Parent.bash)
+local git_proto = require(script.Parent.libs.git_proto)
 
 local ignore_patterns = nil
+
+local TYPE_NAMES = {[1]="Commit", [2]="Tree", [3]="Blob", [4]="Tag", [6]="OFS-Delta", [7]="Ref-Delta"}
 
 --[[
 Utilities
@@ -97,15 +100,23 @@ end
 
 local function read_object(sha)
     local dir = bash.getGitFolderRoot().objects[string.sub(sha, 1, 2)]
-    local data = bash.getFileContents(dir, string.sub(sha, 1, 2))
+    if not dir then return nil end
+
+    local data = bash.getFileContents(dir, string.sub(sha, 3))
+    if not data then return nil end
 
     local raw = zlib.decompressZlib(data)
+    if not raw then return nil end
+
     local nullIndex = string.find(raw, "\0", 1, true)
+    if not nullIndex then return nil end
 
     local header = string.sub(raw, 1, nullIndex - 1)
     local content = string.sub(raw, nullIndex + 1)
 
-    local typeName = string.split(header, "")[1]
+    local typeName = string.split(header, " ")[1]
+
+    return {type = typeName, content = content}
 end
 
 local function write_blob(serializedInstance)
@@ -277,11 +288,11 @@ local function write_tree(index)
             if item.type == "blob" then
                 sha=item.sha
                 type = "blob"
-                tree_content = string.format("%s %s\0%s", item.mode, name, hashlib.hex_to_bin(sha))
+                tree_content = tree_content .. string.format("%s %s\0%s", item.mode, name, hashlib.hex_to_bin(sha))
             else
                 sha = build_tree_objects(item)
                 type = "tree"
-                tree_content = string.format("40000 %s\0%s", name, hashlib.hex_to_bin(sha))
+                tree_content = tree_content .. string.format("40000 %s\0%s", name, hashlib.hex_to_bin(sha))
             end
         end
 
@@ -338,22 +349,229 @@ local function update_ref(ref_path, sha)
     end
 end
 
-local function store_instance_hash(desc)
+local function get_content_lines(sha)
+    if not sha then return 0 end
+
+    local blob = read_object(sha)
+    if not blob or blob.type ~= "blob" then return 0 end
+
+    local success, props = pcall(function() return HttpService:JSONDecode(blob.content) end)
+    if not success then return 1 end
+
+    local className = ""
+    for _, prop in ipairs(props) do
+        if prop.name == "ClassName" then
+            className = prop.value
+            break
+        end
+    end
     
-    assert(desc, "no instance supplied!")
-    local hash = calculate_hash(desc)
-    local dir = bash.createFolder(bash.getGitFolderRoot(), "objects/" .. string.sub(hash, 1, 2))
-        
-    -- create the file (create subfolder, first 2 chars of hash. then remove first 2 chars of content and set as name, compress)
-    bash.createFile(dir, string.sub(hash, 3), zlib.compressZlib(serialize_instance(desc)))
-    
-    -- Modify index, newline, hash and fullname
-    bash.modifyFileContents(bash.getGitFolderRoot(), "index", (
-        bash.getFileContents(bash.getGitFolderRoot(), "index") ..
-        "\n" ..
-        hash .. " " .. desc:GetFullName()
-    )) -- create index
+    if className == "Script" or className == "LocalScript" or className == "ModuleScript" then
+        local source = ""
+        for _, prop in ipairs(props) do
+            if prop.name == "Source" then
+                source = prop.value or ""
+                break
+            end
+        end
+        if source == "" then return 1 end
+        local _, count = string.gsub(source, "\n", "")
+        return count + 1
+    else
+        return 1
+    end
 end
+
+local function return_urls(url: string)
+    return {url .. "/info/refs?service=git-upload-pack", url .. "/git-upload-pack"}
+end
+
+local function discoverRefs(url: string)
+	local ok, res = pcall(function()
+        return HttpService:RequestAsync({
+            Url = return_urls(url)[1],
+            Method = "GET",
+        })
+    end)
+
+	assert(ok, res)
+	assert(res.StatusCode == 200, "Discovery failed: " .. res.StatusCode)
+
+	local buf = buffer.fromstring(res.Body)
+	local cursor = 0
+	local headSha = nil
+
+	while cursor < buffer.len(buf) do
+		local data, next = git_proto.decodePkt(buf, cursor)
+		cursor = next
+		if data then
+			local sha, name = git_proto.parseRef(data)
+			if sha and not headSha then
+				headSha = sha
+			end
+		end
+	end
+
+	assert(headSha, "Could not find HEAD sha in discovery response")
+	return headSha
+end
+
+local function fetchPackfile(url: string, sha: string)
+	local wantPkt = git_proto.encodePkt(buffer.fromstring("want " .. sha .. " side-band-64k ofs-delta\n"))
+	local donePkt = git_proto.encodePkt(buffer.fromstring("done\n"))
+	local body = buffer.tostring(wantPkt) .. buffer.tostring(git_proto.flush()) .. buffer.tostring(donePkt)
+
+	local res = HttpService:RequestAsync({
+		Url = return_urls(url)[2],
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/x-git-upload-pack-request",
+			["Accept"] = "application/x-git-upload-pack-result",
+		},
+		Body = body,
+	})
+	assert(res.StatusCode == 200, "Upload-pack failed: " .. res.StatusCode)
+
+	local resBuf = buffer.fromstring(res.Body)
+	local cursor = 0
+	local pieces = {}
+	local totalSize = 0
+
+	while cursor < buffer.len(resBuf) do
+		local data, next = git_proto.decodePkt(resBuf, cursor)
+		cursor = next
+		if data then
+			local channel = buffer.readu8(data, 0)
+			if channel == 1 then
+				local size = buffer.len(data) - 1
+				local piece = buffer.create(size)
+				buffer.copy(piece, 0, data, 1, size)
+				table.insert(pieces, piece)
+				totalSize += size
+			elseif channel == 2 then
+				print("remote:", buffer.tostring(data):gsub("[\r\n]+", ""))
+			elseif channel == 3 then
+				error("remote error: " .. buffer.tostring(data))
+			end
+		end
+	end
+
+	local fullPack = buffer.create(totalSize)
+	local write = 0
+	for _, piece in pieces do
+		buffer.copy(fullPack, write, piece, 0, buffer.len(piece))
+		write += buffer.len(piece)
+	end
+
+	return fullPack
+end
+
+local function unpackObjects(fullPack)
+	local version, objCount, cursor = git_proto.parsePackHeader(fullPack, 0)
+	print(string.format("Packfile v%d — %d objects", version, objCount))
+	local parsedCount = 0
+	local objectsByOffset = {}
+	local typesByOffset = {}
+	local objectsBySha = {}
+
+	for i = 1, objCount do
+		local objOffset = cursor
+		local objType, size, next = git_proto.parseObjectHeader(fullPack, cursor)
+		cursor = next
+
+		local baseOffset, baseSha
+
+		if objType == 6 then
+			local b = buffer.readu8(fullPack, cursor)
+			cursor += 1
+			baseOffset = bit32.band(b, 0x7F)
+			while bit32.band(b, 0x80) ~= 0 do
+				b = buffer.readu8(fullPack, cursor)
+				cursor += 1
+				baseOffset = bit32.bor(bit32.lshift(baseOffset + 1, 7), bit32.band(b, 0x7F))
+			end
+		elseif objType == 7 then
+			local shaBytes = buffer.create(20)
+			buffer.copy(shaBytes, 0, fullPack, cursor, 20)
+			cursor += 20
+			baseSha = buffer.tostring(shaBytes)
+		end
+
+		local remaining = buffer.len(fullPack) - cursor
+		local slice = buffer.create(remaining)
+		buffer.copy(slice, 0, fullPack, cursor, remaining)
+
+		local decompressed, bytesLeft = zlib.decompressZlib(buffer.tostring(slice))
+
+		local resolved
+		local actualType
+		if objType == 6 then
+			local base = objectsByOffset[objOffset - baseOffset]
+			assert(base, "Missing base object at offset " .. (objOffset - baseOffset))
+			resolved = git_proto.applyDelta(base, decompressed)
+			actualType = typesByOffset[objOffset - baseOffset]
+		else
+			resolved = decompressed
+			actualType = objType
+		end
+
+		objectsByOffset[objOffset] = resolved
+		typesByOffset[objOffset] = actualType
+		parsedCount += 1
+
+		cursor += #buffer.tostring(slice) - (bytesLeft or 0)
+
+		local typePrefix = ({[1]="commit",[2]="tree",[3]="blob",[4]="tag"})[actualType]
+		if typePrefix and resolved then
+			local header = typePrefix .. " " .. #resolved .. "\0"
+			local sha = hashlib.sha1(header .. resolved)
+			objectsBySha[sha] = {objType = actualType, content = resolved}
+		end
+
+		print(string.format("[%d] %s | size: %d%s",
+			i,
+			TYPE_NAMES[objType] or "Unknown",
+			resolved and #resolved or 0,
+			baseOffset and " | base: +" .. baseOffset or ""
+		))
+	end
+
+	return objectsByOffset, objectsBySha
+end
+
+local function writeTree(objectsBySha, treeSha, parent)
+    local treeObj = objectsBySha[treeSha]
+    assert(treeObj, "Missing tree: " .. treeSha)
+
+    local content = treeObj.content
+    local pos = 1
+
+    while pos <= #content do
+        local spacePos = content:find(" ", pos, true)
+        local mode = content:sub(pos, spacePos - 1)
+
+        local nullPos = content:find("\0", spacePos, true)
+        local name = content:sub(spacePos + 1, nullPos - 1)
+
+        local rawSha = content:sub(nullPos + 1, nullPos + 20)
+        local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+        pos = nullPos + 21
+
+        if mode == "40000" then
+            local folder = bash.createFolder(parent, name)
+            writeTree(objectsBySha, sha, folder)
+        else
+            local blobObj = objectsBySha[sha]
+            if blobObj then
+                local ok, err = pcall(bash.createFile, parent, name, blobObj.content)
+                if not ok then
+                    warn("Skipped " .. name .. ": " .. tostring(err))
+                end
+            end
+        end
+    end
+end
+
 
 --[[
 Commands:
@@ -397,10 +615,10 @@ arguments.createArgument("add", "a", function (...)
         "hint: Maybe you wanted to say 'git add .'?")
 
     local target = args[1]
-    local index = read_index()
-
-    -- git add . (.=root)
+    
     if target == "." then
+        -- start with a fresh index for 'add .' to correctly capture deletions
+        local index = {} 
         for _, service in ipairs(bash.trackingRoot) do
             for _, obj in ipairs(service:GetDescendants()) do
                 if not obj:IsDescendantOf(bash.getGitFolderRoot()) and not is_ignored(obj:GetFullName()) then
@@ -408,10 +626,12 @@ arguments.createArgument("add", "a", function (...)
                 end
             end
         end
-
         write_index(index)
         return
     end
+
+    -- for specific adds, we add to the existing index
+    local index = read_index()
 
     local segments = string.split(target, ".")
     local currObj = game
@@ -551,30 +771,109 @@ arguments.createArgument("commit", "", function(...)
         message = "default commit message"
     end
 
-    local parent_sha = get_ref("HEAD")
-
     local index = read_index()
+
+    local last_index = {}
+    local last_index_str = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
+    if last_index_str and last_index_str ~= "" then
+        last_index = HttpService:JSONDecode(last_index_str)
+    end
+
+    local old_paths = {}
+    local new_paths = {}
+    local old_sha_to_path = {}
+    local new_sha_to_path = {}
+
+    for path, data in pairs(last_index) do
+        old_paths[path] = data.sha
+        old_sha_to_path[data.sha] = path
+    end
+    for path, data in pairs(index) do
+        new_paths[path] = data.sha
+        new_sha_to_path[data.sha] = path
+    end
+
+    local files_added = {}
+    local files_deleted = {}
+    local files_modified = {}
+    local files_renamed = {}
+
+    local total_insertions = 0
+    local total_deletions = 0
+
+    for path, old_sha in pairs(old_paths) do
+        local new_sha = new_paths[path]
+
+        if not new_sha then
+            if new_sha_to_path[old_sha] then
+                local new_path_for_sha = new_sha_to_path[old_sha]
+                if new_path_for_sha ~= path then
+                    new_paths[new_path_for_sha] = "RENAMED_PLACEHOLDER"
+                    table.insert(files_renamed, {old_path = path, new_path = new_path_for_sha, similarity = 100})
+                end
+            else
+                table.insert(files_deleted, {path = path, mode = last_index[path].mode})
+                total_deletions = total_deletions + get_content_lines(old_sha)
+            end
+        elseif old_sha ~= new_sha then
+            table.insert(files_modified, {path = path, old_sha = old_sha, new_sha = new_sha})
+            total_deletions = total_deletions + get_content_lines(old_sha)
+            total_insertions = total_insertions + get_content_lines(new_sha)
+        end
+    end
+
+    for path, new_sha in pairs(new_paths) do
+        if not old_paths[path] and new_sha ~= "RENAMED_PLACEHOLDER" then
+            table.insert(files_added, {path = path, mode = index[path].mode})
+            total_insertions = total_insertions + get_content_lines(new_sha)
+        end
+    end
+    
+    local parent_sha = get_ref("HEAD")
     local tree_sha = write_tree(index)
-
     local commit_content = "tree " .. tree_sha .. "\n"
-
     if parent_sha and parent_sha ~= "" then
         commit_content = commit_content .. "parent " .. parent_sha .. "\n"
     end
-
     local timestamp = os.time()
-    commit_content = commit_content ..
-        string.format("author roGit <ro-git@example.com> %d +0000\n", timestamp)
-    commit_content = commit_content ..
-        string.format("committer roGit <ro-git@example.com> %d +0000\n", timestamp)
-
+    commit_content = commit_content .. string.format("author roGit <ro-git@example.com> %d +0000\n", timestamp)
+    commit_content = commit_content .. string.format("committer roGit <ro-git@example.com> %d +0000\n", timestamp)
     commit_content = commit_content .. "\n" .. message
-
     local commit_sha = write_object("commit", commit_content)
-
     update_ref("HEAD", commit_sha)
 
-    print("Committed to master, commit SHA: " .. commit_sha)
+    if bash.getGitFolderRoot():FindFirstChild("last_commit_index") then
+        bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(index))
+    else
+        bash.createFile(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(index))
+    end
+
+    local output_details = {}
+    for _, entry in ipairs(files_renamed) do
+        table.insert(output_details, string.format(" rename %s => %s (%d%%)", entry.old_path, entry.new_path, entry.similarity))
+    end
+    for _, entry in ipairs(files_added) do
+        table.insert(output_details, string.format(" create mode %s %s", entry.mode, entry.path))
+    end
+    for _, entry in ipairs(files_deleted) do
+        table.insert(output_details, string.format(" delete mode %s %s", entry.mode, entry.path))
+    end
+
+    local num_files_changed = #files_added + #files_deleted + #files_modified + #files_renamed
+    local stats_line = ""
+    if num_files_changed > 0 then
+        stats_line = string.format(" %d files changed, %d insertions(+), %d deletions(-)", num_files_changed, total_insertions, total_deletions)
+    end
+
+    local short_sha = string.sub(commit_sha, 1, 7)
+    local final_output = string.format("[master %s] %s", short_sha, message)
+    if num_files_changed > 0 then
+        final_output = final_output .. "\n" .. stats_line
+    end
+    if #output_details > 0 then
+        final_output = final_output .. "\n" .. table.concat(output_details, "\n")
+    end
+    print(final_output)
 end)
 
 
@@ -585,6 +884,13 @@ init
 
 arguments.createArgument("init", "", function (...)
     -- Create .git if not existing already.
+
+    local tuple = {...}
+
+    local quiet  -- if enabled, no output
+    local obj_format = "sha1" -- sha1, sha256
+    local b -- branch
+    
 
     local reinit_required = false
 
@@ -671,39 +977,27 @@ function recursive_download(body, parent)
     end
 end
 
-arguments.createArgument("clone", "", function (...)
+arguments.createArgument("clone", "", function(...)
     assert((#{...} >= 1), "No argument supplied!")
-    local tuple = {...}
+    local url = (...):gsub("%.git$", "")
 
-    local repo = tuple[1]
+    local repoName = url:match("/([^/]+)$")
+    print("Cloning into '" .. repoName .. "'...")
 
-    if not string.find(repo, "github") then -- no non github support, since using their api directly ):
-        warn_assert("Sorry! Only GitHub repositories are supported, due to ROBLOX api limitations.")
-    end
-    -- cleaning time!
-    repo = repo:gsub("https://github.com/", "")
-    repo = repo:gsub("git@github.com:", "")
-    repo = repo:gsub(".git", "")
+    local headSha = discoverRefs(url .. ".git")
+    local fullPack = fetchPackfile(url .. ".git", headSha)
+    local _, objectsBySha = unpackObjects(fullPack)
 
-    -- cloning :P
+    local headCommit = objectsBySha[headSha]
+    assert(headCommit, "HEAD commit not found in packfile")
 
-    print("Cloning into '" .. string.split(repo, "/")[2] .. "'")
-    local base_url = "https://api.github.com"
-    
-    local req = HttpService:RequestAsync({
-        Url = "https://api.github.com/repos/" .. repo .. "/contents"
-    })
+    local treeSha = headCommit.content:match("^tree (%x+)")
+    assert(treeSha, "Could not parse tree SHA from commit")
 
-    if not req.Success and req.StatusCode ~= 200 then 
-        warn_assert("Request error! Status: " .. req.StatusCode)
-    end
- 
-    -- download contents
-    local body = HttpService:JSONDecode(req.Body)
-    local parent = bash.createFolder(workspace, string.split(repo, "/")[2])
-    recursive_download(body, parent)
+    local parent = bash.createFolder(workspace, repoName)
+    writeTree(objectsBySha, treeSha, parent)
 
-    print("Repository " .. "'" .. string.split(repo, "/")[2] .. "'" .. " Cloned")
+    print("Done. '" .. repoName .. "' cloned.")
 end)
 
 return git

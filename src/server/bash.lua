@@ -8,16 +8,19 @@ local conf = {
 
 Bash.trackingRoot = {
     game:GetService("Workspace"),
-    game:GetService("Lighting"),
-    game:GetService("MaterialService"),
-    game:GetService("ReplicatedFirst"),
     game:GetService("ReplicatedStorage"),
+    game:GetService("ReplicatedFirst"),
     game:GetService("ServerScriptService"),
     game:GetService("ServerStorage"),
     game:GetService("StarterGui"),
     game:GetService("StarterPack"),
     game:GetService("StarterPlayer"),
     game:GetService("SoundService"),
+    game:GetService("AdService"),
+    game:GetService("LocalizationService"),
+    game:GetService("PhysicsService"),
+    game:GetService("TextService"),
+    game:GetService("Teams")
 }
 
 --[[
@@ -84,7 +87,7 @@ function Bash.getFileContents(parent, name)
     
     if not file then return nil end
 
-    return file.value
+    return file.Value
 end
 
 function Bash.modifyFileContents(parent, name, content)

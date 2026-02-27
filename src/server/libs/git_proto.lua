@@ -66,6 +66,15 @@ local function readDeltaVariant(s: string, pos: number)
     return size, pos
 end
 
+function proto.writeU32BE(n)
+    return string.char(
+        bit32.band(bit32.rshift(n,24), 0xFF),
+        bit32.band(bit32.rshift(n,16), 0xFF),
+        bit32.band(bit32.rshift(n,8), 0xFF),
+        bit32.band(n, 0xFF)
+    )
+end
+
 function proto.decodePkt(buf: buffer, cursor: number)
     
     local l = convertHexByteToNumber(buf,cursor)
@@ -170,6 +179,21 @@ function proto.parseObjectHeader(buf: buffer, cursor: number)
     return type, size, cursor
 end
 
+function proto.encodeObjectHeader(objType, size)
+    local bytes = {}
+    local b = bit32.bor(bit32.lshift(objType, 4), bit32.band(size, 0xF))
+    size = bit32.rshift(size, 4)
+    
+    while size > 0 do
+        table.insert(bytes, bit32.bor(b, 0x80))
+        b = bit32.band(size, 0x7F)
+        size = bit32.rshift(size, 7)
+    end
+    table.insert(bytes, b)
+
+    return string.char(table.unpack(bytes))
+end
+
 function proto.applyDelta(base: string, delta: string)
     local pos = 1
     local result = {}
@@ -208,6 +232,24 @@ function proto.applyDelta(base: string, delta: string)
     end
 
     return table.concat(result)
+end
+
+function proto.wrapInPktLines(data)
+    local MAX_DATA = 65520
+    local parts = {}
+    local pos = 1
+    local len = #data
+
+    while pos <= len do
+        local chunkSize = math.min(MAX_DATA, len - pos + 1)
+        local totalSize = chunkSize + 4
+        local d1, d2, d3, d4 = convertNumberToHexByte(totalSize)
+        table.insert(parts, string.char(d1, d2, d3, d4))
+        table.insert(parts, string.sub(data, pos, pos + chunkSize - 1))
+        pos = pos + chunkSize
+    end
+
+    return table.concat(parts)
 end
 
 return proto

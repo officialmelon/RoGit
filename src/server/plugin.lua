@@ -7,6 +7,11 @@ need to implement user-friendly
 local plugins = {}
 local arguments = require(script.Parent.arguments)
 local git = require(script.Parent.git)
+local StudioService = game:GetService("StudioService")
+local Players = game:GetService("Players")
+
+local user = Players:GetNameFromUserIdAsync(StudioService:GetUserId())
+local name = game.Name
 
 function createCommandOutput(parent, text, optionalColor)
     local command = Instance.new("Frame")
@@ -66,7 +71,7 @@ function createCommandEntry(parent)
     start.BorderSizePixel = 0
     start.Size = UDim2.new(0, 172, 1, 0)
     start.Font = Enum.Font.Ubuntu
-    start.Text = "thatconvictedfelon@RoGit >"
+    start.Text =  user .. "@" .. name .. ">"
     start.TextColor3 = Color3.fromRGB(255, 255, 255)
     start.TextSize = 14.000
     start.TextXAlignment = Enum.TextXAlignment.Left
@@ -257,6 +262,81 @@ function plugins.createBashTerminal(plugin)
     )
 
     local activeEntryBox = nil
+
+    local function promptInput(promptText, isPassword)
+        local command = Instance.new("Frame")
+        local start = Instance.new("TextLabel")
+        local entry = Instance.new("TextBox")
+        local UIListLayout = Instance.new("UIListLayout")
+        
+        command.Name = "prompt"
+        command.Parent = holder
+        command.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        command.BackgroundTransparency = 1
+        command.BorderSizePixel = 0
+        command.Size = UDim2.new(1, 0, 0, 18)
+
+        UIListLayout.Parent = command
+        UIListLayout.FillDirection = Enum.FillDirection.Horizontal
+        UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+        start.Name = "start"
+        start.Parent = command
+        start.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        start.BackgroundTransparency = 1
+        start.BorderSizePixel = 0
+        start.Size = UDim2.new(0, 0, 1, 0)
+        start.AutomaticSize = Enum.AutomaticSize.X
+        start.Font = Enum.Font.Ubuntu
+        start.Text = promptText .. " "
+        start.TextColor3 = Color3.fromRGB(255, 255, 255)
+        start.TextSize = 14
+        start.TextXAlignment = Enum.TextXAlignment.Left
+
+        entry.Name = "entry"
+        entry.Parent = command
+        entry.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        entry.BackgroundTransparency = 1
+        entry.BorderSizePixel = 0
+        entry.Selectable = false
+        entry.Size = UDim2.new(1, -150, 1, 0)
+        entry.Font = Enum.Font.Ubuntu
+        entry.Text = ""
+        entry.ClearTextOnFocus = false
+        if isPassword then
+            entry.ClearTextOnFocus = true
+        end
+        entry.TextColor3 = Color3.fromRGB(255, 255, 255)
+        entry.TextSize = 14
+        entry.TextXAlignment = Enum.TextXAlignment.Left
+
+        local bindable = Instance.new("BindableEvent")
+        local result = ""
+
+        local connection
+        connection = entry.FocusLost:Connect(function(enterPressed)
+            if enterPressed then
+                result = entry.Text
+                entry.TextEditable = false
+                if isPassword then entry.Text = "" end
+                if connection then connection:Disconnect() end
+                bindable:Fire()
+            end
+        end)
+        
+        activeEntryBox = entry
+        scrollToBottom()
+
+        task.delay(0.1, function()
+            pcall(function() entry:CaptureFocus() end)
+        end)
+
+        bindable.Event:Wait()
+        bindable:Destroy()
+        return result
+    end
+
+    git.replacePromptCallback(promptInput)
     
     local function ensureFocus()
         if activeEntryBox then
@@ -290,21 +370,22 @@ function plugins.createBashTerminal(plugin)
 end
 
 function plugins.initializePlugin(plugin)
+    git.setPlugin(plugin)
     local toolbar = plugin:CreateToolbar("roGit")
 
     local buttons = {
-        ["GraphicalMode"] = toolbar:CreateButton("Graphical Mode", "", "rbxassetid://123456789"),
-        ["BashMode"] = toolbar:CreateButton("Bash Mode", "", "rbxassetid://123456789")
+        -- ["GraphicalMode"] = toolbar:CreateButton("Graphical Mode", "", "rbxassetid://123456789"),
+        ["BashMode"] = toolbar:CreateButton("Bash Mode", "", "rbxassetid://78663253184043")
     }
 
     --// Use during scripting (out of viewport)
-    buttons.GraphicalMode.ClickableWhenViewportHidden = true
+    -- buttons.GraphicalMode.ClickableWhenViewportHidden = true
     buttons.BashMode.ClickableWhenViewportHidden = true
 
     --// Graphical Mode (GUI)
-    buttons.GraphicalMode.Click:Connect(function()
+    -- buttons.GraphicalMode.Click:Connect(function()
     
-    end)
+    -- end)
 
     --// Bash Mode (Terminal)
     local bashTerminalGui = nil

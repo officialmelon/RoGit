@@ -20,7 +20,25 @@ local ini_parser = require(script.Parent.libs.ini_parser)
 local ignore_patterns = nil
 
 local ROGIT_ID = "_rogit_id"
-    
+
+local ACTIVE_PLUGIN = nil
+function git.setPlugin(plugin)
+    ACTIVE_PLUGIN = plugin
+end
+
+local terminal_prompt_callback = nil
+
+function git.replacePromptCallback(prompt_cb)
+    terminal_prompt_callback = prompt_cb
+end
+
+local function ask_for_credential(prompt_text, is_password)
+    if terminal_prompt_callback then
+        return terminal_prompt_callback(prompt_text, is_password)
+    end
+    return nil
+end
+
 -- Create command
 arguments.createCommand("git", function(...)
     arguments.execute("git", "help", ...)
@@ -39,29 +57,55 @@ calculates the hash of a instance based off properties.
 
 -- (https://devforum.roblox.com/t/how-to-save-parts-and-the-idea-of-serialization/524311)
 local function serialize_property(prop)
-
-    -- quick check
     assert(prop ~= nil, "No property parsed to serialize!")
 
     local type = typeof(prop)
     local r = prop
 
-    -- Serialize prop to string.
     if type == "BrickColor" then
-
         r = tostring(prop)
     elseif type == "CFrame" then
-
         r = {pos = serialize_property(prop.Position), rX = serialize_property(prop.rightVector), rY = serialize_property(prop.upVector), rZ = serialize_property(-prop.lookVector)}
     elseif type == "Vector3" then
-
         r = {X = prop.X, Y = prop.Y, Z = prop.Z}
+    elseif type == "Vector2" then
+        r = {X = prop.X, Y = prop.Y}
     elseif type == "Color3" then
-
         r = {Color3.toHSV(prop)}
     elseif type == "EnumItem" then
-
         r = {string.split(tostring(prop), ".")[2], string.split(tostring(prop), ".")[3]} 
+    elseif type == "UDim" then
+        r = {Scale = prop.Scale, Offset = prop.Offset}
+    elseif type == "UDim2" then
+        r = {X = serialize_property(prop.X), Y = serialize_property(prop.Y)}
+    elseif type == "Rect" then
+        r = {Min = serialize_property(prop.Min), Max = serialize_property(prop.Max)}
+    elseif type == "NumberRange" then
+        r = {Min = prop.Min, Max = prop.Max}
+    elseif type == "PhysicalProperties" then
+        r = {Density = prop.Density, Friction = prop.Friction, Elasticity = prop.Elasticity, FrictionWeight = prop.FrictionWeight, ElasticityWeight = prop.ElasticityWeight}
+    elseif type == "Font" then
+        r = {Family = prop.Family, Weight = serialize_property(prop.Weight), Style = serialize_property(prop.Style)}
+    elseif type == "NumberSequenceKeypoint" then
+        r = {Time = prop.Time, Value = prop.Value, Envelope = prop.Envelope}
+    elseif type == "ColorSequenceKeypoint" then
+        r = {Time = prop.Time, Value = serialize_property(prop.Value)}
+    elseif type == "NumberSequence" then
+        local keypoints = {}
+        for _, kp in ipairs(prop.Keypoints) do
+            table.insert(keypoints, serialize_property(kp))
+        end
+        r = {Keypoints = keypoints}
+    elseif type == "ColorSequence" then
+        local keypoints = {}
+        for _, kp in ipairs(prop.Keypoints) do
+            table.insert(keypoints, serialize_property(kp))
+        end
+        r = {Keypoints = keypoints}
+    elseif type == "Instance" then
+        r = {Guid = prop:GetAttribute("_rogit_id")}
+    elseif type == "Content" then
+        r = tostring(prop)
     end
 
     return r
@@ -71,19 +115,64 @@ local function deserialize_property(prop, propType)
     if propType == "BrickColor" then
         return BrickColor.new(prop)
     elseif propType == "CFrame" then
-        local pos = Vector3.new(prop.pos.X, prop.pos.Y, prop.pos.Z)
-        local rX = Vector3.new(prop.rX.X, prop.rX.Y, prop.rX.Z)
-        local rY = Vector3.new(prop.rY.X, prop.rY.Y, prop.rY.Z)
-        local rZ = Vector3.new(prop.rZ.X, prop.rZ.Y, prop.rZ.Z)
+        local pos = deserialize_property(prop.pos, "Vector3")
+        local rX = deserialize_property(prop.rX, "Vector3")
+        local rY = deserialize_property(prop.rY, "Vector3")
+        local rZ = deserialize_property(prop.rZ, "Vector3")
         return CFrame.fromMatrix(pos, rX, rY, -rZ)
     elseif propType == "Vector3" then
         return Vector3.new(prop.X, prop.Y, prop.Z)
+    elseif propType == "Vector2" then
+        return Vector2.new(prop.X, prop.Y)
     elseif propType == "Color3" then
         return Color3.fromHSV(prop[1], prop[2], prop[3])
     elseif propType == "EnumItem" then
         return Enum[prop[1]][prop[2]]
+    elseif propType == "UDim" then
+        return UDim.new(prop.Scale, prop.Offset)
+    elseif propType == "UDim2" then
+        return UDim2.new(deserialize_property(prop.X, "UDim"), deserialize_property(prop.Y, "UDim"))
+    elseif propType == "Rect" then
+        return Rect.new(deserialize_property(prop.Min, "Vector2"), deserialize_property(prop.Max, "Vector2"))
+    elseif propType == "NumberRange" then
+        return NumberRange.new(prop.Min, prop.Max)
+    elseif propType == "PhysicalProperties" then
+        return PhysicalProperties.new(prop.Density, prop.Friction, prop.Elasticity, prop.FrictionWeight, prop.ElasticityWeight)
+    elseif propType == "Font" then
+        return Font.new(prop.Family, deserialize_property(prop.Weight, "EnumItem"), deserialize_property(prop.Style, "EnumItem"))
+    elseif propType == "NumberSequenceKeypoint" then
+        return NumberSequenceKeypoint.new(prop.Time, prop.Value, prop.Envelope)
+    elseif propType == "ColorSequenceKeypoint" then
+        return ColorSequenceKeypoint.new(prop.Time, deserialize_property(prop.Value, "Color3"))
+    elseif propType == "NumberSequence" then
+        local keypoints = {}
+        for _, kp in ipairs(prop.Keypoints) do
+            table.insert(keypoints, deserialize_property(kp, "NumberSequenceKeypoint"))
+        end
+        return NumberSequence.new(keypoints)
+    elseif propType == "ColorSequence" then
+        local keypoints = {}
+        for _, kp in ipairs(prop.Keypoints) do
+            table.insert(keypoints, deserialize_property(kp, "ColorSequenceKeypoint"))
+        end
+        return ColorSequence.new(keypoints)
     end
     return prop
+end
+
+local function parse_path(p)
+    if not p or p == "" then return nil end
+    local clean = p:gsub("^game[./]", ""):gsub("^Workspace[./]", "Workspace/"):gsub("%.", "/")
+    local segments = string.split(clean, "/")
+    local currObj = game
+    for _, segment in ipairs(segments) do
+        if currObj and currObj:FindFirstChild(segment) then
+            currObj = currObj:FindFirstChild(segment)
+        else
+            return nil, segments[#segments], segments
+        end
+    end
+    return currObj, segments[#segments], segments
 end
 
 -- based off git implementations
@@ -211,16 +300,6 @@ local function serialize_instance(instance)
     return HttpService:JSONEncode(instanceProperties)
 end
 
-local function warn_assert(condition, message)
-    -- Check for message
-    assert(message, "no message supplied to warn!")
-
-    if not condition then 
-        warn(message)        
-    end
-
-    return
-end
 
 local function load_ignore_patterns()
     if ignore_patterns ~= nil then
@@ -230,8 +309,9 @@ local function load_ignore_patterns()
     ignore_patterns = {}
     local ignore_file = bash.getGitFolderRoot().Parent:FindFirstChild(".rogitignore")
     if ignore_file then
-        local content = ignore_file.Value
+        local content = bash.getFileContents(bash.getGitFolderRoot().Parent, ".rogitignore")
         for line in string.gmatch(content, "[^\r\n]+") do
+            line = string.match(line, "^%s*(.-)%s*$")
             if string.sub(line, 1, 1) ~= "#" and #line > 0 then
                 table.insert(ignore_patterns, line)
             end
@@ -242,37 +322,31 @@ end
 local function is_ignored(path)
     load_ignore_patterns()
 
+    local path_slashes = string.gsub(path, "%.", "/")
+
     for _, pattern in ipairs(ignore_patterns) do
-        if string.sub(path, 1, #pattern) == pattern then
-            return true
-        end
+        if path_slashes == pattern then return true end
+        if string.sub(path_slashes, 1, #pattern + 1) == pattern .. "/" then return true end
+        if string.sub(path_slashes, -#pattern - 1) == "/" .. pattern then return true end
+        if string.find(path_slashes, "/" .. pattern .. "/", 1, true) then return true end
     end
     return false
 end
 
-local function stage_instance(instance, index, seen_ids)
+local function stage_instance(instance, index, seen_ids, parentVirtualPath)
     seen_ids = seen_ids or {}
     local pathSegments = {}
-    local curr = instance
-    while curr and curr ~= game do
-        local name = curr.Name
-        if curr.Parent then
-            local sameCount = 0
-            local myIndex = 0
-            for _, child in ipairs(curr.Parent:GetChildren()) do
-                if child.Name == curr.Name then
-                    sameCount += 1
-                    if child == curr then
-                        myIndex = sameCount
-                    end
-                end
-            end
-            if sameCount > 1 then
-                name = name .. " (" .. tostring(myIndex) .. ")"
-            end
+    if parentVirtualPath then
+        for part in string.gmatch(parentVirtualPath, "[^/]+") do
+            table.insert(pathSegments, part)
         end
-        table.insert(pathSegments, 1, name)
-        curr = curr.Parent
+        table.insert(pathSegments, instance.Name)
+    else
+        local curr = instance
+        while curr and curr ~= game do
+            table.insert(pathSegments, 1, curr.Name)
+            curr = curr.Parent
+        end
     end
 
     local fullPath = table.concat(pathSegments, "/")
@@ -285,6 +359,8 @@ local function stage_instance(instance, index, seen_ids)
         end
     end
 
+    local baseName = fullPath
+    local collisionBase = baseName
     if hasValidChildren then
         fullPath = fullPath .. "/.properties"
     end
@@ -293,6 +369,7 @@ local function stage_instance(instance, index, seen_ids)
     local collisionCount = 1
     while index[fullPath] do
         fullPath = originalPath .. " [" .. tostring(collisionCount) .. "]"
+        collisionBase = baseName .. " [" .. tostring(collisionCount) .. "]"
         collisionCount += 1
     end
 
@@ -316,17 +393,25 @@ local function stage_instance(instance, index, seen_ids)
         mode = "100644",
         sha = blobSha
     }
+    
+    return collisionBase
 end
 
-local function stage_recursive(instance, index, seen_ids)
+local function stage_recursive(instance, index, seen_ids, perf, parentVirtualPath)
     if is_ignored(instance:GetFullName()) then return end
     seen_ids = seen_ids or {}
+    perf = perf or { last_yield = os.clock() }
 
-    stage_instance(instance, index, seen_ids)
+    local newVirtualPath = stage_instance(instance, index, seen_ids, parentVirtualPath)
+    
+    if os.clock() - perf.last_yield > 0.03 then
+        task.wait()
+        perf.last_yield = os.clock()
+    end
 
     for _, child in ipairs(instance:GetChildren()) do
         if child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
-            stage_recursive(child, index, seen_ids)
+            stage_recursive(child, index, seen_ids, perf, newVirtualPath)
         end
     end
 end
@@ -484,10 +569,10 @@ end
 
 local function get_ref(ref_path)
     local file = bash.getDirectoryOrFile(bash.getGitFolderRoot(), ref_path)
-    if not file or not file:IsA("StringValue") then return nil end
+    if not file then return nil end
 
-    local content = file.Value
-    if string.sub(content, 1, 5) == "ref: " then
+    local content = bash.getFileContents(file.Parent, file.Name)
+    if content and string.sub(content, 1, 5) == "ref: " then
         return get_ref(string.sub(content, 6))
     else
         return content
@@ -514,8 +599,8 @@ local function update_ref(ref_path, sha)
 
     local function get_file_content_by_path(path)
         local file = bash.getDirectoryOrFile(bash.getGitFolderRoot(), path)
-        if file and file:IsA("StringValue") then
-            return file.Value
+        if file then
+            return bash.getFileContents(file.Parent, file.Name)
         end
         return nil
     end
@@ -584,11 +669,40 @@ local function b64Encode(data)
 end
 
 local function getConfigValue(key)
+    local sensitive_keys = {
+        ["user.name"] = true,
+        ["user.email"] = true,
+        ["user.token"] = true,
+        ["user.password"] = true
+    }
+
     local root = bash.getGitFolderRoot()
-    if not root then return nil end
-    local config_content = bash.getFileContents(root, "config")
-    if type(config_content) ~= "string" or config_content == "" then return nil end
-    local loaded_conf = ini_parser.parseIni(config_content)
+    local loaded_conf = {}
+    if root then
+        local config_content = bash.getFileContents(root, "config")
+        if type(config_content) == "string" and config_content ~= "" then
+            loaded_conf = ini_parser.parseIni(config_content)
+        end
+    end
+    local conf = loaded_conf
+
+    local userName = conf.user and conf.user.name
+    local userEmail = conf.user and conf.user.email
+    if not userName and ACTIVE_PLUGIN then
+        pcall(function() userName = ACTIVE_PLUGIN:GetSetting("user.name") end)
+    end
+    if not userEmail and ACTIVE_PLUGIN then
+        pcall(function() userEmail = ACTIVE_PLUGIN:GetSetting("user.email") end)
+    end
+
+    if key == "user.name" then return userName end
+    if key == "user.email" then return userEmail end
+
+    if sensitive_keys[key] and ACTIVE_PLUGIN then
+        local val = ACTIVE_PLUGIN:GetSetting(key)
+        if val then return val end
+    end
+
     local key_parts = string.split(key, ".")
     if loaded_conf[key_parts[1]] then
         local val = loaded_conf[key_parts[1]][key_parts[2]]
@@ -608,7 +722,12 @@ local function get_current_branch()
     return head:match("ref: refs/heads/(.+)")
 end
 
-local function getAuthHeader()
+local memory_credentials = {}
+
+local function getAuthHeader(url)
+    if memory_credentials[url] then
+        return "Basic " .. b64Encode("x:" .. memory_credentials[url])
+    end
     local token = getConfigValue("user.token") or getConfigValue("user.password")
     if token then
         return "Basic " .. b64Encode("x:" .. token)
@@ -616,23 +735,51 @@ local function getAuthHeader()
     return nil
 end
 
-local function discoverRefs(url: string, service: string?, headers: {[string]: any}?)
-	local ok, res = pcall(function()
-        local req = {
-            Url = return_urls(url, service)[1],
-            Method = "GET",
-            Headers = {
-                ["Authorization"] = getAuthHeader()
-            }
-        }
-        if headers then
-            for k, v in pairs(headers) do req.Headers[k] = v end
-        end
-        return HttpService:RequestAsync(req)
-    end)
+local function url_request_with_retry(req_options)
+    local ok, res = pcall(function() return HttpService:RequestAsync(req_options) end)
+    if not ok then return false, res end
 
-	assert(ok, res)
-	assert(res.StatusCode == 200, "Discovery failed: " .. res.StatusCode)
+    if res.StatusCode == 401 or res.StatusCode == 404 then
+        local username = ask_for_credential("Username for '" .. (req_options.Url:match("^(https?://[^/]+)") or req_options.Url) .. "':", false)
+        if not username or username == "" then
+            return true, res
+        end
+        
+        local password = ask_for_credential("Password for '" .. (req_options.Url:match("^(https?://[^/]+)") or req_options.Url) .. "':", true)
+        
+        if password and password ~= "" then
+            local base_url = req_options.Url:match("^(https?://[^/]+)") or req_options.Url
+            memory_credentials[base_url] = password
+            
+            req_options.Headers = req_options.Headers or {}
+            req_options.Headers["Authorization"] = "Basic " .. b64Encode(username .. ":" .. password)
+            
+            ok, res = pcall(function() return HttpService:RequestAsync(req_options) end)
+            if not ok then return false, res end
+        end
+    end
+    return true, res
+end
+
+local function discoverRefs(url: string, service: string?)
+	local req = {
+        Url = return_urls(url, "git-upload-pack")[1],
+        Method = "GET",
+        Headers = {
+            ["Authorization"] = getAuthHeader(url:match("^(https?://[^/]+)") or url)
+        }
+    }
+    
+    local ok, res = url_request_with_retry(req)
+
+    if not ok or res.StatusCode ~= 200 then
+        -- Cleanup if auth failed or repo not found
+        -- bash.trackingRoot = previous_trackingRoot -- This line is likely from a higher-level clone function and not relevant here.
+        -- dir:Destroy() -- This line is likely from a higher-level clone function and not relevant here.
+        error("fatal: repository '" .. url .. "' not found or access denied")
+    end
+    
+	assert(res.StatusCode == 200, "Discovery failed: " .. res.StatusCode .. " (Check repository URL and credentials)")
 
 	local buf = buffer.fromstring(res.Body)
 	local cursor = 0
@@ -657,16 +804,19 @@ local function fetchPackfile(url: string, sha: string)
 	local donePkt = git_proto.encodePkt(buffer.fromstring("done\n"))
 	local body = buffer.tostring(wantPkt) .. buffer.tostring(git_proto.flush()) .. buffer.tostring(donePkt)
 
-	local res = HttpService:RequestAsync({
+	local req = {
 		Url = return_urls(url)[2],
 		Method = "POST",
 		Headers = {
 			["Content-Type"] = "application/x-git-upload-pack-request",
 			["Accept"] = "application/x-git-upload-pack-result",
-            ["Authorization"] = getAuthHeader()
+            ["Authorization"] = getAuthHeader(url:match("^(https?://[^/]+)") or url)
 		},
 		Body = body,
-	})
+	}
+    
+    local ok, res = url_request_with_retry(req)
+    assert(ok, "Upload-pack request error")
 	assert(res.StatusCode == 200, "Upload-pack failed: " .. res.StatusCode)
 
 	local resBuf = buffer.fromstring(res.Body)
@@ -716,13 +866,19 @@ local function unpackObjects(fullPack)
 	local objectsByOffset = {}
 	local typesByOffset = {}
 	local objectsBySha = {}
+	local last_yield = os.clock()
 
 	for i = 1, objCount do
+		if os.clock() - last_yield > 0.03 then
+			task.wait()
+			last_yield = os.clock()
+		end
 		local objOffset = cursor
-		local objType, next = git_proto.parseObjectHeader(fullPack, cursor)
+		local objType, _size, next = git_proto.parseObjectHeader(fullPack, cursor)
 		cursor = next
 
 		local baseOffset
+		local refShaHex
 
 		if objType == 6 then
 			local b = buffer.readu8(fullPack, cursor)
@@ -736,6 +892,10 @@ local function unpackObjects(fullPack)
 		elseif objType == 7 then
 			local shaBytes = buffer.create(20)
 			buffer.copy(shaBytes, 0, fullPack, cursor, 20)
+			refShaHex = ""
+			for j = 0, 19 do
+				refShaHex = refShaHex .. ("%02x"):format(buffer.readu8(shaBytes, j))
+			end
 			cursor += 20
 		end
 
@@ -752,6 +912,12 @@ local function unpackObjects(fullPack)
 			assert(base, "Missing base object at offset " .. (objOffset - baseOffset))
 			resolved = git_proto.applyDelta(base, decompressed)
 			actualType = typesByOffset[objOffset - baseOffset]
+		elseif objType == 7 then
+			local baseWrapper = objectsBySha[refShaHex]
+			-- sometimes forward references occur in packfiles (thin packs), wait or assert.
+			assert(baseWrapper, "Missing base object for REF_DELTA: " .. refShaHex)
+			resolved = git_proto.applyDelta(baseWrapper.content, decompressed)
+			actualType = baseWrapper.objType
 		else
 			resolved = decompressed
 			actualType = objType
@@ -761,7 +927,7 @@ local function unpackObjects(fullPack)
 		typesByOffset[objOffset] = actualType
 		parsedCount += 1
 
-		cursor = bytesLeft
+		cursor = buffer.len(fullPack) - bytesLeft
 
 		local typePrefix = ({[1]="commit",[2]="tree",[3]="blob",[4]="tag"})[actualType]
 		if typePrefix and resolved then
@@ -814,12 +980,20 @@ local function applyProperties(instance, props)
             for _, tag in ipairs(propData.value) do
                 pcall(function() instance:AddTag(tag) end)
             end
-        elseif propData.name ~= "ClassName" and propData.name ~= "Parent" and propData.name ~= "Name" then
+        elseif propData.name ~= "ClassName" and propData.name ~= "Parent" then
             local val = deserialize_property(propData.value, propData.valueType)
             if val ~= nil then
-                pcall(function()
-                    instance[propData.name] = val
-                end)
+                if propData.name == "MeshId" and instance:IsA("MeshPart") then
+                    pcall(function()
+                        local InsertService = game:GetService("InsertService")
+                        local loadedMesh = InsertService:CreateMeshPartAsync(val, instance.CollisionFidelity, instance.RenderFidelity)
+                        instance:ApplyMesh(loadedMesh)
+                    end)
+                else
+                    pcall(function()
+                        instance[propData.name] = val
+                    end)
+                end
             end
         end
     end
@@ -879,7 +1053,7 @@ local function writeTree(objectsBySha, treeSha, parent, treePath)
                 uuid = extractRogitId(childProps)
             end
 
-            local target = uuid and findByRogitId(parent, uuid) or nil
+            local target = uuid and findByRogitId(parent, uuid) or parent:FindFirstChild(name)
             if not target then
                 if className then
                     local ok, inst = pcall(Instance.new, className)
@@ -1002,6 +1176,9 @@ arguments.createArgument("git", "help", "h", function (...)
             mv = "git-mv - Move or rename a file, a directory, or a symlink.\n\nUsage: git mv <source> <destination>",
             restore = "git-restore - Restore working tree files.\n\nUsage: git restore <pathspec>",
             remote = "git-remote - Manage set of tracked repositories.\n\nUsage: git remote [-v | --verbose]\n       git remote add [-f] <name> <url>\n       git remote remove <name>\n       git remote set-url <name> <newurl>",
+            init = "git-init - Create an empty Git repository or reinitialize an existing one.\n\nUsage: git init [-q | --quiet] [-b <branch-name>]",
+            log = "git-log - Show commit logs.\n\nUsage: git log [<options>]",
+            config = "git-config - Get and set repository or global options.\n\nUsage: git config [--global] <name> [<value>]",
             version = "git-version - Show the RoGit version information.\n\nUsage: git version"
         }
 
@@ -1037,8 +1214,6 @@ These are common Git commands used in various situations:
 
 start a working area (see also: git help tutorial)
    clone     Clone a repository into a new directory
-   init      Create an empty Git repository or reinitialize an existing one
-
 work on the current change (see also: git help everyday)
    add       Add file contents to the index
    mv        Move or rename a file, a directory, or a symlink
@@ -1062,6 +1237,10 @@ collaborate (see also: git help workflows)
    pull      Fetch from and integrate with another repository or a local branch
    push      Update remote refs along with associated objects
    remote    Manage set of tracked repositories
+
+Other commands:
+   init      Create an empty Git repository or reinitialize an existing one
+   config    Get and set repository or global options
 
 'git help -a' and 'git help -g' list available subcommands and some
 concept guides. See 'git help <command>' or 'git help <concept>'
@@ -1114,17 +1293,23 @@ arguments.createArgument("git", "rebase", "", function()
 end)
 
 arguments.createArgument("git", "merge", "", function(...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository")
-    local args = {...}
-    if #args == 0 then
-        print("usage: git merge <commit-or-branch>")
+    local tuple = {...}
+    local branch = tuple[1]
+
+    if not branch then
+        print("fatal: No commit specified and merge.defaultToUpstream not set.")
+        return
+    end
+
+    local root = bash.getGitFolderRoot()
+    if not root then
+        print("fatal: not a git repository (or any of the parent directories): .git")
         return
     end
     
-    local target = args[1]
-    local target_sha = get_ref("refs/heads/" .. target) or get_ref("refs/remotes/origin/" .. target)
+    local target_sha = get_ref("refs/heads/" .. branch) or get_ref("refs/remotes/origin/" .. branch)
     if not target_sha or target_sha == "" then
-        print("merge: " .. target .. " - not something we can merge")
+        print("merge: " .. branch .. " - not something we can merge")
         return
     end
     
@@ -1134,33 +1319,24 @@ arguments.createArgument("git", "merge", "", function(...)
 end)
 
 arguments.createArgument("git", "mv", "", function(...)
+    local tuple = {...}
+    local source = tuple[1]
+    local destination = tuple[2]
+
+    if not source or not destination then
+        print("fatal: bad source, source=")
+        return
+    end
+
     assert(bash.getGitFolderRoot(), "fatal: not a git repository")
-    local args = {...}
-    if #args < 2 then 
-        print("usage: git mv <source> <destination>")
-        return 
-    end
     
-    local source = args[1]:gsub("^game[./]", ""):gsub("%.", "/")
-    local dest = args[2]:gsub("^game[./]", ""):gsub("%.", "/")
+    local source_path_cleaned = source:gsub("^game[./]", ""):gsub("%.", "/")
+    local dest_path_cleaned = destination:gsub("^game[./]", ""):gsub("%.", "/")
     
-    local function parse_path(p)
-        local segments = string.split(p, "/")
-        local currObj = game
-        for _, segment in ipairs(segments) do
-            if currObj and currObj:FindFirstChild(segment) then
-                currObj = currObj:FindFirstChild(segment)
-            else
-                return nil, segments[#segments], segments
-            end
-        end
-        return currObj, segments[#segments], segments
-    end
+    local sourceObj = parse_path(source_path_cleaned)
+    assert(sourceObj, "fatal: bad source, source=" .. source_path_cleaned)
     
-    local sourceObj = parse_path(source)
-    assert(sourceObj, "fatal: bad source, source=" .. source)
-    
-    local destObj, destName, destSegments = parse_path(dest)
+    local destObj, destName, destSegments = parse_path(dest_path_cleaned)
     if destObj then
         sourceObj.Parent = destObj
     else
@@ -1171,44 +1347,41 @@ arguments.createArgument("git", "mv", "", function(...)
         sourceObj.Name = destName
     end
     
-    print("Moved '" .. source .. "' to '" .. dest .. "'")
+    print("Moved '" .. source_path_cleaned .. "' to '" .. dest_path_cleaned .. "'")
     arguments.execute("git", "add", ".")
 end)
 
 arguments.createArgument("git", "restore", "", function(...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository")
-    local args = {...}
-    if #args < 1 then
-        print("usage: git restore <pathspec>")
+    local tuple = {...}
+    if #tuple == 0 then
+        print("fatal: you must specify path(s) to restore")
         return
     end
 
+    assert(bash.getGitFolderRoot(), "fatal: not a git repository")
     local index = read_index()
-    local path = args[1]:gsub("^game[./]", ""):gsub("%.", "/")
+    local path = tuple[1] -- Use tuple[1] as the path argument
+    
+    local is_all = (path == ".")
+    local target_path_base = ""
+    if not is_all then
+        local _, _, segments = parse_path(path)
+        target_path_base = table.concat(segments or {}, "/")
+    end
     
     local found = false
     for idx_path, data in pairs(index) do
-        local target_path = idx_path:match("^(.-)/%.properties$") or idx_path
-        if target_path == path or target_path:sub(1, #path + 1) == path .. "/" then
+        local entry_path = idx_path:match("^(.-)/%.properties$") or idx_path
+        if is_all or entry_path == target_path_base or entry_path:sub(1, #target_path_base + 1) == target_path_base .. "/" then
             found = true
             
-            local segments = string.split(target_path, "/")
-            local currObj = game
-            for _, segment in ipairs(segments) do
-                if currObj and currObj:FindFirstChild(segment) then
-                    currObj = currObj:FindFirstChild(segment)
-                else
-                    currObj = nil
-                    break
-                end
-            end
-            
-            if currObj then
+            local targetObj = parse_path(entry_path)
+            if targetObj then
                 local obj = read_object(data.sha)
                 if obj and obj.type == "blob" then
                     local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
                     if ok then
-                        applyProperties(currObj, props)
+                        applyProperties(targetObj, props)
                     end
                 end
             end
@@ -1250,8 +1423,11 @@ arguments.createArgument("git", "add", "a", function (...)
         end
     end
 
-    warn_assert(#paths > 0,
-        "hint: Maybe you wanted to say 'git add .'?")
+    if #paths == 0 then
+        print("Nothing specified, nothing added.")
+        print("hint: Maybe you wanted to say 'git add .'?")
+        return
+    end
 
     local has_dot = false
     for _, p in ipairs(paths) do
@@ -1262,7 +1438,7 @@ arguments.createArgument("git", "add", "a", function (...)
     end
 
     if has_dot then
-        local index = {}
+        local index = read_index()
         local seen_ids = {}
         for _, service in ipairs(bash.trackingRoot) do
             if force or not is_ignored(service:GetFullName()) then
@@ -1288,23 +1464,12 @@ arguments.createArgument("git", "add", "a", function (...)
     local seen_ids = {}
 
     for _, target in ipairs(paths) do
-        if target:sub(1, 5) == "game." then
-            target = target:sub(6)
-        end
-        local segments = string.split(target, ".")
-        local currObj = game
+        local currObj = parse_path(target)
 
-        for _, segment in ipairs(segments) do
-            if currObj and currObj:FindFirstChild(segment) then
-                currObj = currObj:FindFirstChild(segment)
-            else
-                currObj = nil
-                break
-            end
+        if not currObj then
+            print("fatal: pathspec '" .. target .. "' did not match any files")
+            return
         end
-
-        assert(currObj,
-            "fatal: pathspec '" .. target .. "' did not match any files")
 
         if dry_run then
             print("add '" .. currObj:GetFullName() .. "'")
@@ -1348,7 +1513,13 @@ local function fetch(remote_name)
     for name, sha in pairs(refs) do
         if name ~= "HEAD" then
             local pack = fetchPackfile(url, sha)
-            unpackObjects(pack)
+            local _, objectsBySha = unpackObjects(pack)
+            for objSha, obj in pairs(objectsBySha) do
+                local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
+                if typeName then
+                    write_object(typeName, obj.content)
+                end
+            end
         end
     end
 end
@@ -1386,6 +1557,13 @@ arguments.createArgument("git", "pull", "", function (...)
 
     local fullPack = fetchPackfile(url, remoteSha)
     local _, objectsBySha = unpackObjects(fullPack)
+
+    for objSha, obj in pairs(objectsBySha) do
+        local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
+        if typeName then
+            write_object(typeName, obj.content)
+        end
+    end
 
     local headCommit = objectsBySha[remoteSha]
     assert(headCommit, "HEAD commit not found in packfile")
@@ -1433,7 +1611,7 @@ arguments.createArgument("git", "rm", "", function (...)
     local tuple = {...}
     local is_cached = false
     local recursive = false
-    local force = false
+    local _force = false
     local paths = {}
 
     for _, arg in ipairs(tuple) do
@@ -1442,13 +1620,16 @@ arguments.createArgument("git", "rm", "", function (...)
         elseif arg == "-r" then
             recursive = true
         elseif arg == "-f" or arg == "--force" then
-            force = true
+            _force = true
         else
             table.insert(paths, arg)
         end
     end
 
-    assert(#paths > 0, "fatal: no path specified")
+    if #paths == 0 then
+        print("fatal: No pathspec was given. Which files should I remove?")
+        return
+    end
 
     local index = read_index()
     local removed = {}
@@ -1480,16 +1661,7 @@ arguments.createArgument("git", "rm", "", function (...)
 
     if not is_cached then
         for _, path in ipairs(removed) do
-            local segments = string.split(path, "/")
-            local currObj = game
-            for _, segment in ipairs(segments) do
-                if currObj and currObj:FindFirstChild(segment) then
-                    currObj = currObj:FindFirstChild(segment)
-                else
-                    currObj = nil
-                    break
-                end
-            end
+            local currObj = parse_path(path)
             if currObj and currObj ~= game then
                 currObj:Destroy()
             end
@@ -1589,6 +1761,10 @@ arguments.createArgument("git", "commit", "", function(...)
         return
     end
 
+    if message == "default commit message" then
+        warn("hint: It's recommended to provide a descriptive commit message with -m")
+    end
+
     local parent_sha = get_ref("HEAD")
     local tree_sha = write_tree(index)
     local commit_content = "tree " .. tree_sha .. "\n"
@@ -1676,8 +1852,6 @@ arguments.createArgument("git", "init", "", function (...)
         i += 1
     end
 
-    local reinit_required = false
-
     local root = bash.getGitFolderRoot()
     if not root then 
         root = bash.createGitFolderRoot()
@@ -1688,10 +1862,10 @@ arguments.createArgument("git", "init", "", function (...)
         if not quiet then
             print("Reinitialized existing Git repository in " .. game.Name)
         end
-        reinit_required = true
+        local _reinit_required = true
     end
 
-    local hooks = bash.createFolder(root, "hooks")
+    bash.createFolder(root, "hooks")
     local info = bash.createFolder(root, "info")
 
     bash.createFolder(root, "objects/info")
@@ -1722,6 +1896,7 @@ arguments.createArgument("git", "init", "", function (...)
     ]])
 
     bash.createFile(bash.getGitFolderRoot(), "index", "")
+    bash.createFile(bash.getGitFolderRoot().Parent, ".rogit_project", "This repository is recognized as a valid roGit project.")
     bash.createFile(bash.getGitFolderRoot().Parent, ".rogitignore", [[
     # Instances to ignore in ro-git
     .rogitignore
@@ -1739,37 +1914,80 @@ clones a git repository
 arguments.createArgument("git", "clone", "", function(...)
     local tuple = {...}
     local branch_override = nil
-    local positional = {}
+    local url = nil
+    local repo_dir = nil
 
     local i = 1
     while i <= #tuple do
         if (tuple[i] == "-b" or tuple[i] == "--branch") and tuple[i + 1] then
             branch_override = tuple[i + 1]
             i += 1
-        else
-            table.insert(positional, tuple[i])
+        elseif tuple[i]:sub(1,1) ~= "-" then -- Positional argument
+            if not url then
+                url = tuple[i]
+            elseif not repo_dir then
+                repo_dir = tuple[i]
+            end
         end
         i += 1
     end
 
-    assert(#positional >= 1, "No argument supplied!")
-    local url = positional[1]:gsub("%.git$", "")
+    if not url or url == "" then
+        print("fatal: You must specify a repository to clone.")
+        print("\nusage: git clone [<options>] [--] <repo> [<dir>]\n\n    -v, --verbose         be more verbose\n    -q, --quiet           be more quiet\n    --progress            force progress reporting\n    -n, --no-checkout     don't create a checkout")
+        return
+    end
 
-    local repoName = url:match("/([^/]+)$")
+    local repoName = url:match("/([^/]+)$") or "repository"
+    if repo_dir then
+        repoName = repo_dir
+    end
     print("Cloning into '" .. repoName .. "'...")
 
-    local refs = discoverRefs(url .. ".git")
+    if not bash.getGitFolderRoot() then
+        arguments.execute("git", "init", "-q")
+    end
+    arguments.execute("git", "remote", "add", "origin", url)
+
+    local refs = discoverRefs(url)
     local headSha
     if branch_override then
         headSha = refs["refs/heads/" .. branch_override]
         assert(headSha, "fatal: Remote branch '" .. branch_override .. "' not found in upstream origin")
     else
-        headSha = refs["HEAD"] or refs["refs/heads/master"] or refs["refs/heads/main"]
-        assert(headSha, "Could not find a suitable branch (HEAD/master/main) in discovery response")
+       headSha = refs["HEAD"] or refs["refs/heads/master"] or refs["refs/heads/main"]
+    end
+    
+    if not headSha or headSha == "" then
+        print("warning: You appear to have cloned an empty repository.")
+        return
     end
 
-    local fullPack = fetchPackfile(url .. ".git", headSha)
-    local _, objectsBySha = unpackObjects(fullPack)
+    local packFile = fetchPackfile(url, headSha)
+    local _, objectsBySha = unpackObjects(packFile)
+
+    for sha, obj in pairs(objectsBySha) do
+        local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
+        if typeName then
+            write_object(typeName, obj.content)
+        end
+    end
+
+    local activeBranch = branch_override
+    if not activeBranch then
+        for refName, sha in pairs(refs) do
+            if sha == headSha and refName:match("^refs/heads/") then
+                activeBranch = refName:sub(12)
+                break
+            end
+        end
+        activeBranch = activeBranch or "master"
+    end
+    
+    local gitRoot = bash.getGitFolderRoot()
+    bash.modifyFileContents(gitRoot, "HEAD", "ref: refs/heads/" .. activeBranch)
+    bash.createFile(bash.createFolder(gitRoot, "refs/heads"), activeBranch, headSha)
+    bash.createFile(bash.createFolder(gitRoot, "refs/remotes/origin"), activeBranch, headSha)
 
     local headCommit = objectsBySha[headSha]
     assert(headCommit, "HEAD commit not found in packfile")
@@ -1781,6 +1999,42 @@ arguments.createArgument("git", "clone", "", function(...)
     assert(treeObj, "Missing root tree: " .. treeSha)
 
     local content = treeObj.content
+    
+    local is_rogit_project = false
+    local check_pos = 1
+    while check_pos <= #content do
+        local spacePos = content:find(" ", check_pos, true)
+        local nullPos = content:find("\0", spacePos, true)
+        local child_name = content:sub(spacePos + 1, nullPos - 1)
+        if child_name == "ServerStorage" then
+            local rawSha = content:sub(nullPos + 1, nullPos + 20)
+            local ss_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+            local ssObj = objectsBySha[ss_sha]
+            if ssObj then
+                local ss_content = ssObj.content
+                local ss_pos = 1
+                while ss_pos <= #ss_content do
+                    local ss_spacePos = ss_content:find(" ", ss_pos, true)
+                    local ss_nullPos = ss_content:find("\0", ss_spacePos, true)
+                    local ss_name = ss_content:sub(ss_spacePos + 1, ss_nullPos - 1)
+                    if ss_name == ".rogit_project" then
+                        is_rogit_project = true
+                        break
+                    end
+                    ss_pos = ss_nullPos + 21
+                end
+            end
+        end
+        check_pos = nullPos + 21
+    end
+    
+    if not is_rogit_project then
+        print("fatal: repository does not appear to be a rogit project (missing .rogit_project file at ServerStorage root).")
+        local gitRoot_to_destroy = bash.getGitFolderRoot()
+        if gitRoot_to_destroy then gitRoot_to_destroy:Destroy() end
+        return
+    end
+
     local pos = 1
     while pos <= #content do
         local spacePos = content:find(" ", pos, true)
@@ -2056,13 +2310,8 @@ arguments.createArgument("git", "push", "", function(...)
     
     local url = remote_section.url
 
-    local authHeaders = {}
-    local auth = getAuthHeader()
-    if auth then
-        authHeaders["Authorization"] = auth
-    end
-
-    local refs = discoverRefs(url, "git-receive-pack", authHeaders)
+    -- authHeaders are now handled internally inside discoverRefs -> url_request_with_retry
+    local refs = discoverRefs(url, "git-receive-pack")
     local remoteSha = refs["refs/heads/" .. branch_name] or refs["HEAD"]
 
     local localSha = get_ref("HEAD")
@@ -2107,7 +2356,7 @@ arguments.createArgument("git", "push", "", function(...)
         end
     end
 
-    local objects = collectObjects(localSha, force_push and nil or remoteSha)
+    local objects = collectObjects(localSha, if force_push then nil else remoteSha)
 
     local objectCount = 0
     for _ in pairs(objects) do
@@ -2131,21 +2380,23 @@ arguments.createArgument("git", "push", "", function(...)
 
     local body = refPkt .. flushStr .. packFile
 
-    local res = HttpService:RequestAsync({
-        Url = url .. "/git-receive-pack",
+    local req = {
+        Url = return_urls(url, "git-receive-pack")[2],
         Method = "POST",
         Headers = {
             ["Content-Type"] = "application/x-git-receive-pack-request",
             ["Accept"] = "application/x-git-receive-pack-result",
-            ["Authorization"] = getAuthHeader()
+            ["Authorization"] = getAuthHeader(url:match("^(https?://[^/]+)") or url)
         },
         Body = body,
-    })
+    }
+
+    local ok, res = url_request_with_retry(req)
+    assert(ok, "Push request error")
 
     if res.StatusCode == 200 then
         local remote_messages = {}
         local success_message = "To " .. url .. "\n"
-        local match_found = false
 
         local response_buffer = buffer.fromstring(res.Body)
         local cursor = 0
@@ -2154,48 +2405,39 @@ arguments.createArgument("git", "push", "", function(...)
             cursor = next
             if data then
                 local channel = buffer.readu8(data, 0)
-                local line = buffer.tostring(data, 1)
+                local line = buffer.tostring(data)
+                line = line:sub(2)
                 
-                -- Strip trailing whitespace/newlines
                 line = line:gsub("[\r\n]+", "")
 
                 if channel == 2 then 
                     table.insert(remote_messages, "remote: " .. line)
                 elseif channel == 1 then
                     if line:find("^unpack ") then
-                        -- Just typical unpack status, safe to ignore silently or store
                     elseif line:find("^ok ") then
                         if not remoteSha or remoteSha == "" then
                             success_message = success_message .. " * [new branch]      " .. branch_name .. " -> " .. branch_name .. "\n"
                         else
                             success_message = success_message .. "   " .. string.sub(oldSha, 1, 7) .. ".." .. string.sub(localSha, 1, 7) .. "  " .. branch_name .. " -> " .. branch_name .. "\n"
                         end
-                        match_found = true
                     elseif line:find("^ng ") then
-                        local ref, reason = line:match("^ng (.-) (.+)$")
+                        local _ref, reason = line:match("^ng (.-) (.+)$")
                         success_message = success_message .. " ! [rejected]        " .. branch_name .. " -> " .. branch_name .. " (" .. (reason or "unknown") .. ")\n"
-                        match_found = true
                     elseif line ~= "" and not line:find("0000") then
-                        -- For any unknown channel 1 messages that aren't flushes
-                        -- success_message = success_message .. " " .. line .. "\n"
                     end
                 else
-                    -- For non-sideband environments, string parsing direct
                     local full_line = buffer.tostring(data)
                     full_line = full_line:gsub("[\r\n]+", "")
                     if full_line:find("^unpack ") then
-                        -- skip
                     elseif full_line:find("^ok ") then
                         if not remoteSha or remoteSha == "" then
                             success_message = success_message .. " * [new branch]      " .. branch_name .. " -> " .. branch_name .. "\n"
                         else
                             success_message = success_message .. "   " .. string.sub(oldSha, 1, 7) .. ".." .. string.sub(localSha, 1, 7) .. "  " .. branch_name .. " -> " .. branch_name .. "\n"
                         end
-                        match_found = true
                     elseif full_line:find("^ng ") then
-                        local ref, reason = full_line:match("^ng (.-) (.+)$")
+                        local _ref, reason = full_line:match("^ng (.-) (.+)$")
                         success_message = success_message .. " ! [rejected]        " .. branch_name .. " -> " .. branch_name .. " (" .. (reason or "unknown") .. ")\n"
-                        match_found = true
                     end
                 end
             end
@@ -2230,6 +2472,7 @@ arguments.createArgument("git", "status", "st", function()
 
     local index = read_index()
     local headSha = get_ref("HEAD")
+    local current_branch = get_current_branch() or "master"
 
     local last_index = {}
     local last_index_str = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
@@ -2255,10 +2498,10 @@ arguments.createArgument("git", "status", "st", function()
     end
 
     if not headSha or headSha == "" then
-        print("On branch master")
+        print("On branch " .. current_branch)
         print("\nNo commits yet\n")
     else
-        print("On branch master")
+        print("On branch " .. current_branch)
     end
 
     local has_staged = #staged_new + #staged_modified + #staged_deleted > 0
@@ -2390,9 +2633,9 @@ arguments.createArgument("git", "branch", "br", function(...)
         local old_branch = tuple[2]
         local new_branch = tuple[3]
         if not new_branch then
-            new_branch = old_branch
             local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
             old_branch = current_ref:match("ref: refs/heads/(.+)")
+            new_branch = old_branch
         end
         assert(old_branch and new_branch, "usage: git branch -m [<old>] <new>")
 
@@ -2416,6 +2659,22 @@ arguments.createArgument("git", "branch", "br", function(...)
     end
 
     local branch_name = tuple[1]
+    if not branch_name or branch_name == "" then
+        -- list branches if no name provided
+        local heads = bash.getGitFolderRoot():FindFirstChild("refs")
+        if heads then heads = heads:FindFirstChild("heads") end
+        if heads then
+            local current = get_current_branch()
+            for _, child in ipairs(heads:GetChildren()) do
+                if child.Name == current then
+                    print("* " .. child.Name)
+                else
+                    print("  " .. child.Name)
+                end
+            end
+        end
+        return
+    end
     assert(is_valid_branch_name(branch_name), "fatal: '" .. tostring(branch_name) .. "' is not a valid branch name.")
     
     local start_point = tuple[2]
@@ -2437,6 +2696,12 @@ arguments.createArgument("git", "switch", "", function(...)
         branch_name = tuple[2]
     else
         branch_name = tuple[1]
+    end
+    
+    if not branch_name or branch_name == "" then
+        print("fatal: branch name required")
+        print("usage: git switch [-c | --create] <branch>")
+        return
     end
     
     assert(is_valid_branch_name(branch_name), "fatal: invalid reference: " .. tostring(branch_name))
@@ -2478,18 +2743,33 @@ arguments.createArgument("git", "reset", "", function(...)
     local paths = {}
 
     local i = 1
+    local positional = {}
     while i <= #tuple do
         local arg = tuple[i]
         if arg == "--soft" or arg == "--mixed" or arg == "--hard" then
             mode = arg
         elseif arg:sub(1, 1) ~= "-" then
-            if i == 1 or (i == 2 and tuple[1]:sub(1,1) == "-") then
-                commit_target = arg
-            else
-                table.insert(paths, arg)
-            end
+            table.insert(positional, arg)
         end
         i += 1
+    end
+
+    if #positional > 0 then
+        local first = positional[1]
+        local is_commit = false
+        if first == "HEAD" or get_ref("refs/heads/" .. first) then
+            is_commit = true
+        elseif #first >= 7 and first:match("^%x+$") then
+            is_commit = true
+        end
+        
+        if is_commit then
+            commit_target = table.remove(positional, 1)
+        end
+        
+        for _, p in ipairs(positional) do
+            table.insert(paths, p)
+        end
     end
 
     if #paths > 0 then
@@ -2626,7 +2906,7 @@ arguments.createArgument("git", "reset", "", function(...)
                 local pos = 1
                 while pos <= #content do
                     local spacePos = content:find(" ", pos, true)
-                    local mode_str = content:sub(pos, spacePos - 1)
+                    local _entry_mode = content:sub(pos, spacePos - 1)
                     local nullPos = content:find("\0", spacePos, true)
                     local rawSha = content:sub(nullPos + 1, nullPos + 20)
                     local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
@@ -2647,7 +2927,7 @@ arguments.createArgument("git", "reset", "", function(...)
         local pos = 1
         while pos <= #content do
             local spacePos = content:find(" ", pos, true)
-            local mode_str = content:sub(pos, spacePos - 1)
+            local entry_mode = content:sub(pos, spacePos - 1)
             local nullPos = content:find("\0", spacePos, true)
             local name = content:sub(spacePos + 1, nullPos - 1)
             local rawSha = content:sub(nullPos + 1, nullPos + 20)
@@ -2656,7 +2936,7 @@ arguments.createArgument("git", "reset", "", function(...)
             
             local full_path = prefix == "" and name or (prefix .. "/" .. name)
             
-            if mode_str == "40000" then
+            if entry_mode == "40000" then
                 build_index_from_tree(child_sha, full_path, new_index)
                 if mode == "--hard" then
                     local segments = string.split(full_path, "/")
@@ -2672,7 +2952,7 @@ arguments.createArgument("git", "reset", "", function(...)
                     end
                 end
             else
-                new_index[full_path] = {sha = child_sha, mode = mode_str}
+                new_index[full_path] = {sha = child_sha, mode = entry_mode}
             end
         end
     end
@@ -2704,33 +2984,37 @@ arguments.createArgument("git", "reset", "", function(...)
         end
 
         for _, service in ipairs(bash.trackingRoot) do
-            if tree_objects_by_service then
-            end
             local obj = read_object(target_tree_sha)
             if obj then
                 local content = obj.content
                 local pos = 1
                 while pos <= #content do
                     local spacePos = content:find(" ", pos, true)
-                    local mode_str = content:sub(pos, spacePos - 1)
+                    local entry_mode = content:sub(pos, spacePos - 1)
                     local nullPos = content:find("\0", spacePos, true)
                     local name = content:sub(spacePos + 1, nullPos - 1)
                     local rawSha = content:sub(nullPos + 1, nullPos + 20)
                     local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
                     pos = nullPos + 21
                     
-                    if mode_str == "40000" and service.Name == name then
-                        local childProps = peekPropertiesBlob(fake_remote_map, child_sha)
-                        if childProps then
-                            applyProperties(service, childProps)
-                        end
-                        writeTree(fake_remote_map, child_sha, service, name)
+                    if entry_mode == "40000" and service.Name == name then
+                        local objectsByShaFallback = setmetatable({}, {
+                            __index = function(_, key)
+                                local obj = read_object(key)
+                                if not obj then return nil end
+                                return {
+                                    objType = ({commit=1, tree=2, blob=3, tag=4})[obj.type],
+                                    content = obj.content
+                                }
+                            end
+                        })
+                        writeTree(objectsByShaFallback, child_sha, service, name)
                     end
                 end
             end
         end
         print("HEAD is now at " .. target_sha:sub(1, 7))
-    elseif mode == "--mixed" then
+    elseif mode == "--mixed" or mode == "--soft" then
         print("Unstaged changes after reset:")
     end
 end)
@@ -2753,6 +3037,25 @@ arguments.createArgument("git", "config", "", function(...)
         return
     end
     
+    local key_parts = string.split(key, ".")
+    local section = key_parts[1]
+    local property = key_parts[2]
+    
+    local sensitive_keys = {
+        ["user.name"] = true,
+        ["user.email"] = true,
+        ["user.token"] = true,
+        ["user.password"] = true
+    }
+
+    if value then
+        if (is_global or sensitive_keys[key]) and ACTIVE_PLUGIN then
+            ACTIVE_PLUGIN:SetSetting(key, value)
+            print("Set '" .. key .. "' in plugin settings")
+            return
+        end
+    end
+
     local root = bash.getGitFolderRoot()
     if not root then
         print("fatal: not in a git directory")
@@ -2762,10 +3065,6 @@ arguments.createArgument("git", "config", "", function(...)
     local config_content = bash.getFileContents(root, "config")
     local loaded_conf = ini_parser.parseIni(config_content)
     
-    local key_parts = string.split(key, ".")
-    local section = key_parts[1]
-    local property = key_parts[2]
-    
     if value then
         if not loaded_conf[section] then
             loaded_conf[section] = {}
@@ -2773,8 +3072,9 @@ arguments.createArgument("git", "config", "", function(...)
         loaded_conf[section][property] = value
         bash.modifyFileContents(root, "config", ini_parser.serializeIni(loaded_conf))
     else
-        if loaded_conf[section] and loaded_conf[section][property] then
-            print(loaded_conf[section][property])
+        local val = getConfigValue(key)
+        if val then
+            print(val)
         end
     end
 end)

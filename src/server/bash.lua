@@ -13,6 +13,7 @@ Bash.trackingRoot = {
     game:GetService("ServerScriptService"),
     game:GetService("ServerStorage"),
     game:GetService("StarterGui"),
+    game:GetService("Lighting"),
     game:GetService("StarterPack"),
     game:GetService("StarterPlayer"),
     game:GetService("SoundService"),
@@ -32,6 +33,11 @@ function Bash.getGitFolderRoot()
     if conf.gitRoot:FindFirstChild(".git") then
         return conf.gitRoot:FindFirstChild(".git")
     end
+    return nil
+end
+
+function Bash.exists(parent, name)
+    return parent:FindFirstChild(name) ~= nil
 end
 
 -- Creates .git folder (e.g. for init)
@@ -50,17 +56,31 @@ function Bash.createFile(parent, name, content)
     assert(content, "Content is nil!")
 
     if parent:FindFirstChild(name) then 
-        assert("File already exists!")
-        return
+        warn("Bash: File '" .. name .. "' already exists in '" .. parent:GetFullName() .. "'")
+        return parent:FindFirstChild(name)
     end
 
-    -- create "File" (stringvalue)
-    local str = Instance.new("StringValue")
-    str.Parent = parent
-    str.Value = content
-    str.Name = name
-
-    return str
+    if #content <= 199000 then
+        -- create "File" (stringvalue)
+        local str = Instance.new("StringValue")
+        str.Parent = parent
+        str.Value = content
+        str.Name = name
+        return str
+    else
+        local folder = Instance.new("Folder")
+        folder.Name = name
+        folder.Parent = parent
+        
+        local chunks = math.ceil(#content / 199000)
+        for i = 1, chunks do
+            local chunkStr = Instance.new("StringValue")
+            chunkStr.Name = tostring(i)
+            chunkStr.Value = string.sub(content, (i-1)*199000 + 1, i*199000)
+            chunkStr.Parent = folder
+        end
+        return folder
+    end
 end
 
 -- Get folders
@@ -87,7 +107,24 @@ function Bash.getFileContents(parent, name)
     
     if not file then return nil end
 
-    return file.Value
+    if file:IsA("StringValue") then
+        return file.Value
+    elseif file:IsA("Folder") then
+        local result = {}
+        local i = 1
+        while true do
+            local chunk = file:FindFirstChild(tostring(i))
+            if chunk and chunk:IsA("StringValue") then
+                table.insert(result, chunk.Value)
+                i = i + 1
+            else
+                break
+            end
+        end
+        return table.concat(result, "")
+    end
+
+    return nil
 end
 
 function Bash.modifyFileContents(parent, name, content)
@@ -96,10 +133,37 @@ function Bash.modifyFileContents(parent, name, content)
     assert(name, "File name is nil!")
     assert(content, "Content is nil!")
 
-    assert(parent:FindFirstChild(name), "File doesnt exist! Looking for " .. content)
-
     local str = parent:FindFirstChild(name)
-    str.Value = content
+    if not str then
+        warn("Bash: Attempting to modify non-existent file '" .. name .. "' in '" .. parent:GetFullName() .. "'. Creating instead.")
+        return Bash.createFile(parent, name, content)
+    end
+    
+    if str:IsA("StringValue") then
+        if #content <= 199000 then
+            str.Value = content
+            return str
+        else
+            str:Destroy()
+            return Bash.createFile(parent, name, content)
+        end
+    elseif str:IsA("Folder") then
+        if #content <= 199000 then
+            str:Destroy()
+            return Bash.createFile(parent, name, content)
+        else
+            str:ClearAllChildren()
+            local chunks = math.ceil(#content / 199000)
+            for i = 1, chunks do
+                local chunkStr = Instance.new("StringValue")
+                chunkStr.Name = tostring(i)
+                chunkStr.Value = string.sub(content, (i-1)*199000 + 1, i*199000)
+                chunkStr.Parent = str
+            end
+            return str
+        end
+    end
+    return nil
 end
 
 -- Create files

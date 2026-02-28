@@ -5,10 +5,11 @@ arguments.existingCommands = {
 }
 
 --[[
-Returns existingArguments
+Returns existingCommands
 ]]
 function arguments.returnAllArguments(cmd)
-    return arguments[cmd].existingArguments
+    if not cmd then cmd = "git" end
+    return arguments.existingCommands[cmd] and arguments.existingCommands[cmd].args or {}
 end
 
 local function levenshtein(s1, s2)

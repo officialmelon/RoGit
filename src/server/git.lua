@@ -106,6 +106,10 @@ local function serialize_property(prop)
         r = {Guid = prop:GetAttribute("_rogit_id")}
     elseif type == "Content" then
         r = tostring(prop)
+    else
+        if typeof(prop) == "userdata" or typeof(prop) == "function" or typeof(prop) == "thread" then
+            r = tostring(prop)
+        end
     end
 
     return r
@@ -209,7 +213,7 @@ local function read_object(sha)
     if not raw64 then return nil end
 
     local data = hashlib.base64_to_bin(raw64)
-    local raw = zlib.decompressZlib(data)
+    local raw = pcall(function() return zlib.decompressZlib(data) end) and zlib.decompressZlib(data) or nil
     if not raw then return nil end
 
     local nullIndex = string.find(raw, "\0", 1, true)
@@ -265,6 +269,28 @@ local function serialize_instance(instance)
                     value = val,
                     valueType = typeof(val)
                 })
+            end
+        end)
+    end
+    
+    if instance:IsA("LuaSourceContainer") then
+        pcall(function()
+            local found = false
+            for _, prop in ipairs(instanceProperties) do
+                if prop.name == "Source" then
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                local val = (instance :: any).Source
+                if val ~= nil then
+                    table.insert(instanceProperties, {
+                        name = "Source",
+                        value = val,
+                        valueType = "string"
+                    })
+                end
             end
         end)
     end
@@ -325,31 +351,28 @@ local function is_ignored(path)
     local path_slashes = string.gsub(path, "%.", "/")
 
     for _, pattern in ipairs(ignore_patterns) do
-        if path_slashes == pattern then return true end
-        if string.sub(path_slashes, 1, #pattern + 1) == pattern .. "/" then return true end
-        if string.sub(path_slashes, -#pattern - 1) == "/" .. pattern then return true end
-        if string.find(path_slashes, "/" .. pattern .. "/", 1, true) then return true end
+        local is_glob = string.find(pattern, "*")
+        if is_glob then
+            local lua_pattern = "^" .. string.gsub(pattern, "([%.%+%-%?%[%]%^%$%(%)])", "%%%1")
+            lua_pattern = string.gsub(lua_pattern, "%*", ".*") .. "$"
+            if string.match(path_slashes, lua_pattern) then return true end
+            
+            local lua_pattern_endswith = "/" .. string.gsub(pattern, "([%.%+%-%?%[%]%^%$%(%)])", "%%%1")
+            lua_pattern_endswith = string.gsub(lua_pattern_endswith, "%*", ".*") .. "$"
+            if string.match(path_slashes, lua_pattern_endswith) then return true end
+        else
+            if path_slashes == pattern then return true end
+            if string.sub(path_slashes, 1, #pattern + 1) == pattern .. "/" then return true end
+            if string.sub(path_slashes, -#pattern - 1) == "/" .. pattern then return true end
+            if string.find(path_slashes, "/" .. pattern .. "/", 1, true) then return true end
+        end
     end
     return false
 end
 
-local function stage_instance(instance, index, seen_ids, parentVirtualPath)
+local function stage_instance(instance, index, seen_ids, assignedVirtualPath)
     seen_ids = seen_ids or {}
-    local pathSegments = {}
-    if parentVirtualPath then
-        for part in string.gmatch(parentVirtualPath, "[^/]+") do
-            table.insert(pathSegments, part)
-        end
-        table.insert(pathSegments, instance.Name)
-    else
-        local curr = instance
-        while curr and curr ~= game do
-            table.insert(pathSegments, 1, curr.Name)
-            curr = curr.Parent
-        end
-    end
-
-    local fullPath = table.concat(pathSegments, "/")
+    local fullPath = assignedVirtualPath
 
     local hasValidChildren = false
     for _, child in ipairs(instance:GetChildren()) do
@@ -359,18 +382,8 @@ local function stage_instance(instance, index, seen_ids, parentVirtualPath)
         end
     end
 
-    local baseName = fullPath
-    local collisionBase = baseName
     if hasValidChildren then
         fullPath = fullPath .. "/.properties"
-    end
-
-    local originalPath = fullPath
-    local collisionCount = 1
-    while index[fullPath] do
-        fullPath = originalPath .. " [" .. tostring(collisionCount) .. "]"
-        collisionBase = baseName .. " [" .. tostring(collisionCount) .. "]"
-        collisionCount += 1
     end
 
     local current_id = instance:GetAttribute(ROGIT_ID)
@@ -393,8 +406,6 @@ local function stage_instance(instance, index, seen_ids, parentVirtualPath)
         mode = "100644",
         sha = blobSha
     }
-    
-    return collisionBase
 end
 
 local function stage_recursive(instance, index, seen_ids, perf, parentVirtualPath)
@@ -402,17 +413,48 @@ local function stage_recursive(instance, index, seen_ids, perf, parentVirtualPat
     seen_ids = seen_ids or {}
     perf = perf or { last_yield = os.clock() }
 
-    local newVirtualPath = stage_instance(instance, index, seen_ids, parentVirtualPath)
+    local myVirtualPath = instance.Name
+    if parentVirtualPath then
+        myVirtualPath = parentVirtualPath .. "/" .. instance.Name
+    end
+    
+    -- Root services passed to stage_recursive initially get their own name as path
+    if not parentVirtualPath then
+        myVirtualPath = instance.Name
+    else
+        -- If we were called from a parent, our path is already set by parentVirtualPath
+        myVirtualPath = parentVirtualPath
+    end
+
+    stage_instance(instance, index, seen_ids, myVirtualPath)
     
     if os.clock() - perf.last_yield > 0.03 then
         task.wait()
         perf.last_yield = os.clock()
     end
 
+    local sibling_counts = {}
+    local valid_children = {}
     for _, child in ipairs(instance:GetChildren()) do
         if child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
-            stage_recursive(child, index, seen_ids, perf, newVirtualPath)
+            local n = child.Name
+            sibling_counts[n] = (sibling_counts[n] or 0) + 1
+            table.insert(valid_children, child)
         end
+    end
+    
+    local current_indices = {}
+    for _, child in ipairs(valid_children) do
+        local n = child.Name
+        current_indices[n] = (current_indices[n] or 0) + 1
+        
+        local childVirtualName = n
+        if sibling_counts[n] > 1 then
+            childVirtualName = n .. " [" .. tostring(current_indices[n]) .. "]"
+        end
+        
+        local childVirtualPath = myVirtualPath .. "/" .. childVirtualName
+        stage_recursive(child, index, seen_ids, perf, childVirtualPath)
     end
 end
 
@@ -656,10 +698,14 @@ end
 local function b64Encode(data)
     local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     local res = {}
+    local last_yield = os.clock()
     for i = 1, #data, 3 do
-        local n = 0
+        if os.clock() - last_yield > 0.03 then
+            task.wait()
+            last_yield = os.clock()
+        end
         local c1, c2, c3 = string.byte(data, i, i + 2)
-        n = bit32.bor(bit32.lshift(c1 or 0, 16), bit32.lshift(c2 or 0, 8), c3 or 0)
+        local n = bit32.bor(bit32.lshift(c1 or 0, 16), bit32.lshift(c2 or 0, 8), c3 or 0)
         table.insert(res, string.sub(b, bit32.rshift(n, 18) + 1, bit32.rshift(n, 18) + 1))
         table.insert(res, string.sub(b, bit32.band(bit32.rshift(n, 12), 63) + 1, bit32.band(bit32.rshift(n, 12), 63) + 1))
         table.insert(res, c2 and string.sub(b, bit32.band(bit32.rshift(n, 6), 63) + 1, bit32.band(bit32.rshift(n, 6), 63) + 1) or "=")
@@ -967,6 +1013,41 @@ local function peekPropertiesBlob(objectsBySha, treeSha)
     return nil
 end
 
+local pending_instance_refs = {}
+
+local function resolve_instance_refs()
+    if #pending_instance_refs == 0 then return end
+    
+    local guid_map = {}
+    local function map_guids(parent)
+        for _, child in ipairs(parent:GetChildren()) do
+            if child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
+                local guid = child:GetAttribute(ROGIT_ID)
+                if guid then
+                    guid_map[guid] = child
+                end
+                map_guids(child)
+            end
+        end
+    end
+    
+    -- `bash.trackingRoot` needs to be used to map the tracked services
+    for _, service in ipairs(bash.trackingRoot) do
+        map_guids(service)
+    end
+    
+    for _, refPending in ipairs(pending_instance_refs) do
+        local target = guid_map[refPending.targetGuid]
+        if target then
+            pcall(function()
+                refPending.inst[refPending.prop] = target
+            end)
+        end
+    end
+    
+    table.clear(pending_instance_refs)
+end
+
 local function applyProperties(instance, props)
     for _, propData in ipairs(props) do
         if propData.name == "_attributes" and propData.valueType == "_attributes" then
@@ -981,18 +1062,32 @@ local function applyProperties(instance, props)
                 pcall(function() instance:AddTag(tag) end)
             end
         elseif propData.name ~= "ClassName" and propData.name ~= "Parent" then
-            local val = deserialize_property(propData.value, propData.valueType)
-            if val ~= nil then
-                if propData.name == "MeshId" and instance:IsA("MeshPart") then
-                    pcall(function()
-                        local InsertService = game:GetService("InsertService")
-                        local loadedMesh = InsertService:CreateMeshPartAsync(val, instance.CollisionFidelity, instance.RenderFidelity)
-                        instance:ApplyMesh(loadedMesh)
-                    end)
-                else
-                    pcall(function()
-                        instance[propData.name] = val
-                    end)
+            if propData.valueType == "Instance" then
+                if type(propData.value) == "table" and propData.value.Guid then
+                    table.insert(pending_instance_refs, {
+                        inst = instance,
+                        prop = propData.name,
+                        targetGuid = propData.value.Guid
+                    })
+                end
+            else
+                local val = deserialize_property(propData.value, propData.valueType)
+                if val ~= nil then
+                    if propData.name == "MeshId" and instance:IsA("MeshPart") then
+                        pcall(function()
+                            local InsertService = game:GetService("InsertService")
+                            local loadedMesh = InsertService:CreateMeshPartAsync(val, instance.CollisionFidelity, instance.RenderFidelity)
+                            instance:ApplyMesh(loadedMesh)
+                        end)
+                    elseif propData.name == "Source" and instance:IsA("LuaSourceContainer") then
+                        pcall(function()
+                            (instance :: any).Source = val
+                        end)
+                    else
+                        pcall(function()
+                            instance[propData.name] = val
+                        end)
+                    end
                 end
             end
         end
@@ -1179,7 +1274,8 @@ arguments.createArgument("git", "help", "h", function (...)
             init = "git-init - Create an empty Git repository or reinitialize an existing one.\n\nUsage: git init [-q | --quiet] [-b <branch-name>]",
             log = "git-log - Show commit logs.\n\nUsage: git log [<options>]",
             config = "git-config - Get and set repository or global options.\n\nUsage: git config [--global] <name> [<value>]",
-            version = "git-version - Show the RoGit version information.\n\nUsage: git version"
+            version = "git-version - Show the RoGit version information.\n\nUsage: git version",
+            credential = "git-credential - Prompt for and cache user credentials.\n\nUsage: git credential (fill|approve|reject)"
         }
 
         if cmd == "-a" or cmd == "--all" then
@@ -1283,6 +1379,65 @@ arguments.createArgument("git", "diff", "", function()
             end
         end
     end
+
+    local untracked = {}
+    local function traverse_untracked_for_diff(parent, path_prefix, seen_ids)
+        local child_counts = {}
+        for _, child in ipairs(parent:GetChildren()) do
+            if not is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
+                child_counts[child.Name] = (child_counts[child.Name] or 0) + 1
+            end
+        end
+
+        local seen_local = {}
+        for _, child in ipairs(parent:GetChildren()) do
+            if not is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
+                local rogit_id = child:GetAttribute(ROGIT_ID)
+                local collisionBase = child.Name
+                local virtualName = child.Name
+                
+                if child_counts[child.Name] > 1 then
+                    local id_to_use = rogit_id
+                    if not id_to_use or id_to_use == "" or seen_ids[id_to_use] then
+                        id_to_use = HttpService:GenerateGUID(false)
+                        child:SetAttribute(ROGIT_ID, id_to_use)
+                    end
+                    seen_ids[id_to_use] = true
+                    
+                    seen_local[child.Name] = (seen_local[child.Name] or 0) + 1
+                    virtualName = collisionBase .. " [" .. tostring(seen_local[child.Name]) .. "]"
+                end
+                
+                local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
+                
+                local hasValidChildren = false
+                for _, sub in ipairs(child:GetChildren()) do
+                    if sub ~= bash.getGitFolderRoot() and not is_ignored(sub:GetFullName()) and not sub:IsDescendantOf(bash.getGitFolderRoot()) then
+                        hasValidChildren = true
+                        break
+                    end
+                end
+                
+                local index_path = hasValidChildren and (my_path .. "/.properties") or my_path
+                if not index[index_path] and not index[my_path] then
+                    untracked[my_path] = true
+                end
+                
+                traverse_untracked_for_diff(child, my_path, seen_ids)
+            end
+        end
+    end
+
+    local global_seen = {}
+    for _, child in ipairs(bash.trackingRoot) do
+        local child_path = child.Name
+        traverse_untracked_for_diff(child, child_path, global_seen)
+    end
+    
+    for path, _ in pairs(untracked) do
+        print("\27[31m??\27[0m " .. path)
+        has_diff = true
+    end
     if not has_diff then
         print("Everything up-to-date with index.")
     end
@@ -1313,9 +1468,14 @@ arguments.createArgument("git", "merge", "", function(...)
         return
     end
     
-    print("Updating " .. get_ref("HEAD"):sub(1,7) .. ".." .. target_sha:sub(1,7))
-    print("Fast-forward")
-    arguments.execute("git", "reset", "--hard", target_sha)
+    local head_sha = get_ref("HEAD")
+    if head_sha == target_sha then
+        print("Already up to date.")
+        return
+    end
+    
+    warn("roGit does not fully support automatic branch merging yet.")
+    print("If you want to overwrite your current branch with '" .. branch .. "', run: git reset --hard " .. branch)
 end)
 
 arguments.createArgument("git", "mv", "", function(...)
@@ -1387,6 +1547,8 @@ arguments.createArgument("git", "restore", "", function(...)
             end
         end
     end
+    
+    resolve_instance_refs()
     
     if found then
         print("Restored " .. path)
@@ -1601,6 +1763,8 @@ arguments.createArgument("git", "pull", "", function (...)
         end
     end
 
+    resolve_instance_refs()
+
     update_ref("HEAD", remoteSha)
     update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, remoteSha)
 
@@ -1651,6 +1815,9 @@ arguments.createArgument("git", "rm", "", function (...)
             if index[path_to_remove] then
                 index[path_to_remove] = nil
                 table.insert(removed, path_to_remove)
+            elseif index[path_to_remove .. "/.properties"] then
+                index[path_to_remove .. "/.properties"] = nil
+                table.insert(removed, path_to_remove .. "/.properties")
             else
                 warn("fatal: pathspec '" .. path_to_remove .. "' did not match any files")
             end
@@ -1661,7 +1828,8 @@ arguments.createArgument("git", "rm", "", function (...)
 
     if not is_cached then
         for _, path in ipairs(removed) do
-            local currObj = parse_path(path)
+            local clean_path = path:match("^(.-)/%.properties$") or path
+            local currObj = parse_path(clean_path)
             if currObj and currObj ~= game then
                 currObj:Destroy()
             end
@@ -2000,36 +2168,36 @@ arguments.createArgument("git", "clone", "", function(...)
 
     local content = treeObj.content
     
-    local is_rogit_project = false
-    local check_pos = 1
-    while check_pos <= #content do
-        local spacePos = content:find(" ", check_pos, true)
-        local nullPos = content:find("\0", spacePos, true)
-        local child_name = content:sub(spacePos + 1, nullPos - 1)
-        if child_name == "ServerStorage" then
-            local rawSha = content:sub(nullPos + 1, nullPos + 20)
-            local ss_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-            local ssObj = objectsBySha[ss_sha]
-            if ssObj then
-                local ss_content = ssObj.content
-                local ss_pos = 1
-                while ss_pos <= #ss_content do
-                    local ss_spacePos = ss_content:find(" ", ss_pos, true)
-                    local ss_nullPos = ss_content:find("\0", ss_spacePos, true)
-                    local ss_name = ss_content:sub(ss_spacePos + 1, ss_nullPos - 1)
-                    if ss_name == ".rogit_project" then
-                        is_rogit_project = true
-                        break
-                    end
-                    ss_pos = ss_nullPos + 21
+    local function find_rogit_project(current_tree_sha)
+        local obj = objectsBySha[current_tree_sha]
+        if not obj then return false end
+        
+        local c_content = obj.content
+        local c_pos = 1
+        while c_pos <= #c_content do
+            local spacePos = c_content:find(" ", c_pos, true)
+            local mode = c_content:sub(c_pos, spacePos - 1)
+            local nullPos = c_content:find("\0", spacePos, true)
+            local name = c_content:sub(spacePos + 1, nullPos - 1)
+            local rawSha = c_content:sub(nullPos + 1, nullPos + 20)
+            local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+            c_pos = nullPos + 21
+            
+            if name == ".rogit_project" then
+                return true
+            elseif mode == "40000" then
+                if find_rogit_project(child_sha) then
+                    return true
                 end
             end
         end
-        check_pos = nullPos + 21
+        return false
     end
     
+    local is_rogit_project = find_rogit_project(treeSha)
+    
     if not is_rogit_project then
-        print("fatal: repository does not appear to be a rogit project (missing .rogit_project file at ServerStorage root).")
+        print("fatal: repository does not appear to be a rogit project (missing .rogit_project file).")
         local gitRoot_to_destroy = bash.getGitFolderRoot()
         if gitRoot_to_destroy then gitRoot_to_destroy:Destroy() end
         return
@@ -2061,6 +2229,38 @@ arguments.createArgument("git", "clone", "", function(...)
             end
         end
     end
+
+    resolve_instance_refs()
+
+    local function clone_build_index(current_tree_sha, prefix, new_index)
+        local obj = objectsBySha[current_tree_sha]
+        if not obj then return end
+        
+        local c_content = obj.content
+        local c_pos = 1
+        while c_pos <= #c_content do
+            local spacePos = c_content:find(" ", c_pos, true)
+            local c_mode = c_content:sub(c_pos, spacePos - 1)
+            local nullPos = c_content:find("\0", spacePos, true)
+            local c_name = c_content:sub(spacePos + 1, nullPos - 1)
+            local rawSha = c_content:sub(nullPos + 1, nullPos + 20)
+            local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+            c_pos = nullPos + 21
+            
+            local full_path = prefix == "" and c_name or (prefix .. "/" .. c_name)
+            
+            if c_mode == "40000" then
+                clone_build_index(child_sha, full_path, new_index)
+            else
+                new_index[full_path] = {sha = child_sha, mode = c_mode}
+            end
+        end
+    end
+
+    local new_index = {}
+    clone_build_index(treeSha, "", new_index)
+    write_index(new_index)
+    bash.modifyFileContents(gitRoot, "last_commit_index", HttpService:JSONEncode(new_index))
 
     print("Done. '" .. repoName .. "' cloned.")
 end)
@@ -2356,7 +2556,13 @@ arguments.createArgument("git", "push", "", function(...)
         end
     end
 
-    local objects = collectObjects(localSha, if force_push then nil else remoteSha)
+    local local_tracking = get_ref("refs/remotes/" .. remote_name .. "/" .. branch_name)
+    local common_ancestor = remoteSha
+    if remoteSha and not read_object(remoteSha) then
+        common_ancestor = local_tracking
+    end
+
+    local objects = collectObjects(localSha, common_ancestor)
 
     local objectCount = 0
     for _ in pairs(objects) do
@@ -2615,6 +2821,13 @@ arguments.createArgument("git", "branch", "br", function(...)
         local branch = tuple[2]
         assert(branch, "fatal: branch name required")
 
+        local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
+        local current_branch = current_ref:match("ref: refs/heads/(.+)")
+        if current_branch == branch then
+            print("error: Cannot delete branch '" .. branch .. "' checked out at '" .. bash.getGitFolderRoot().Parent:GetFullName() .. "'")
+            return
+        end
+
         local heads = bash.getGitFolderRoot():FindFirstChild("refs")
         if heads then heads = heads:FindFirstChild("heads") end
         if heads then
@@ -2721,8 +2934,9 @@ arguments.createArgument("git", "switch", "", function(...)
     print("Switched to " .. (create_branch and "a new branch '" or "branch '") .. branch_name .. "'")
     
     local status, err = pcall(function()
-        arguments.execute("git", "reset", "--hard", "HEAD")
+        arguments.execute("git", "reset", "--mixed", "HEAD")
     end)
+    warn("roGit switch completed. Checkout does not automatically update workspace files yet to prevent data loss. Use 'git restore .' if you want to cleanly revert to the branch state.")
     if not status then warn(err) end
 end)
 
@@ -3013,6 +3227,8 @@ arguments.createArgument("git", "reset", "", function(...)
                 end
             end
         end
+        
+        resolve_instance_refs()
         print("HEAD is now at " .. target_sha:sub(1, 7))
     elseif mode == "--mixed" or mode == "--soft" then
         print("Unstaged changes after reset:")
@@ -3076,6 +3292,30 @@ arguments.createArgument("git", "config", "", function(...)
         if val then
             print(val)
         end
+    end
+end)
+
+arguments.createArgument("git", "credential", "", function(...)
+    local tuple = {...}
+    local cmd = tuple[1]
+    if cmd == "reject" then
+        local url = tuple[2]
+        if not url then
+            print("usage: git credential (fill|approve|reject)")
+            return
+        end
+        local base_url = url:match("^(https?://[^/]+)") or url
+        if memory_credentials[base_url] then
+            memory_credentials[base_url] = nil
+            print("Cleared cached credentials for", base_url)
+        else
+            print("No cached credentials to clear for", base_url)
+        end
+    elseif cmd == "fill" or cmd == "approve" then
+        -- roGit handles these implicitly during fetch/push via memory_credentials
+        return
+    else
+        print("usage: git credential (fill|approve|reject)")
     end
 end)
 

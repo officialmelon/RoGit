@@ -92,6 +92,8 @@ function Bash.getDirectoryOrFile(parent, name)
     for _, rec in string.split(name, "/") do
         if parent:FindFirstChild(rec) then
             parent = parent:FindFirstChild(rec)
+        else
+            return nil
         end
     end
 

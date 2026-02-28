@@ -3,9 +3,9 @@ Full "rewrite" of git in luau
 ]]
 local arguments = require(script.Parent.arguments)
 local git = require(script.Parent.git)
-local plugin = require(script.Parent.plugin)
+local pluginModule = require(script.Parent.plugin)
 
-plugin.initializePlugin()
+pluginModule.initializePlugin(plugin)
 
 --[[
 Test execution

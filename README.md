@@ -1,3 +1,2 @@
-# roGit
-
-Full git rewrite for ROBLOX.
+### roGit
+> Roblox version control on the git protocol.

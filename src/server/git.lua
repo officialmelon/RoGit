@@ -103,7 +103,12 @@ local function serialize_property(prop)
         end
         r = {Keypoints = keypoints}
     elseif type == "Instance" then
-        r = {Guid = prop:GetAttribute("_rogit_id")}
+        local guid = prop:GetAttribute(ROGIT_ID)
+        if not guid then
+            guid = HttpService:GenerateGUID(false)
+            prop:SetAttribute(ROGIT_ID, guid)
+        end
+        r = {Guid = guid}
     elseif type == "Content" then
         r = tostring(prop)
     else
@@ -162,6 +167,19 @@ local function deserialize_property(prop, propType)
         return ColorSequence.new(keypoints)
     end
     return prop
+end
+
+local _ro_yield = 0
+local last_yield = os.clock()
+local function roYield()
+    _ro_yield = _ro_yield + 1
+    if _ro_yield > 400 then
+        _ro_yield = 0
+        if os.clock() - last_yield > 0.04 then
+            task.wait()
+            last_yield = os.clock()
+        end
+    end
 end
 
 local function parse_path(p)
@@ -261,6 +279,7 @@ local function serialize_instance(instance)
     local instanceProperties = {}
     
     for _, property in instancePropertiesClassList do 
+        roYield()
         pcall(function ()
             local val = instance[property.Name]
             if val ~= nil then 
@@ -327,6 +346,8 @@ local function serialize_instance(instance)
 end
 
 
+local ignore_cache = {}
+
 local function load_ignore_patterns()
     if ignore_patterns ~= nil then
         return
@@ -339,34 +360,42 @@ local function load_ignore_patterns()
         for line in string.gmatch(content, "[^\r\n]+") do
             line = string.match(line, "^%s*(.-)%s*$")
             if string.sub(line, 1, 1) ~= "#" and #line > 0 then
-                table.insert(ignore_patterns, line)
+                local is_glob = string.find(line, "*")
+                if is_glob then
+                    local p1 = "^" .. string.gsub(line, "([%.%+%-%?%[%]%^%$%(%)])", "%%%1")
+                    p1 = string.gsub(p1, "%*", ".*") .. "$"
+                    
+                    local p2 = "/" .. string.gsub(line, "([%.%+%-%?%[%]%^%$%(%)])", "%%%1")
+                    p2 = string.gsub(p2, "%*", ".*") .. "$"
+                    
+                    table.insert(ignore_patterns, {raw = line, kind = "glob", p1 = p1, p2 = p2})
+                else
+                    table.insert(ignore_patterns, {raw = line, kind = "exact"})
+                end
             end
         end
     end
 end
 
 local function is_ignored(path)
+    if ignore_cache[path] ~= nil then return ignore_cache[path] end
     load_ignore_patterns()
 
     local path_slashes = string.gsub(path, "%.", "/")
 
-    for _, pattern in ipairs(ignore_patterns) do
-        local is_glob = string.find(pattern, "*")
-        if is_glob then
-            local lua_pattern = "^" .. string.gsub(pattern, "([%.%+%-%?%[%]%^%$%(%)])", "%%%1")
-            lua_pattern = string.gsub(lua_pattern, "%*", ".*") .. "$"
-            if string.match(path_slashes, lua_pattern) then return true end
-            
-            local lua_pattern_endswith = "/" .. string.gsub(pattern, "([%.%+%-%?%[%]%^%$%(%)])", "%%%1")
-            lua_pattern_endswith = string.gsub(lua_pattern_endswith, "%*", ".*") .. "$"
-            if string.match(path_slashes, lua_pattern_endswith) then return true end
+    for _, pat in ipairs(ignore_patterns) do
+        if pat.kind == "glob" then
+            if string.match(path_slashes, pat.p1) then ignore_cache[path] = true; return true end
+            if string.match(path_slashes, pat.p2) then ignore_cache[path] = true; return true end
         else
-            if path_slashes == pattern then return true end
-            if string.sub(path_slashes, 1, #pattern + 1) == pattern .. "/" then return true end
-            if string.sub(path_slashes, -#pattern - 1) == "/" .. pattern then return true end
-            if string.find(path_slashes, "/" .. pattern .. "/", 1, true) then return true end
+            local pattern = pat.raw
+            if path_slashes == pattern then ignore_cache[path] = true; return true end
+            if string.sub(path_slashes, 1, #pattern + 1) == pattern .. "/" then ignore_cache[path] = true; return true end
+            if string.sub(path_slashes, -#pattern - 1) == "/" .. pattern then ignore_cache[path] = true; return true end
+            if string.find(path_slashes, "/" .. pattern .. "/", 1, true) then ignore_cache[path] = true; return true end
         end
     end
+    ignore_cache[path] = false
     return false
 end
 
@@ -427,11 +456,7 @@ local function stage_recursive(instance, index, seen_ids, perf, parentVirtualPat
     end
 
     stage_instance(instance, index, seen_ids, myVirtualPath)
-    
-    if os.clock() - perf.last_yield > 0.03 then
-        task.wait()
-        perf.last_yield = os.clock()
-    end
+    roYield()
 
     local sibling_counts = {}
     local valid_children = {}
@@ -658,6 +683,7 @@ local function update_ref(ref_path, sha)
 end
 
 local function get_content_lines(sha)
+    roYield()
     if not sha then return 0 end
 
     local blob = read_object(sha)
@@ -906,19 +932,14 @@ local function fetchPackfile(url: string, sha: string)
 end
 
 local function unpackObjects(fullPack)
-	local version, objCount, cursor = git_proto.parsePackHeader(fullPack, 0)
-	print(string.format("Packfile v%d — %d objects", version, objCount))
+	local _version, objCount, cursor = git_proto.parsePackHeader(fullPack, 0)
 	local parsedCount = 0
 	local objectsByOffset = {}
 	local typesByOffset = {}
 	local objectsBySha = {}
-	local last_yield = os.clock()
 
 	for i = 1, objCount do
-		if os.clock() - last_yield > 0.03 then
-			task.wait()
-			last_yield = os.clock()
-		end
+		roYield()
 		local objOffset = cursor
 		local objType, _size, next = git_proto.parseObjectHeader(fullPack, cursor)
 		cursor = next
@@ -1019,13 +1040,14 @@ local function resolve_instance_refs()
     if #pending_instance_refs == 0 then return end
     
     local guid_map = {}
-    local function map_guids(parent)
-        for _, child in ipairs(parent:GetChildren()) do
-            if child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
-                local guid = child:GetAttribute(ROGIT_ID)
-                if guid then
-                    guid_map[guid] = child
-                end
+    local function map_guids(node)
+        if node ~= bash.getGitFolderRoot() and not node:IsDescendantOf(bash.getGitFolderRoot()) then
+            roYield()
+            local guid = node:GetAttribute(ROGIT_ID)
+            if guid then
+                guid_map[guid] = node
+            end
+            for _, child in ipairs(node:GetChildren()) do
                 map_guids(child)
             end
         end
@@ -1050,6 +1072,7 @@ end
 
 local function applyProperties(instance, props)
     for _, propData in ipairs(props) do
+        roYield()
         if propData.name == "_attributes" and propData.valueType == "_attributes" then
             for attrName, attrData in pairs(propData.value) do
                 local val = deserialize_property(attrData.value, attrData.valueType)
@@ -1123,6 +1146,7 @@ local function writeTree(objectsBySha, treeSha, parent, treePath)
     local pos = 1
 
     while pos <= #content do
+        roYield()
         local spacePos = content:find(" ", pos, true)
         local mode = content:sub(pos, spacePos - 1)
 
@@ -1391,6 +1415,7 @@ arguments.createArgument("git", "diff", "", function()
 
         local seen_local = {}
         for _, child in ipairs(parent:GetChildren()) do
+            roYield()
             if not is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
                 local rogit_id = child:GetAttribute(ROGIT_ID)
                 local collisionBase = child.Name
@@ -1721,6 +1746,7 @@ arguments.createArgument("git", "pull", "", function (...)
     local _, objectsBySha = unpackObjects(fullPack)
 
     for objSha, obj in pairs(objectsBySha) do
+        roYield()
         local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
         if typeName then
             write_object(typeName, obj.content)
@@ -1738,6 +1764,7 @@ arguments.createArgument("git", "pull", "", function (...)
     local content = treeObj.content
     local pos = 1
     while pos <= #content do
+        roYield()
         local spacePos = content:find(" ", pos, true)
         local mode = content:sub(pos, spacePos - 1)
         local nullPos = content:find("\0", spacePos, true)
@@ -1895,6 +1922,7 @@ arguments.createArgument("git", "commit", "", function(...)
     local total_deletions = 0
 
     for path, old_sha in pairs(old_paths) do
+        roYield()
         local new_sha = new_paths[path]
 
         if not new_sha then
@@ -1916,6 +1944,7 @@ arguments.createArgument("git", "commit", "", function(...)
     end
 
     for path, new_sha in pairs(new_paths) do
+        roYield()
         if not old_paths[path] and new_sha ~= "RENAMED_PLACEHOLDER" then
             table.insert(files_added, {path = path, mode = index[path].mode})
             total_insertions = total_insertions + get_content_lines(new_sha)
@@ -1992,6 +2021,12 @@ arguments.createArgument("git", "commit", "", function(...)
         final_output = final_output .. "\n" .. stats_line
     end
     if #output_details > 0 then
+        if #output_details > 20 then
+            local new_details = {}
+            for i = 1, 20 do table.insert(new_details, output_details[i]) end
+            table.insert(new_details, string.format(" ... and %d more files", #output_details - 20))
+            output_details = new_details
+        end
         final_output = final_output .. "\n" .. table.concat(output_details, "\n")
     end
     print(final_output)
@@ -2135,6 +2170,7 @@ arguments.createArgument("git", "clone", "", function(...)
     local _, objectsBySha = unpackObjects(packFile)
 
     for sha, obj in pairs(objectsBySha) do
+        roYield()
         local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
         if typeName then
             write_object(typeName, obj.content)
@@ -2175,6 +2211,7 @@ arguments.createArgument("git", "clone", "", function(...)
         local c_content = obj.content
         local c_pos = 1
         while c_pos <= #c_content do
+            roYield()
             local spacePos = c_content:find(" ", c_pos, true)
             local mode = c_content:sub(c_pos, spacePos - 1)
             local nullPos = c_content:find("\0", spacePos, true)
@@ -2205,6 +2242,7 @@ arguments.createArgument("git", "clone", "", function(...)
 
     local pos = 1
     while pos <= #content do
+        roYield()
         local spacePos = content:find(" ", pos, true)
         local mode = content:sub(pos, spacePos - 1)
         local nullPos = content:find("\0", spacePos, true)
@@ -2239,6 +2277,7 @@ arguments.createArgument("git", "clone", "", function(...)
         local c_content = obj.content
         local c_pos = 1
         while c_pos <= #c_content do
+            roYield()
             local spacePos = c_content:find(" ", c_pos, true)
             local c_mode = c_content:sub(c_pos, spacePos - 1)
             local nullPos = c_content:find("\0", spacePos, true)
@@ -2617,7 +2656,11 @@ arguments.createArgument("git", "push", "", function(...)
                 line = line:gsub("[\r\n]+", "")
 
                 if channel == 2 then 
-                    table.insert(remote_messages, "remote: " .. line)
+                    if line:find("^Resolving deltas") then
+                        table.insert(remote_messages, "remote: " .. line)
+                    else
+                        table.insert(remote_messages, line)
+                    end
                 elseif channel == 1 then
                     if line:find("^unpack ") then
                     elseif line:find("^ok ") then

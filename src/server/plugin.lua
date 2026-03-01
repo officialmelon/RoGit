@@ -14,6 +14,17 @@ local user = Players:GetNameFromUserIdAsync(StudioService:GetUserId())
 local name = game.Name
 
 function createCommandOutput(parent, text, optionalColor)
+    local MAX_TEXT_LENGTH = 150000
+    if #text > MAX_TEXT_LENGTH then
+        local firstElement = nil
+        for i = 1, #text, MAX_TEXT_LENGTH do
+            local chunk = string.sub(text, i, i + MAX_TEXT_LENGTH - 1)
+            local elm = createCommandOutput(parent, chunk, optionalColor)
+            if not firstElement then firstElement = elm end
+        end
+        return firstElement
+    end
+
     local command = Instance.new("Frame")
     local output = Instance.new("TextLabel")
     local UIListLayout = Instance.new("UIListLayout")
@@ -44,6 +55,22 @@ function createCommandOutput(parent, text, optionalColor)
     output.TextWrapped = true
     output.RichText = true
 
+    if parent and parent.Name == "commands_holder" then
+        local children = parent:GetChildren()
+        local uiFrames = {}
+        for _, child in ipairs(children) do
+            if child:IsA("Frame") then
+                table.insert(uiFrames, child)
+            end
+        end
+        local MAX_LINES = 400
+        if #uiFrames > MAX_LINES then
+            for i = 1, #uiFrames - MAX_LINES do
+                uiFrames[i]:Destroy()
+            end
+        end
+    end
+
     return output
 end
 
@@ -69,9 +96,13 @@ function createCommandEntry(parent)
     start.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     start.BackgroundTransparency = 1.000
     start.BorderSizePixel = 0
-    start.Size = UDim2.new(0, 172, 1, 0)
+
+    local promptText = user .. "@" .. name .. ">"
+    local textWidth = game:GetService("TextService"):GetTextSize(promptText, 14, Enum.Font.Ubuntu, Vector2.new(10000, 100)).X + 4
+
+    start.Size = UDim2.new(0, textWidth, 1, 0)
     start.Font = Enum.Font.Ubuntu
-    start.Text =  user .. "@" .. name .. ">"
+    start.Text = promptText
     start.TextColor3 = Color3.fromRGB(255, 255, 255)
     start.TextSize = 14.000
     start.TextXAlignment = Enum.TextXAlignment.Left
@@ -82,7 +113,7 @@ function createCommandEntry(parent)
     entry.BackgroundTransparency = 1.000
     entry.BorderSizePixel = 0
     entry.Selectable = false
-    entry.Size = UDim2.new(1, -172, 1, 0)
+    entry.Size = UDim2.new(1, -textWidth, 1, 0)
     entry.Font = Enum.Font.Ubuntu
     entry.Text = ""
     entry.ClearTextOnFocus = false
@@ -151,7 +182,34 @@ function handleCommandCallback(TextBox:TextBox, parent)
                 table.insert(commandHistory, text)
             end
             
-            local toProcess = string.split(text, " ")
+            local toProcess = {}
+            local idx = 1
+            while idx <= #text do
+                local c = text:sub(idx, idx)
+                if c:match("%s") then
+                    idx += 1
+                elseif c == '"' or c == "'" then
+                    local end_idx = text:find(c, idx + 1, true)
+                    if end_idx then
+                        table.insert(toProcess, text:sub(idx + 1, end_idx - 1))
+                        idx = end_idx + 1
+                    else
+                        table.insert(toProcess, text:sub(idx + 1))
+                        break
+                    end
+                else
+                    local match_end = text:find("[%s\"']", idx)
+                    if match_end then
+                        table.insert(toProcess, text:sub(idx, match_end - 1))
+                        idx = match_end
+                    else
+                        table.insert(toProcess, text:sub(idx))
+                        break
+                    end
+                end
+            end
+            
+            if #toProcess == 0 then return end
             local cmdName = string.lower(toProcess[1])
             
             if arguments.existingCommands[cmdName] then

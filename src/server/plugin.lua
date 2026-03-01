@@ -7,12 +7,25 @@ need to implement user-friendly
 local plugins = {}
 local arguments = require(script.Parent.arguments)
 local git = require(script.Parent.git)
+local remote = require(script.Parent.libs.git_remote)
+
 local StudioService = game:GetService("StudioService")
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 
 local user = Players:GetNameFromUserIdAsync(StudioService:GetUserId())
 local name = game.Name
 
+local commandHistory = {}
+
+--// In-Game check
+if not RunService:IsStudio() then 
+    return
+end
+
+--[[
+Creates output of commands.
+]]
 function createCommandOutput(parent, text, optionalColor)
     local MAX_TEXT_LENGTH = 150000
     if #text > MAX_TEXT_LENGTH then
@@ -74,6 +87,9 @@ function createCommandOutput(parent, text, optionalColor)
     return output
 end
 
+--[[
+Creates a input/entry (interactive) command prompt.
+]]
 function createCommandEntry(parent)
     local command = Instance.new("Frame")
     local start = Instance.new("TextLabel")
@@ -131,8 +147,9 @@ function createCommandEntry(parent)
     return command
 end
 
-local commandHistory = {}
-
+--[[
+Handles the callback of the interactive commands.
+]]
 function handleCommandCallback(TextBox:TextBox, parent)
     local UserInputService = game:GetService("UserInputService")
     local unsubmittedText = ""
@@ -232,6 +249,9 @@ function handleCommandCallback(TextBox:TextBox, parent)
     end)
 end
 
+--[[
+Create the bash terminal gui of the plugin.
+]]
 function plugins.createBashTerminal(plugin)
 
     --// Create terminal
@@ -310,6 +330,7 @@ function plugins.createBashTerminal(plugin)
         scrollToBottom()
     end
 
+    --// Replace output calls with custom terminal ones.
     git.replaceOutputCallback(
         printOutput,
         warnOutput,
@@ -318,6 +339,10 @@ function plugins.createBashTerminal(plugin)
     arguments.replacePrint(
         printOutput
     )
+    remote.print = printOutput
+    remote.warn = warnOutput
+    remote.error = errOutput
+
 
     local activeEntryBox = nil
 
@@ -427,23 +452,17 @@ function plugins.createBashTerminal(plugin)
     return terminal
 end
 
+--[[
+self-explanatory, initialzes the plugin itself.
+]]
 function plugins.initializePlugin(plugin)
     git.setPlugin(plugin)
     local toolbar = plugin:CreateToolbar("roGit")
 
     local buttons = {
-        -- ["GraphicalMode"] = toolbar:CreateButton("Graphical Mode", "", "rbxassetid://123456789"),
-        ["BashMode"] = toolbar:CreateButton("Bash Mode", "", "rbxassetid://78663253184043")
+        ["BashMode"] = toolbar:CreateButton("Git Terminal", "", "rbxassetid://78663253184043")
     }
-
-    --// Use during scripting (out of viewport)
-    -- buttons.GraphicalMode.ClickableWhenViewportHidden = true
     buttons.BashMode.ClickableWhenViewportHidden = true
-
-    --// Graphical Mode (GUI)
-    -- buttons.GraphicalMode.Click:Connect(function()
-    
-    -- end)
 
     --// Bash Mode (Terminal)
     local bashTerminalGui = nil

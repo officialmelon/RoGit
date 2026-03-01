@@ -8,10 +8,10 @@ local pluginModule = require(script.Parent.plugin)
 pluginModule.initializePlugin(plugin)
 
 --[[
-Test execution
+Example custom execution
 ]]
--- arguments.executeArgument("init", ".")
--- arguments.executeArgument("add", ".")
--- arguments.executeArgument("remote", "add", "origin", "https://github.com/officialmelon/rblx_test.git")
--- arguments.executeArgument("commit", "-m", "commit")
--- arguments.executeArgument("push", "origin", "master")
+-- arguments.executeArgument("git", "init", ".")
+-- arguments.executeArgument("git", "add", ".")
+-- arguments.executeArgument("git", "remote", "add", "origin", "https://github.com/officialmelon/rblx_test.git")
+-- arguments.executeArgument("git", "commit", "-m", "commit")
+-- arguments.executeArgument("git", "push", "origin", "master")

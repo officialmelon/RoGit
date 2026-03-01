@@ -1,0 +1,74 @@
+local Utilities = {}
+
+local _HttpService = game:GetService("HttpService")
+--// Yielding defintions
+local _ro_yield = 0
+local last_yield = os.clock()
+
+
+--[[
+Yeilds every 400 calls to the function, or every 0.04 seconds.
+]]
+function Utilities.roYield()
+    _ro_yield = _ro_yield + 1
+    if _ro_yield > 400 then
+        _ro_yield = 0
+        if os.clock() - last_yield > 0.04 then
+            task.wait()
+            last_yield = os.clock()
+        end
+    end
+end
+
+--[[
+Parses a path into a Roblox Instance.
+Returns the instance, the last segment, and the segments.
+]]
+function Utilities.parse_path(path)
+    if not path or path == "" then
+        return nil
+    end
+
+    local cleaned = path:gsub("^game[./]", ""):gsub("^Workspace[./]", "Workspace/"):gsub("%.", "/")
+    local segments = string.split(cleaned, "/")
+    local currObj = game
+
+    for _, segment in ipairs(segments) do
+        if currObj and currObj:FindFirstChild(segment) then
+            currObj = currObj:FindFirstChild(segment)
+        else
+            return nil, segments[#segments], segments
+        end
+    end
+
+    return currObj, segments[#segments], segments
+end
+
+function Utilities.return_urls(url: string, service: string?)
+    local svc = service or "git-upload-pack"
+    return {url .. "/info/refs?service=" .. svc, url .. "/" .. svc}
+end
+
+--[[
+Encodes data into base64.
+]]
+function Utilities.b64Encode(data)
+    local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local res = {}
+    local last_yield = os.clock()
+    for i = 1, #data, 3 do
+        if os.clock() - last_yield > 0.03 then
+            task.wait()
+            last_yield = os.clock()
+        end
+        local c1, c2, c3 = string.byte(data, i, i + 2)
+        local n = bit32.bor(bit32.lshift(c1 or 0, 16), bit32.lshift(c2 or 0, 8), c3 or 0)
+        table.insert(res, string.sub(b, bit32.rshift(n, 18) + 1, bit32.rshift(n, 18) + 1))
+        table.insert(res, string.sub(b, bit32.band(bit32.rshift(n, 12), 63) + 1, bit32.band(bit32.rshift(n, 12), 63) + 1))
+        table.insert(res, c2 and string.sub(b, bit32.band(bit32.rshift(n, 6), 63) + 1, bit32.band(bit32.rshift(n, 6), 63) + 1) or "=")
+        table.insert(res, c3 and string.sub(b, bit32.band(n, 63) + 1, bit32.band(n, 63) + 1) or "=")
+    end
+    return table.concat(res)
+end
+
+return Utilities

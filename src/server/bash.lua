@@ -25,7 +25,8 @@ Bash.trackingRoot = {
 }
 
 --[[
-Bash-Esque file system
+Kind-of emulates "bash"?
+Needs a real filesystem setup/filesystem navigation commands.
 ]]
 
 -- Returns where we hold .git
@@ -56,7 +57,7 @@ function Bash.createFile(parent, name, content)
     assert(content, "Content is nil!")
 
     if parent:FindFirstChild(name) then 
-        warn("Bash: File '" .. name .. "' already exists in '" .. parent:GetFullName() .. "'")
+        -- warn("Bash: File '" .. name .. "' already exists in '" .. parent:GetFullName() .. "'")
         return parent:FindFirstChild(name)
     end
 

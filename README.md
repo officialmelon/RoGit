@@ -49,12 +49,12 @@
 3. Open **Roblox Studio** and open any Experience.
 4. From the top toolbar, go to **Plugins** > **Plugins Folder**.
 5. Copy the downloaded plugin file into the window that opens.
-6. Restart **Roblox Studio**. The plugin will now appear in your toolbar as **"Bash Mode"**.
+6. Restart **Roblox Studio**. The plugin will now appear in your toolbar as **"Git Terminal"**.
 
 ---
 
 ## Example
-> WARNING: You may experience lag for a short period (15~ seconds), this is where the instances are deserialising.
+> WARNING: You may experience lag for a short period (1~ minute), this is where the instances are deserialising. (SPEEDS WILL IMPROVE IN THE FUTURE, SLOW IMPLEMENTATIONS.)
 - Lets start by cloning in a repository (this is the original crossroads map!):
 ```
 git clone https://github.com/officialmelon/crossroads-rogit.git

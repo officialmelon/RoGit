@@ -1,0 +1,516 @@
+local Remote = {}
+
+local HttpService = game:GetService("HttpService")
+local hashlib = require(script.Parent.hashlib)
+local zlib = require(script.Parent.zlib)
+local bash = require(script.Parent.Parent.bash)
+local git_proto = require(script.Parent.git_proto)
+local Utilities = require(script.Parent.utilities)
+local Auth = require(script.Parent.localstore)
+local Requests = require(script.Parent.requests)
+local ini_parser = require(script.Parent.ini_parser)
+local _Handlers = require(script.Parent.git_handlers)
+local instances = require(script.Parent.instances)
+
+local ROGIT_ID = "_rogit_id"
+local pending_instance_refs = {}
+
+Remote.print = print
+Remote.warn = warn
+Remote.error = error
+
+--[[
+Requests git refs, parses and returns.
+]]
+function Remote.discoverRefs(url: string, service: string?)
+	local req = {
+        Url = Utilities.return_urls(url, service or "git-upload-pack")[1],
+        Method = "GET",
+        Headers = {
+            ["Authorization"] = Auth.getAuthHeader(url:match("^(https?://[^/]+)") or url)
+        }
+    }
+    
+    local ok, res = Requests.url_request_with_retry(req)
+
+    if not ok or res.StatusCode ~= 200 then
+        Remote.error("fatal: repository '" .. url .. "' not found or access denied")
+    end
+    
+	local buf = buffer.fromstring(res.Body)
+	local cursor = 0
+	local refs = {}
+
+	while cursor < buffer.len(buf) do
+		local data, next = git_proto.decodePkt(buf, cursor)
+		cursor = next
+		if data then
+			local sha, name = git_proto.parseRef(data)
+			if sha and name then
+				refs[name] = sha
+			end
+		end
+	end
+
+	return refs
+end
+
+--[[
+Fetches the git repository packfile, parses and returns.
+]]
+function Remote.fetchPackfile(url: string, sha: string)
+	local wantPkt = git_proto.encodePkt(buffer.fromstring("want " .. sha .. " side-band-64k ofs-delta\n"))
+	local donePkt = git_proto.encodePkt(buffer.fromstring("done\n"))
+	local body = buffer.tostring(wantPkt) .. buffer.tostring(git_proto.flush()) .. buffer.tostring(donePkt)
+
+	local req = {
+		Url = Utilities.return_urls(url)[2],
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/x-git-upload-pack-request",
+			["Accept"] = "application/x-git-upload-pack-result",
+            ["Authorization"] = Auth.getAuthHeader(url:match("^(https?://[^/]+)") or url)
+		},
+		Body = body,
+	}
+    
+    local ok, res = Requests.url_request_with_retry(req)
+    assert(ok, "Upload-pack request error")
+	assert(res.StatusCode == 200, "Upload-pack failed: " .. res.StatusCode)
+
+	local resBuf = buffer.fromstring(res.Body)
+	local cursor = 0
+	local pieces = {}
+	local totalSize = 0
+
+	while cursor < buffer.len(resBuf) do
+		local data, next = git_proto.decodePkt(resBuf, cursor)
+		cursor = next
+		if data then
+			local channel = buffer.readu8(data, 0)
+			if channel == 1 then
+				local size = buffer.len(data) - 1
+				local piece = buffer.create(size)
+				buffer.copy(piece, 0, data, 1, size)
+				table.insert(pieces, piece)
+				totalSize += size
+			elseif channel == 2 then
+				local msg = buffer.tostring(data):sub(2)
+				for line in msg:gmatch("[^\r\n]+") do
+					local trimmed = line:match("^%s*(.-)%s*$")
+					if trimmed and (trimmed:find("done") or trimmed:find("Total")) then
+						Remote.print("remote: " .. trimmed)
+					end
+				end
+			elseif channel == 3 then
+				Remote.error("remote error: " .. buffer.tostring(data))
+			end
+		end
+	end
+
+	local fullPack = buffer.create(totalSize)
+	local write = 0
+	for _, piece in pieces do
+		buffer.copy(fullPack, write, piece, 0, buffer.len(piece))
+		write += buffer.len(piece)
+	end
+
+	return fullPack
+end
+
+--[[
+Unpacks objects (either from clone/pull)
+]]
+function Remote.unpackObjects(fullPack)
+	local _version, objCount, cursor = git_proto.parsePackHeader(fullPack, 0)
+	local parsedCount = 0
+	local objectsByOffset = {}
+	local typesByOffset = {}
+	local objectsBySha = {}
+
+	for i = 1, objCount do
+		Utilities.roYield()
+		local objOffset = cursor
+		local objType, _size, next = git_proto.parseObjectHeader(fullPack, cursor)
+		cursor = next
+
+		local baseOffset
+		local refShaHex
+
+		if objType == 6 then
+			local b = buffer.readu8(fullPack, cursor)
+			cursor += 1
+			baseOffset = bit32.band(b, 0x7F)
+			while bit32.band(b, 0x80) ~= 0 do
+				b = buffer.readu8(fullPack, cursor)
+				cursor += 1
+				baseOffset = bit32.bor(bit32.lshift(baseOffset + 1, 7), bit32.band(b, 0x7F))
+			end
+		elseif objType == 7 then
+			local shaBytes = buffer.create(20)
+			buffer.copy(shaBytes, 0, fullPack, cursor, 20)
+			refShaHex = ""
+			for j = 0, 19 do
+				refShaHex = refShaHex .. ("%02x"):format(buffer.readu8(shaBytes, j))
+			end
+			cursor += 20
+		end
+
+		local remaining = buffer.len(fullPack) - cursor
+		local slice = buffer.create(remaining)
+		buffer.copy(slice, 0, fullPack, cursor, remaining)
+
+		local decompressed, bytesLeft = zlib.decompressZlib(buffer.tostring(slice))
+
+		local resolved
+		local actualType
+		if objType == 6 then
+			local base = objectsByOffset[objOffset - baseOffset]
+			assert(base, "Missing base object at offset " .. (objOffset - baseOffset))
+			resolved = git_proto.applyDelta(base, decompressed)
+			actualType = typesByOffset[objOffset - baseOffset]
+		elseif objType == 7 then
+			local baseWrapper = objectsBySha[refShaHex]
+			assert(baseWrapper, "Missing base object for REF_DELTA: " .. refShaHex)
+			resolved = git_proto.applyDelta(baseWrapper.content, decompressed)
+			actualType = baseWrapper.objType
+		else
+			resolved = decompressed
+			actualType = objType
+		end
+
+		objectsByOffset[objOffset] = resolved
+		typesByOffset[objOffset] = actualType
+		parsedCount += 1
+
+		cursor = buffer.len(fullPack) - bytesLeft
+
+		local typePrefix = ({[1]="commit",[2]="tree",[3]="blob",[4]="tag"})[actualType]
+		if typePrefix and resolved then
+			local header = typePrefix .. " " .. #resolved .. "\0"
+			local sha = hashlib.sha1(header .. resolved)
+			objectsBySha[sha] = {objType = actualType, content = resolved}
+		end
+	end
+
+	return objectsByOffset, objectsBySha
+end
+
+--[[
+Parses properties of objects.
+]]
+function Remote.peekPropertiesBlob(objectsBySha, treeSha)
+    local treeObj = objectsBySha[treeSha]
+    if not treeObj then return nil end
+
+    local content = treeObj.content
+    local pos = 1
+    while pos <= #content do
+        local spacePos = content:find(" ", pos, true)
+        local nullPos = content:find("\0", spacePos, true)
+        local entryName = content:sub(spacePos + 1, nullPos - 1)
+        local rawSha = content:sub(nullPos + 1, nullPos + 20)
+        local entrySha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+        pos = nullPos + 21
+
+        if entryName == ".properties" then
+            local blobObj = objectsBySha[entrySha]
+            if blobObj then
+                local ok, props = pcall(function() return HttpService:JSONDecode(blobObj.content) end)
+                if ok then return props end
+            end
+            return nil
+        end
+    end
+    return nil
+end
+
+--[[
+Resolves the references for instances.
+]]
+function Remote.resolve_instance_refs()
+    if #pending_instance_refs == 0 then return end
+    
+    local guid_map = {}
+    local function map_guids(node)
+        if node ~= bash.getGitFolderRoot() and not node:IsDescendantOf(bash.getGitFolderRoot()) then
+            Utilities.roYield()
+            local guid = node:GetAttribute(ROGIT_ID)
+            if guid then
+                guid_map[guid] = node
+            end
+            for _, child in ipairs(node:GetChildren()) do
+                map_guids(child)
+            end
+        end
+    end
+    
+    for _, service in ipairs(bash.trackingRoot) do
+        map_guids(service)
+    end
+    
+    for _, refPending in ipairs(pending_instance_refs) do
+        local target = guid_map[refPending.targetGuid]
+        if target then
+            pcall(function()
+                refPending.inst[refPending.prop] = target
+            end)
+        end
+    end
+    
+    table.clear(pending_instance_refs)
+end
+
+--[[
+applies properties to an instance.
+]]
+function Remote.applyProperties(instance, props)
+    for _, propData in ipairs(props) do
+        Utilities.roYield()
+        if propData.name == "_attributes" and propData.valueType == "_attributes" then
+            if type(propData.value) == "table" and propData.value[1] and type(propData.value[1]) == "table" and propData.value[1].name then
+                -- New sorted array format
+                for _, attrData in ipairs(propData.value) do
+                    local val = instances.deserialize_property(attrData.value, attrData.valueType)
+                    if val ~= nil then
+                        pcall(function() instance:SetAttribute(attrData.name, val) end)
+                    end
+                end
+            elseif type(propData.value) == "table" then
+                -- Legacy dictionary format
+                for attrName, attrValue in pairs(propData.value) do
+                    local val
+                    if type(attrValue) == "table" and attrValue.value then
+                        val = instances.deserialize_property(attrValue.value, attrValue.valueType)
+                    else
+                        val = attrValue
+                    end
+                    if val ~= nil then
+                        pcall(function() instance:SetAttribute(attrName, val) end)
+                    end
+                end
+            end
+        elseif propData.name == "_tags" and propData.valueType == "_tags" then
+            for _, tag in ipairs(propData.value) do
+                pcall(function() instance:AddTag(tag) end)
+            end
+        elseif propData.name ~= "ClassName" and propData.name ~= "Parent" then
+            if propData.valueType == "Instance" then
+                if type(propData.value) == "table" and propData.value.Guid then
+                    table.insert(pending_instance_refs, {
+                        inst = instance,
+                        prop = propData.name,
+                        targetGuid = propData.value.Guid
+                    })
+                end
+            else
+                local val = instances.deserialize_property(propData.value, propData.valueType)
+                if val ~= nil then
+                    if propData.name == "MeshId" and instance:IsA("MeshPart") then
+                        pcall(function()
+                            local InsertService = game:GetService("InsertService")
+                            local loadedMesh = InsertService:CreateMeshPartAsync(val, instance.CollisionFidelity, instance.RenderFidelity)
+                            instance:ApplyMesh(loadedMesh)
+                        end)
+                    elseif propData.name == "Source" and instance:IsA("LuaSourceContainer") then
+                        pcall(function()
+                            (instance :: any).Source = val
+                        end)
+                    else
+                        pcall(function()
+                            instance[propData.name] = val
+                        end)
+                    end
+                end
+            end
+        end
+    end
+end
+
+--[[
+find instances by rogit_id (e.g. for properties with instance type)
+]]
+function Remote.findByRogitId(parent, rogitId)
+    for _, child in ipairs(parent:GetChildren()) do
+        if child:GetAttribute(ROGIT_ID) == rogitId then
+            return child
+        end
+    end
+    return nil
+end
+
+--[[
+Extracts the rogit_id from properties.
+]]
+function Remote.extractRogitId(props)
+    for _, propData in ipairs(props) do
+        if propData.name == "_attributes" and propData.valueType == "_attributes" then
+            if type(propData.value) == "table" then
+                -- Check for new array format
+                if propData.value[1] and type(propData.value[1]) == "table" and propData.value[1].name then
+                    for _, attrData in ipairs(propData.value) do
+                        if attrData.name == ROGIT_ID then
+                            return attrData.value
+                        end
+                    end
+                else
+                    -- Fallback to legacy dictionary format
+                    local entry = propData.value[ROGIT_ID]
+                    if entry then
+                        return type(entry) == "table" and entry.value or entry
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+--[[
+Writes to the remote tree.
+]]
+function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
+    local treeObj = objectsBySha[treeSha]
+    assert(treeObj, "Missing tree: " .. treeSha)
+
+    local content = treeObj.content
+    local pos = 1
+
+    while pos <= #content do
+        Utilities.roYield()
+        local spacePos = content:find(" ", pos, true)
+        local mode = content:sub(pos, spacePos - 1)
+
+        local nullPos = content:find("\0", spacePos, true)
+        local name = content:sub(spacePos + 1, nullPos - 1)
+
+        local rawSha = content:sub(nullPos + 1, nullPos + 20)
+        local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+        pos = nullPos + 21
+
+        local entryPath = treePath and (treePath .. "/" .. name) or name
+
+        if mode == "40000" then
+            local childProps = Remote.peekPropertiesBlob(objectsBySha, sha)
+            local className = nil
+            local uuid = nil
+            if childProps then
+                for _, propData in ipairs(childProps) do
+                    if propData.name == "ClassName" then
+                        className = propData.value
+                    end
+                end
+                uuid = Remote.extractRogitId(childProps)
+            end
+
+            local target = uuid and Remote.findByRogitId(parent, uuid) or parent:FindFirstChild(name)
+            if not target then
+                if className then
+                    local ok, inst = pcall(Instance.new, className)
+                    if ok then
+                        target = inst
+                        target.Name = name
+                        target.Parent = parent
+                    else
+                        target = bash.createFolder(parent, name)
+                    end
+                else
+                    target = bash.createFolder(parent, name)
+                end
+            end
+
+            if uuid then
+                target:SetAttribute(ROGIT_ID, uuid)
+            end
+
+            if childProps then
+                Remote.applyProperties(target, childProps)
+            end
+
+            Remote.writeTree(objectsBySha, sha, target, entryPath)
+        else
+            local blobObj = objectsBySha[sha]
+            if not blobObj then
+                continue
+            elseif name == ".properties" then
+                local ok, props = pcall(function() return HttpService:JSONDecode(blobObj.content) end)
+                if ok then
+                    Remote.applyProperties(parent, props)
+                end
+            else
+                local ok, props = pcall(function() return HttpService:JSONDecode(blobObj.content) end)
+                if not ok then
+                    continue
+                end
+
+                local className = "Part"
+                for _, propData in ipairs(props) do
+                    if propData.name == "ClassName" then
+                        className = propData.value
+                        break
+                    end
+                end
+
+                local uuid = Remote.extractRogitId(props)
+                local newInstance = uuid and Remote.findByRogitId(parent, uuid) or parent:FindFirstChild(name)
+
+                if not newInstance then
+                    local ok2, inst = pcall(Instance.new, className)
+                    if not ok2 then
+                        continue
+                    end
+                    newInstance = inst
+                    newInstance.Name = name
+                    newInstance.Parent = parent
+                end
+
+                Remote.applyProperties(newInstance, props)
+            end
+        end
+    end
+end
+
+--[[
+Fetches remote based off name.
+]]
+function Remote.fetch(remote_name)
+    print("Fetching " .. remote_name)
+
+    local config_content = bash.getFileContents(bash.getGitFolderRoot(), "config")
+    local loaded_conf = ini_parser.parseIni(config_content)
+
+    local section_name = 'remote "' .. remote_name .. '"'
+    local remote_section = loaded_conf[section_name]
+    assert(remote_section and remote_section.url, "fatal: '" .. remote_name .. "' does not appear to be a git repository")
+    
+    local url = remote_section.url
+
+    local refs = Remote.discoverRefs(url)
+    
+    local output = { "From " .. url }
+    for name, sha in pairs(refs) do
+        if name ~= "HEAD" then
+            local branch_name = name:match("refs/heads/(.+)")
+            if branch_name then
+                table.insert(output, string.format(" * [new branch]      %-15s -> %s/%s", branch_name, remote_name, branch_name))
+                _Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, sha)
+            end
+        end
+    end
+    print(table.concat(output, "\n"))
+
+    for name, sha in pairs(refs) do
+        if name ~= "HEAD" then
+            local pack = Remote.fetchPackfile(url, sha)
+            local _, objectsBySha = Remote.unpackObjects(pack)
+            for objSha, obj in pairs(objectsBySha) do
+                local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
+                if typeName then
+                    _Handlers.write_object(typeName, obj.content)
+                end
+            end
+        end
+    end
+end
+
+return Remote

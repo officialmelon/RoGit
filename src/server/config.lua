@@ -1,4 +1,7 @@
+--[[
+gotta remember to change this per release!
+]]
 return {
-    version = "0.1",
+    version = "1.0",
     createdBy = "melon"
 }

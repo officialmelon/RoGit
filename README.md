@@ -20,9 +20,8 @@
 
 **roGit** is a pure-Luau port of Git designed to run directly within **Roblox Studio**. It fundamentally allows developers to interact with the Git protocol (`https://`) to clone, commit, pull, and push Roblox Instances natively.
 
-**WARNING: Experimental Software** 
-> **DO NOT use this for actual production version control at its current stage.**  
-> It is highly unreliable, contains bugs, and *can* cause data loss in your experience. I am **not** responsible for any lost work. Use entirely at your own risk!
+**Experimental Plugin** 
+> This plugin is experimental, contains bugs, and *can* cause data loss in your experience. I am **not** responsible for any lost work. Use entirely at your own risk!
 
 *Note: This is strictly a hobby project. Meaningful updates or stability patches are not guaranteed.*
 
@@ -30,7 +29,7 @@
 
 ## Features & Supported Commands
 
-While still a prototype, `roGit` currently supports a subset of standard Git commands, adapted for the Roblox `Instance` tree:
+`roGit` currently supports a subset of standard Git commands, adapted for the Roblox `Instance` tree:
 
 - `git clone <url>` - Clone remote repositories directly into Workspace.
 - `git status` - View modified, added, and staged Instances.
@@ -39,7 +38,7 @@ While still a prototype, `roGit` currently supports a subset of standard Git com
 - `git push` & `git pull` - Sync with remote HTTPS repositories (GitHub, GitLab, etc.).
 - `git branch`, `git diff`, `git fetch`, `git config` and more!
 
-*(Note: Complex operations like `rebase` and interactive merges are currently stubbed or unsupported due to Luau limitations).*
+*(Note: Complex operations like `rebase` and interactive merges are currently stubbed because i'm lazy).*
 
 ---
 
@@ -54,4 +53,9 @@ While still a prototype, `roGit` currently supports a subset of standard Git com
 
 ---
 
-love yall x melon
+## Example
+> WARNING: You may experience lag for a short period (15~ seconds), this is where the instances are deserialising.
+- Lets start by cloning in a repository (this is the original crossroads map!):
+```
+git clone https://github.com/officialmelon/crossroads-rogit.git
+```

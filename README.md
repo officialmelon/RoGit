@@ -53,6 +53,10 @@
 
 ---
 
+## Issues
+- Slow cloning/pulling time (this is due to redundant loops we do, will be fixed in next release)
+- `git add` keeps staging everything again after a fresh clone? this is a large and known issue that I **hope** to fix in the next release!
+
 ## Example
 > WARNING: You may experience lag for a short period (1~ minute), this is where the instances are deserialising. (SPEEDS WILL IMPROVE IN THE FUTURE, SLOW IMPLEMENTATIONS.)
 - Lets start by cloning in a repository (this is the original crossroads map!):

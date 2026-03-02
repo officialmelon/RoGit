@@ -374,7 +374,7 @@ function Handlers.update_ref(ref_path, sha)
         local parent_folder = bash.getGitFolderRoot()
         if #segments > 0 then
             local dir_path = table.concat(segments, "/")
-            parent_folder = bash.getDirectoryOrFile(parent_folder, dir_path)
+            parent_folder = bash.createFolder(parent_folder, dir_path)
         end
 
         if parent_folder and parent_folder:FindFirstChild(filename) then

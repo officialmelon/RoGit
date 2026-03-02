@@ -22,6 +22,7 @@
 
 **Experimental Plugin** 
 > This plugin is experimental, contains bugs, and *can* cause data loss in your experience. I am **not** responsible for any lost work. Use entirely at your own risk!
+> Editing the repository directly via third party means (i.e not through Roblox Studio) may cause corruption and damage to your projects.
 
 *Note: This is strictly a hobby project. Meaningful updates or stability patches are not guaranteed.*
 
@@ -52,11 +53,6 @@
 6. Restart **Roblox Studio**. The plugin will now appear in your toolbar as **"Git Terminal"**.
 
 ---
-
-## Issues
-- Slow cloning/pulling time (this is due to redundant loops we do, will be fixed in next release)
-- `git add` keeps staging everything again after a fresh clone? this is a large and known issue that I **hope** to fix in the next release!
-
 ## Example
 > WARNING: You may experience lag for a short period (1~ minute), this is where the instances are deserialising. (SPEEDS WILL IMPROVE IN THE FUTURE, SLOW IMPLEMENTATIONS.)
 - Lets start by cloning in a repository (this is the original crossroads map!):

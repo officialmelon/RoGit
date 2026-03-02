@@ -45,15 +45,18 @@ function Requests.url_request_with_retry(req_options)
                 password = password
             }
             
-            -- Success! Save to global config so we never prompt again (auto-persist)
+            --[[
+            ts bugged tf out, why tf u not saving gng?
+            lowkey finna crash out in ts mf ass lines of code.
+            fuck ass code should work first try, but no
+            you decided to be a bitch today. SAVE THE FUCKING CREDENTIALS
+            pls uwu
+            ]]
             if Auth.ACTIVE_PLUGIN then
                 pcall(function()
                     Auth.ACTIVE_PLUGIN:SetSetting("user.name", username)
                     Auth.ACTIVE_PLUGIN:SetSetting("user.password", password)
                 end)
-                if Auth.print then
-                    Auth.print("Credentials saved to global config for future sessions.")
-                end
             end
             
             req_options.Headers = req_options.Headers or {}

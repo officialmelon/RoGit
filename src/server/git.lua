@@ -596,7 +596,24 @@ arguments.createArgument("git", "pull", "", function (...)
 
     Remote.resolve_instance_refs()
 
+    local old_index = Handlers.read_index()
     local new_index = Remote.buildIndexFromTree(objectsBySha, treeSha)
+    
+    -- Sync deletions: If it was in the index but not anymore, remove it from workspace
+    local to_destroy = {}
+    for path, _ in pairs(old_index) do
+        if not new_index[path] then
+            local clean_path = path:match("^(.-)/%.properties$") or path
+            local currObj = Utilities.parse_path(clean_path)
+            if currObj and currObj ~= game and currObj.Parent ~= game then
+                table.insert(to_destroy, currObj)
+            end
+        end
+    end
+    for _, obj in ipairs(to_destroy) do
+        pcall(function() obj:Destroy() end)
+    end
+    
     Handlers.write_index(new_index)
     bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
 
@@ -2097,22 +2114,18 @@ arguments.createArgument("git", "reset", "", function(...)
 
     if mode == "--hard" then
         local index = Handlers.read_index()
+        local to_destroy = {}
         for path, _ in pairs(index) do
             if not new_index[path] then
-                local segments = string.split(path, "/")
-                local currObj = game
-                for _, segment in ipairs(segments) do
-                    if currObj and currObj:FindFirstChild(segment) then
-                        currObj = currObj:FindFirstChild(segment)
-                    else
-                        currObj = nil
-                        break
-                    end
-                end
+                local clean_path = path:match("^(.-)/%.properties$") or path
+                local currObj = Utilities.parse_path(clean_path)
                 if currObj and currObj ~= game and currObj.Parent ~= game then
-                    currObj:Destroy()
+                    table.insert(to_destroy, currObj)
                 end
             end
+        end
+        for _, obj in ipairs(to_destroy) do
+            pcall(function() obj:Destroy() end)
         end
 
         for _, service in ipairs(bash.trackingRoot) do

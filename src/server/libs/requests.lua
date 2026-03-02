@@ -40,7 +40,21 @@ function Requests.url_request_with_retry(req_options)
         
         if password and password ~= "" then
             local base_url = req_options.Url:match("^(https?://[^/]+)") or req_options.Url
-            Auth.memory_credentials[base_url] = password
+            Auth.memory_credentials[base_url] = {
+                username = username,
+                password = password
+            }
+            
+            -- Success! Save to global config so we never prompt again (auto-persist)
+            if Auth.ACTIVE_PLUGIN then
+                pcall(function()
+                    Auth.ACTIVE_PLUGIN:SetSetting("user.name", username)
+                    Auth.ACTIVE_PLUGIN:SetSetting("user.password", password)
+                end)
+                if Auth.print then
+                    Auth.print("Credentials saved to global config for future sessions.")
+                end
+            end
             
             req_options.Headers = req_options.Headers or {}
             req_options.Headers["Authorization"] = "Basic " .. Utilities.b64Encode(username .. ":" .. password)

@@ -165,19 +165,48 @@ function instances.serialize_instance(instance)
         valueType = "string"
     })
 
+    local INTERNAL_TO_PUBLIC = {
+        size = "Size",
+        color = "Color",
+        color3uint8 = "Color",
+        formFactorRaw = "FormFactor",
+        shape = "Shape",
+        MaterialVariantSerialized = "MaterialVariant",
+    }
+
     for _, propertyData in ipairs(instancePropertiesClassList) do
-        if propertyData.Serialized == true and not skipList[propertyData.Name] then
-            -- If we have both lowercase and PascalCase (e.g. 'size' vs 'Size'), pick PascalCase for readability
-            -- But usually Serialized == true is the 'true' internal name.
-            -- To avoid a 4500-file diff where 'Size' becomes 'size', we'll try to keep the human version if it's the same type.
+        -- Often the 'true' serialized property is lowercase (e.g. 'size') or internal (e.g. 'Color3uint8')
+        -- We try to map it to its public PascalCase member if possible.
+        local internalName = propertyData.Name
+        local publicName = INTERNAL_TO_PUBLIC[internalName] or (internalName:sub(1,1):upper() .. internalName:sub(2))
+        
+        -- Special case: Color3uint8 is just 'Color'
+        if internalName == "Color3uint8" then publicName = "Color" end
+
+        if (propertyData.Serialized == true or publicName == "Color" or publicName == "Size") and not skipList[publicName] then
             pcall(function()
-                local val = instance[propertyData.Name]
+                local val = instance[publicName]
+                if val == nil and publicName ~= internalName then
+                    val = instance[internalName]
+                end
+
                 if val ~= nil then
-                    table.insert(instanceProperties, {
-                        name = propertyData.Name,
-                        value = instances.serialize_property(val),
-                        valueType = typeof(val)
-                    })
+                    -- Check if we already added this (e.g. redirected both 'size' and 'Size')
+                    local found = false
+                    for _, existing in ipairs(instanceProperties) do
+                        if existing.name == publicName then
+                            found = true
+                            break
+                        end
+                    end
+
+                    if not found then
+                        table.insert(instanceProperties, {
+                            name = publicName,
+                            value = instances.serialize_property(val),
+                            valueType = typeof(val)
+                        })
+                    end
                 end
             end)
         end

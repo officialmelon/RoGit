@@ -2237,9 +2237,9 @@ arguments.createArgument("git", "credential", "", function(...)
         local base_url = url:match("^(https?://[^/]+)") or url
         if Auth.memory_credentials[base_url] then
             Auth.memory_credentials[base_url] = nil
-            print("Cleared cached credentials for", base_url)
+            print("Cleared cached credentials for '" .. base_url .. "'")
         else
-            print("No cached credentials to clear for", base_url)
+            print("No cached credentials to clear for '" .. base_url .. "'")
         end
     elseif cmd == "fill" or cmd == "approve" then
         -- roGit handles these implicitly during fetch/push via Auth.memory_credentials

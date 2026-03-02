@@ -8,6 +8,7 @@ local plugins = {}
 local arguments = require(script.Parent.arguments)
 local git = require(script.Parent.git)
 local remote = require(script.Parent.libs.git_remote)
+local Auth = require(script.Parent.libs.localstore)
 
 local StudioService = game:GetService("StudioService")
 local Players = game:GetService("Players")
@@ -345,6 +346,7 @@ function plugins.createBashTerminal(plugin)
     remote.print = printOutput
     remote.warn = warnOutput
     remote.error = errOutput
+    Auth.print = printOutput
 
 
     local activeEntryBox = nil

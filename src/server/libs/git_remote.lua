@@ -315,9 +315,20 @@ function Remote.applyProperties(instance, props)
                             (instance :: any).Source = val
                         end)
                     else
-                        pcall(function()
-                            instance[propData.name] = val
+                        local name = propData.name
+                        if name == "Color3uint8" then name = "Color" end
+                        
+                        local ok = pcall(function()
+                            instance[name] = val
                         end)
+                        
+                        if not ok then
+                            -- Try capitalized fallback (e.g. 'size' -> 'Size')
+                            local cap = name:sub(1,1):upper() .. name:sub(2)
+                            pcall(function()
+                                instance[cap] = val
+                            end)
+                        end
                     end
                 end
             end

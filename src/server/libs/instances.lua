@@ -10,6 +10,17 @@ local bash = require(script.Parent.Parent.bash)
 local ROGIT_ID = "_rogit_id"
 
 --[[
+Helper to round numbers to avoid floating point jitter in Git.
+]]
+local function round(num)
+    if typeof(num) ~= "number" then return num end
+    -- Round to 6 decimal places and return as number
+    local rounded = tonumber(string.format("%.6f", num))
+    if rounded == 0 then return 0 end -- Clean -0 to 0
+    return rounded
+end
+
+--[[
 Serializes a property to a table, that can be converted to JSON.
 ]]
 function instances.serialize_property(prop)
@@ -18,34 +29,36 @@ function instances.serialize_property(prop)
     local type = typeof(prop)
     local r = prop
 
-    if type == "BrickColor" then
+    if type == "number" then
+        r = round(prop)
+    elseif type == "BrickColor" then
         r = tostring(prop)
     elseif type == "CFrame" then
         r = {pos = instances.serialize_property(prop.Position), rX = instances.serialize_property(prop.rightVector), rY = instances.serialize_property(prop.upVector), rZ = instances.serialize_property(-prop.lookVector)}
     elseif type == "Vector3" then
-        r = {X = prop.X, Y = prop.Y, Z = prop.Z}
+        r = {X = round(prop.X), Y = round(prop.Y), Z = round(prop.Z)}
     elseif type == "Vector2" then
-        r = {X = prop.X, Y = prop.Y}
+        r = {X = round(prop.X), Y = round(prop.Y)}
     elseif type == "Color3" then
-        r = {Color3.toHSV(prop)}
+        r = {R = round(prop.R), G = round(prop.G), B = round(prop.B)}
     elseif type == "EnumItem" then
         r = {string.split(tostring(prop), ".")[2], string.split(tostring(prop), ".")[3]} 
     elseif type == "UDim" then
-        r = {Scale = prop.Scale, Offset = prop.Offset}
+        r = {Scale = round(prop.Scale), Offset = round(prop.Offset)}
     elseif type == "UDim2" then
         r = {X = instances.serialize_property(prop.X), Y = instances.serialize_property(prop.Y)}
     elseif type == "Rect" then
         r = {Min = instances.serialize_property(prop.Min), Max = instances.serialize_property(prop.Max)}
     elseif type == "NumberRange" then
-        r = {Min = prop.Min, Max = prop.Max}
+        r = {Min = round(prop.Min), Max = round(prop.Max)}
     elseif type == "PhysicalProperties" then
-        r = {Density = prop.Density, Friction = prop.Friction, Elasticity = prop.Elasticity, FrictionWeight = prop.FrictionWeight, ElasticityWeight = prop.ElasticityWeight}
+        r = {Density = round(prop.Density), Friction = round(prop.Friction), Elasticity = round(prop.Elasticity), FrictionWeight = round(prop.FrictionWeight), ElasticityWeight = round(prop.ElasticityWeight)}
     elseif type == "Font" then
         r = {Family = prop.Family, Weight = instances.serialize_property(prop.Weight), Style = instances.serialize_property(prop.Style)}
     elseif type == "NumberSequenceKeypoint" then
-        r = {Time = prop.Time, Value = prop.Value, Envelope = prop.Envelope}
+        r = {Time = round(prop.Time), Value = round(prop.Value), Envelope = round(prop.Envelope)}
     elseif type == "ColorSequenceKeypoint" then
-        r = {Time = prop.Time, Value = instances.serialize_property(prop.Value)}
+        r = {Time = round(prop.Time), Value = instances.serialize_property(prop.Value)}
     elseif type == "NumberSequence" then
         local keypoints = {}
         for _, kp in ipairs(prop.Keypoints) do
@@ -87,13 +100,18 @@ function instances.deserialize_property(prop, propType)
         local rX = instances.deserialize_property(prop.rX, "Vector3")
         local rY = instances.deserialize_property(prop.rY, "Vector3")
         local rZ = instances.deserialize_property(prop.rZ, "Vector3")
-        return CFrame.fromMatrix(pos, rX, rY, -rZ)
+        return CFrame.fromMatrix(pos, rX, rY, rZ)
     elseif propType == "Vector3" then
         return Vector3.new(prop.X, prop.Y, prop.Z)
     elseif propType == "Vector2" then
         return Vector2.new(prop.X, prop.Y)
     elseif propType == "Color3" then
-        return Color3.fromHSV(prop[1], prop[2], prop[3])
+        if prop.R then
+            return Color3.new(prop.R, prop.G, prop.B)
+        else
+            -- Backwards compatibility for HSV
+            return Color3.fromHSV(prop[1], prop[2], prop[3])
+        end
     elseif propType == "EnumItem" then
         return Enum[prop[1]][prop[2]]
     elseif propType == "UDim" then
@@ -134,32 +152,38 @@ Serializes instance & instance properties
 function instances.serialize_instance(instance)
     assert(typeof(instance) == "Instance", "no instance passed or instance is not a Instance")
 
-        -- Get properties list and loop through all properties for said instance
     local instancePropertiesClassList = game:GetService("ReflectionService"):GetPropertiesOfClass(instance.ClassName)
     local instanceProperties = {}
     
-    local SKIP_PROPS = {
+    local skipList = {
         Parent = true,
-        parent = true,
-        archivable = true,
-        className = true,
     }
 
-    for _, property in instancePropertiesClassList do 
-        Utilities.roYield()
-        if not SKIP_PROPS[property.Name] then
-            pcall(function ()
-                local val = instance[property.Name]
-                if val ~= nil then 
+    table.insert(instanceProperties, {
+        name = "ClassName",
+        value = instance.ClassName,
+        valueType = "string"
+    })
+
+    for _, propertyData in ipairs(instancePropertiesClassList) do
+        if propertyData.Serialized == true and not skipList[propertyData.Name] then
+            -- If we have both lowercase and PascalCase (e.g. 'size' vs 'Size'), pick PascalCase for readability
+            -- But usually Serialized == true is the 'true' internal name.
+            -- To avoid a 4500-file diff where 'Size' becomes 'size', we'll try to keep the human version if it's the same type.
+            pcall(function()
+                local val = instance[propertyData.Name]
+                if val ~= nil then
                     table.insert(instanceProperties, {
-                        name = property.Name,
-                        value = val,
+                        name = propertyData.Name,
+                        value = instances.serialize_property(val),
                         valueType = typeof(val)
                     })
                 end
             end)
         end
     end
+
+    -- No immediate sort here, we'll sort at the end
     
     if instance:IsA("LuaSourceContainer") then
         pcall(function()
@@ -183,11 +207,7 @@ function instances.serialize_instance(instance)
         end)
     end
     
-    for _, instanceProp in instanceProperties do 
-        if instanceProp.value ~= nil then 
-            instanceProp.value = instances.serialize_property(instanceProp.value)
-        end
-    end
+    -- Serialization is now handled inside the loop for standard props
 
     local attributes = instance:GetAttributes()
     local attrKeys = {}
@@ -214,12 +234,18 @@ function instances.serialize_instance(instance)
 
     local tags = instance:GetTags()
     if #tags > 0 then
+        table.sort(tags)
         table.insert(instanceProperties, {
             name = "_tags",
             value = tags,
             valueType = "_tags"
         })
     end
+
+    -- Final stable sort of all properties (including internal ones)
+    table.sort(instanceProperties, function(a, b)
+        return a.name < b.name
+    end)
 
     return HttpService:JSONEncode(instanceProperties)
 end
@@ -281,9 +307,22 @@ function instances.stage_recursive(instance, index, seen_ids, perf, parentVirtua
     -- Root services passed to stage_recursive initially get their own name as path
     if not parentVirtualPath then
         myVirtualPath = instance.Name
-        -- Ensure root services have stable IDs based on their name if not already set
-        if not instance:GetAttribute(ROGIT_ID) then
-            instance:SetAttribute(ROGIT_ID, "SERVICE_" .. instance.Name)
+        -- Ensure root services and certain singletons have stable IDs
+        local forcedID = nil
+        if instance.Parent == game then
+            forcedID = "SERVICE_" .. instance.Name
+        elseif instance.Name == "Camera" and instance:IsA("Camera") and instance.Parent and instance.Parent:IsA("Workspace") then
+            forcedID = "SERVICE_Camera"
+        elseif instance.Name == "Terrain" and instance:IsA("Terrain") and instance.Parent and instance.Parent:IsA("Workspace") then
+            forcedID = "SERVICE_Terrain"
+        end
+
+        if forcedID then
+            if instance:GetAttribute(ROGIT_ID) ~= forcedID then
+                instance:SetAttribute(ROGIT_ID, forcedID)
+            end
+        elseif not instance:GetAttribute(ROGIT_ID) then
+            instance:SetAttribute(ROGIT_ID, HttpService:GenerateGUID(true))
         end
     else
         myVirtualPath = parentVirtualPath

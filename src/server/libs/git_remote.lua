@@ -128,6 +128,9 @@ function Remote.unpackObjects(fullPack)
 	local typesByOffset = {}
 	local objectsBySha = {}
 
+	local fullPackStr = buffer.tostring(fullPack)
+	local fullPackLen = #fullPackStr
+
 	for i = 1, objCount do
 		Utilities.roYield()
 		local objOffset = cursor
@@ -147,20 +150,15 @@ function Remote.unpackObjects(fullPack)
 				baseOffset = bit32.bor(bit32.lshift(baseOffset + 1, 7), bit32.band(b, 0x7F))
 			end
 		elseif objType == 7 then
-			local shaBytes = buffer.create(20)
-			buffer.copy(shaBytes, 0, fullPack, cursor, 20)
-			refShaHex = ""
+			local parts = table.create(20)
 			for j = 0, 19 do
-				refShaHex = refShaHex .. ("%02x"):format(buffer.readu8(shaBytes, j))
+				parts[j + 1] = string.format("%02x", buffer.readu8(fullPack, cursor + j))
 			end
+			refShaHex = table.concat(parts)
 			cursor += 20
 		end
 
-		local remaining = buffer.len(fullPack) - cursor
-		local slice = buffer.create(remaining)
-		buffer.copy(slice, 0, fullPack, cursor, remaining)
-
-		local decompressed, bytesLeft = zlib.decompressZlib(buffer.tostring(slice))
+		local decompressed, bytesLeft = zlib.decompressZlib(fullPackStr, cursor + 1)
 
 		local resolved
 		local actualType
@@ -183,12 +181,12 @@ function Remote.unpackObjects(fullPack)
 		typesByOffset[objOffset] = actualType
 		parsedCount += 1
 
-		cursor = buffer.len(fullPack) - bytesLeft
+		cursor = fullPackLen - bytesLeft
 
 		local typePrefix = ({[1]="commit",[2]="tree",[3]="blob",[4]="tag"})[actualType]
 		if typePrefix and resolved then
 			local header = typePrefix .. " " .. #resolved .. "\0"
-			local sha = hashlib.sha1(header .. resolved)
+			local sha = hashlib.sha1()(header)(resolved)()
 			objectsBySha[sha] = {objType = actualType, content = resolved}
 		end
 	end
@@ -265,8 +263,8 @@ end
 applies properties to an instance.
 ]]
 function Remote.applyProperties(instance, props)
+    Utilities.roYield()
     for _, propData in ipairs(props) do
-        Utilities.roYield()
         if propData.name == "_attributes" and propData.valueType == "_attributes" then
             if type(propData.value) == "table" and propData.value[1] and type(propData.value[1]) == "table" and propData.value[1].name then
                 -- New sorted array format
@@ -346,21 +344,25 @@ function Remote.extractRogitId(props)
     for _, propData in ipairs(props) do
         if propData.name == "_attributes" and propData.valueType == "_attributes" then
             if type(propData.value) == "table" then
-                -- Check for new array format
+                -- Check for new sorted array format: [{name = "...", value = ...}]
                 if propData.value[1] and type(propData.value[1]) == "table" and propData.value[1].name then
                     for _, attrData in ipairs(propData.value) do
                         if attrData.name == ROGIT_ID then
-                            return attrData.value
+                            local v = attrData.value
+                            return type(v) == "table" and (v.Guid or v.value) or v
                         end
                     end
                 else
                     -- Fallback to legacy dictionary format
                     local entry = propData.value[ROGIT_ID]
                     if entry then
-                        return type(entry) == "table" and entry.value or entry
+                        return type(entry) == "table" and (entry.Guid or entry.value) or entry
                     end
                 end
             end
+        elseif propData.name == ROGIT_ID then
+            -- Extreme fallback if ID is at root level of props (some very old versions)
+            return type(propData.value) == "table" and (propData.value.Guid or propData.value.value) or propData.value
         end
     end
     return nil
@@ -404,18 +406,21 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
             end
 
             local target = uuid and Remote.findByRogitId(parent, uuid) or parent:FindFirstChild(name)
+            local isNew = false
             if not target then
+                isNew = true
                 if className then
                     local ok, inst = pcall(Instance.new, className)
                     if ok then
                         target = inst
                         target.Name = name
-                        target.Parent = parent
                     else
-                        target = bash.createFolder(parent, name)
+                        target = Instance.new("Folder")
+                        target.Name = name
                     end
                 else
-                    target = bash.createFolder(parent, name)
+                    target = Instance.new("Folder")
+                    target.Name = name
                 end
             end
 
@@ -428,6 +433,10 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
             end
 
             Remote.writeTree(objectsBySha, sha, target, entryPath)
+
+            if isNew then
+                target.Parent = parent
+            end
         else
             local blobObj = objectsBySha[sha]
             if not blobObj then
@@ -454,17 +463,22 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
                 local uuid = Remote.extractRogitId(props)
                 local newInstance = uuid and Remote.findByRogitId(parent, uuid) or parent:FindFirstChild(name)
 
+                local isNew = false
                 if not newInstance then
+                    isNew = true
                     local ok2, inst = pcall(Instance.new, className)
                     if not ok2 then
                         continue
                     end
                     newInstance = inst
                     newInstance.Name = name
-                    newInstance.Parent = parent
                 end
 
                 Remote.applyProperties(newInstance, props)
+
+                if isNew then
+                    newInstance.Parent = parent
+                end
             end
         end
     end
@@ -511,6 +525,41 @@ function Remote.fetch(remote_name)
             end
         end
     end
+end
+
+function Remote.buildIndexFromTree(objectsBySha, treeSha)
+    local index = {}
+
+    local function traverse(tSha, prefix)
+        local treeObj = objectsBySha[tSha]
+        if not treeObj then return end
+
+        local content = treeObj.content
+        local pos = 1
+        while pos <= #content do
+            local spacePos = content:find(" ", pos, true)
+            local mode = content:sub(pos, spacePos - 1)
+            local nullPos = content:find("\0", spacePos, true)
+            local name = content:sub(spacePos + 1, nullPos - 1)
+            local rawSha = content:sub(nullPos + 1, nullPos + 20)
+            local entrySha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+            pos = nullPos + 21
+
+            local entryPath = prefix ~= "" and (prefix .. "/" .. name) or name
+
+            if mode == "40000" then
+                traverse(entrySha, entryPath)
+            else
+                index[entryPath] = {
+                    mode = mode,
+                    sha = entrySha
+                }
+            end
+        end
+    end
+
+    traverse(treeSha, "")
+    return index
 end
 
 return Remote

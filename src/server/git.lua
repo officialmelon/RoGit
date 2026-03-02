@@ -198,16 +198,7 @@ arguments.createArgument("git", "diff", "", function()
     local has_diff = false
     for path, data in pairs(index) do
         local target_path = path:match("^(.-)/%.properties$") or path
-        local segments = string.split(target_path, "/")
-        local currObj = game
-        for _, segment in ipairs(segments) do
-            if currObj and currObj:FindFirstChild(segment) then
-                currObj = currObj:FindFirstChild(segment)
-            else
-                currObj = nil
-                break
-            end
-        end
+        local currObj = Utilities.parse_path(target_path)
 
         if not currObj then
             print("\27[31mD\27[0m  " .. path)
@@ -503,7 +494,7 @@ arguments.createArgument("git", "add", "a", function (...)
     local seen_ids = {}
 
     for _, target in ipairs(paths) do
-        local currObj = Utilities.parse_path(target)
+        local currObj, _, segments = Utilities.parse_path(target)
 
         if not currObj then
             print("fatal: pathspec '" .. target .. "' did not match any files")
@@ -513,7 +504,9 @@ arguments.createArgument("git", "add", "a", function (...)
         if dry_run then
             print("add '" .. currObj:GetFullName() .. "'")
         else
-            instances.stage_recursive(currObj, index, seen_ids)
+            local parentPath = table.concat(segments, "/", 1, #segments - 1)
+            if parentPath == "" then parentPath = nil end
+            instances.stage_recursive(currObj, index, seen_ids, nil, parentPath)
         end
     end
 
@@ -560,7 +553,7 @@ arguments.createArgument("git", "pull", "", function (...)
         Utilities.roYield()
         local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
         if typeName then
-            Handlers.write_object(typeName, obj.content)
+            Handlers.write_object_with_sha(typeName, obj.content, objSha)
         end
     end
 
@@ -603,13 +596,7 @@ arguments.createArgument("git", "pull", "", function (...)
 
     Remote.resolve_instance_refs()
 
-    local new_index = {}
-    local seen_ids = {}
-    for _, service in ipairs(bash.trackingRoot) do
-        if not Handlers.is_ignored(service:GetFullName()) then
-            instances.stage_recursive(service, new_index, seen_ids)
-        end
-    end
+    local new_index = Remote.buildIndexFromTree(objectsBySha, treeSha)
     Handlers.write_index(new_index)
     bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
 
@@ -999,14 +986,50 @@ arguments.createArgument("git", "clone", "", function(...)
         return
     end
 
-    local packFile = Remote.fetchPackfile(url, headSha)
-    local _, objectsBySha = Remote.unpackObjects(packFile)
+    local _t0 = os.clock()
 
+    local _t1 = os.clock()
+    local packFile = Remote.fetchPackfile(url, headSha)
+
+    _t1 = os.clock()
+    local _, objectsBySha = Remote.unpackObjects(packFile)
+    local _objCount = 0
+    for _ in pairs(objectsBySha) do _objCount += 1 end
+
+    _t1 = os.clock()
+    local _needed = {}
+    local function _collectNeeded(sha)
+        if not sha or _needed[sha] then return end
+        local obj = objectsBySha[sha]
+        if not obj then return end
+        _needed[sha] = true
+        if obj.objType == 1 then
+            local treeSha = obj.content:match("^tree (%x+)")
+            if treeSha then _collectNeeded(treeSha) end
+        elseif obj.objType == 2 then
+            local c = obj.content
+            local p = 1
+            while p <= #c do
+                local sp = c:find(" ", p, true)
+                local np = c:find("\0", sp, true)
+                local rs = c:sub(np + 1, np + 20)
+                local es = ("%02x"):rep(20):format(rs:byte(1, 20))
+                p = np + 21
+                _collectNeeded(es)
+            end
+        end
+    end
+    _collectNeeded(headSha)
+
+    local _writeCount = 0
     for sha, obj in pairs(objectsBySha) do
-        Utilities.roYield()
-        local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
-        if typeName then
-            Handlers.write_object(typeName, obj.content)
+        if _needed[sha] then
+            Utilities.roYield()
+            local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
+            if typeName then
+                Handlers.write_object_with_sha(typeName, obj.content, sha)
+                _writeCount += 1
+            end
         end
     end
 
@@ -1037,6 +1060,7 @@ arguments.createArgument("git", "clone", "", function(...)
 
     local content = treeObj.content
     
+    _t1 = os.clock()
     local function find_rogit_project(current_tree_sha)
         local obj = objectsBySha[current_tree_sha]
         if not obj then return false end
@@ -1073,6 +1097,8 @@ arguments.createArgument("git", "clone", "", function(...)
         return
     end
 
+    _t1 = os.clock()
+    local _instanceCount = 0
     local pos = 1
     while pos <= #content do
         Utilities.roYield()
@@ -1097,19 +1123,20 @@ arguments.createArgument("git", "clone", "", function(...)
                     Remote.applyProperties(serviceParent, childProps)
                 end
                 Remote.writeTree(objectsBySha, sha, serviceParent, name)
+                _instanceCount += 1
             end
         end
     end
 
+    _t1 = os.clock()
     Remote.resolve_instance_refs()
 
-    local new_index = {}
-    local seen_ids = {}
-    for _, service in ipairs(bash.trackingRoot) do
-        if not Handlers.is_ignored(service:GetFullName()) then
-            instances.stage_recursive(service, new_index, seen_ids)
-        end
-    end
+    _t1 = os.clock()
+    local new_index = Remote.buildIndexFromTree(objectsBySha, treeSha)
+    local _indexCount = 0
+    for _ in pairs(new_index) do _indexCount += 1 end
+
+    _t1 = os.clock()
     Handlers.write_index(new_index)
     bash.modifyFileContents(gitRoot, "last_commit_index", HttpService:JSONEncode(new_index))
 

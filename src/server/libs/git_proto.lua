@@ -197,6 +197,12 @@ end
 function proto.applyDelta(base: string, delta: string)
     local pos = 1
     local result = {}
+	local res_index = 1
+	local byte = string.byte
+	local sub = string.sub
+	local band = bit32.band
+	local bor = bit32.bor
+	local lshift = bit32.lshift
 
     local _, newPos = readDeltaVariant(delta, pos)
     pos = newPos
@@ -204,29 +210,32 @@ function proto.applyDelta(base: string, delta: string)
     local _, newPos2 = readDeltaVariant(delta, pos)
     pos = newPos2
 
-    while pos <= #delta do
-        local cmd = string.byte(delta, pos)
-        pos +=1
+	local delta_len = #delta
 
-        if bit32.band(cmd, 0x80) ~= 0 then
+    while pos <= delta_len do
+        local cmd = byte(delta, pos)
+        pos += 1
+
+        if band(cmd, 0x80) ~= 0 then
             local offset = 0
             local size = 0
 
-            if bit32.band(cmd, 0x01) ~= 0 then offset = bit32.bor(offset, string.byte(delta, pos)) pos += 1 end
-            if bit32.band(cmd, 0x02) ~= 0 then offset = bit32.bor(offset, bit32.lshift(string.byte(delta, pos), 8)) pos += 1 end
-            if bit32.band(cmd, 0x04) ~= 0 then offset = bit32.bor(offset, bit32.lshift(string.byte(delta, pos), 16)) pos += 1 end
-            if bit32.band(cmd, 0x08) ~= 0 then offset = bit32.bor(offset, bit32.lshift(string.byte(delta, pos), 24)) pos += 1 end
+            if band(cmd, 0x01) ~= 0 then offset = bor(offset, byte(delta, pos)) pos += 1 end
+            if band(cmd, 0x02) ~= 0 then offset = bor(offset, lshift(byte(delta, pos), 8)) pos += 1 end
+            if band(cmd, 0x04) ~= 0 then offset = bor(offset, lshift(byte(delta, pos), 16)) pos += 1 end
+            if band(cmd, 0x08) ~= 0 then offset = bor(offset, lshift(byte(delta, pos), 24)) pos += 1 end
 
-            if bit32.band(cmd, 0x10) ~= 0 then size = bit32.bor(size, string.byte(delta, pos)) pos += 1 end
-            if bit32.band(cmd, 0x20) ~= 0 then size = bit32.bor(size, bit32.lshift(string.byte(delta, pos), 8)) pos += 1 end
-            if bit32.band(cmd, 0x40) ~= 0 then size = bit32.bor(size, bit32.lshift(string.byte(delta, pos), 16)) pos += 1 end
+            if band(cmd, 0x10) ~= 0 then size = bor(size, byte(delta, pos)) pos += 1 end
+            if band(cmd, 0x20) ~= 0 then size = bor(size, lshift(byte(delta, pos), 8)) pos += 1 end
+            if band(cmd, 0x40) ~= 0 then size = bor(size, lshift(byte(delta, pos), 16)) pos += 1 end
 
             if size == 0 then size = 0x10000 end
 
-            table.insert(result, string.sub(base, offset + 1, offset + size))
+            result[res_index] = sub(base, offset + 1, offset + size)
+			res_index += 1
         elseif cmd > 0 then
-            local chunk = string.sub(delta, pos, pos + cmd - 1)
-            table.insert(result, chunk)
+            result[res_index] = sub(delta, pos, pos + cmd - 1)
+			res_index += 1
             pos += cmd
         end
     end

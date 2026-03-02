@@ -29,14 +29,37 @@ function Utilities.parse_path(path)
         return nil
     end
 
+    local ROGIT_ID = "_rogit_id"
     local cleaned = path:gsub("^game[./]", ""):gsub("^Workspace[./]", "Workspace/"):gsub("%.", "/")
     local segments = string.split(cleaned, "/")
     local currObj = game
 
     for _, segment in ipairs(segments) do
-        if currObj and currObj:FindFirstChild(segment) then
-            currObj = currObj:FindFirstChild(segment)
+        if not currObj then return nil, segments[#segments], segments end
+        
+        local baseName, indexStr = segment:match("^(.*) %[(%d+)%]$")
+        if indexStr then
+            local targetIndex = tonumber(indexStr)
+            local children = {}
+            for _, child in ipairs(currObj:GetChildren()) do
+                if child.Name == baseName then
+                    table.insert(children, child)
+                end
+            end
+            
+            table.sort(children, function(a, b)
+                if a.Name ~= b.Name then
+                    return a.Name < b.Name
+                end
+                return (a:GetAttribute(ROGIT_ID) or "") < (b:GetAttribute(ROGIT_ID) or "")
+            end)
+            
+            currObj = children[targetIndex]
         else
+            currObj = currObj:FindFirstChild(segment)
+        end
+        
+        if not currObj then
             return nil, segments[#segments], segments
         end
     end

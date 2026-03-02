@@ -13,7 +13,10 @@ local StudioService = game:GetService("StudioService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
-local user = Players:GetNameFromUserIdAsync(StudioService:GetUserId())
+local user = "User"
+pcall(function()
+    user = Players:GetNameFromUserIdAsync(StudioService:GetUserId())
+end)
 local name = game.Name
 
 local commandHistory = {}

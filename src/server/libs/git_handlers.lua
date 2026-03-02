@@ -11,6 +11,7 @@ local Utilities = require(script.Parent.utilities)
 --// Cache for .rogitignore
 local ignore_cache = {}
 local ignore_patterns = nil
+local objects_dir_cache = {}
 
 --[[
 Compresses and writes an object to the .git/objects folder.
@@ -34,6 +35,34 @@ function Handlers.write_object(typeName, content)
     end
 
     return sha
+end
+
+function Handlers.write_object_with_sha(typeName, content, sha)
+    local prefix = string.sub(sha, 1, 2)
+    local dir = objects_dir_cache[prefix]
+    if not dir then
+        dir = bash.createFolder(
+            bash.getGitFolderRoot(),
+            "objects/" .. prefix
+        )
+        objects_dir_cache[prefix] = dir
+    end
+
+    if not dir:FindFirstChild(string.sub(sha, 3)) then
+        local header = typeName .. " " .. tostring(#content) .. "\0"
+        local full = header .. content
+        bash.createFile(
+            dir,
+            string.sub(sha, 3),
+            hashlib.bin_to_base64(zlib.compressZlib(full))
+        )
+    end
+
+    return sha
+end
+
+function Handlers.clear_objects_cache()
+    table.clear(objects_dir_cache)
 end
 
 --[[ 

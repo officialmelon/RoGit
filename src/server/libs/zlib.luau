@@ -2548,10 +2548,10 @@ end
 
 
 
-local function createReader(input_string:string)
+local function createReader(input_string:string,input_offset:number?)
 local input=input_string
 local input_strlen=#input_string
-local input_next_byte_pos=1
+local input_next_byte_pos=input_offset or 1
 local cache_bitlen=0
 local cache=0
 
@@ -2726,8 +2726,8 @@ end
 
 
 
-local function createDecompressState(str:string,dictionary:Dictionary__DARKLUA_TYPE_c?):DeflateState__DARKLUA_TYPE_f
-local ReadBits,ReadBytes,Decode,ReaderBitlenLeft,SkipToByteBoundary=createReader(str)
+local function createDecompressState(str:string,dictionary:Dictionary__DARKLUA_TYPE_c?,offset:number?):DeflateState__DARKLUA_TYPE_f
+local ReadBits,ReadBytes,Decode,ReaderBitlenLeft,SkipToByteBoundary=createReader(str,offset)
 local state={
 ReadBits=ReadBits,
 ReadBytes=ReadBytes,
@@ -3146,8 +3146,8 @@ end
 
 
 
-local function decompressDeflateInternal(str:string,dictionary:Dictionary__DARKLUA_TYPE_c?):(string?,number?)
-local state=createDecompressState(str,dictionary)
+local function decompressDeflateInternal(str:string,dictionary:Dictionary__DARKLUA_TYPE_c?,offset:number?):(string?,number?)
+local state=createDecompressState(str,dictionary,offset)
 local result,status=inflate(state)
 if not result then
 return nil,status
@@ -3160,8 +3160,8 @@ end
 
 
 
-local function decompressZlibInternal(str:string,dictionary:Dictionary__DARKLUA_TYPE_c?):(string?,number?)
-local state=createDecompressState(str,dictionary)
+local function decompressZlibInternal(str:string,dictionary:Dictionary__DARKLUA_TYPE_c?,offset:number?):(string?,number?)
+local state=createDecompressState(str,dictionary,offset)
 local readBits=state.ReadBits
 
 local CMF=readBits(8)
@@ -3244,12 +3244,12 @@ end
 
 
 
-function LibDeflate.decompressDeflate(str:string):(string?,number?)
+function LibDeflate.decompressDeflate(str:string,offset:number?):(string?,number?)
 local arg_valid,arg_err=isValidArguments(str)
 if not arg_valid then
 error('Usage: LibDeflate.decompressDeflate(str): '..arg_err::string,2)
 end
-return decompressDeflateInternal(str)
+return decompressDeflateInternal(str,nil,offset)
 end
 
 
@@ -3297,12 +3297,12 @@ end
 
 
 
-function LibDeflate.decompressZlib(str:string):(string?,number?)
+function LibDeflate.decompressZlib(str:string,offset:number?):(string?,number?)
 local arg_valid,arg_err=isValidArguments(str)
 if not arg_valid then
 error('Usage: LibDeflate.decompressZlib(str): '..arg_err::string,2)
 end
-return decompressZlibInternal(str)
+return decompressZlibInternal(str,nil,offset)
 end
 
 

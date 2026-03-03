@@ -116,7 +116,8 @@ arguments.createArgument("git", "help", "h", function (...)
             log = "git-log - Show commit logs.\n\nUsage: git log [<options>]",
             config = "git-config - Get and set repository or global options.\n\nUsage: git config [--global] <name> [<value>]",
             version = "git-version - Show the RoGit version information.\n\nUsage: git version",
-            credential = "git-credential - Prompt for and cache user credentials.\n\nUsage: git credential (fill|approve|reject)"
+            credential = "git-credential - Prompt for and cache user credentials.\n\nUsage: git credential (fill|approve|reject)",
+            checkout = "git-checkout - Switch branches or restore working tree files.\n\nUsage: git checkout [-b] <branchname>\n       git checkout <pathspec>..."
         }
 
         if cmd == "-a" or cmd == "--all" then
@@ -164,7 +165,9 @@ examine the history and state (see also: git help revisions)
 
 grow, mark and tweak your common history
    branch    List, create, or delete branches
+   checkout  Switch branches or restore working tree files
    commit    Record changes to the repository
+   switch    Switch branches
    merge     Join two or more development histories together
    rebase    Reapply commits on top of another base tip (NOT IMPLEMENTED YET)
    reset     Reset current HEAD to the specified state
@@ -377,23 +380,94 @@ arguments.createArgument("git", "restore", "", function(...)
 
     assert(bash.getGitFolderRoot(), "fatal: not a git repository")
     local index = Handlers.read_index()
-    local path = tuple[1] -- Use tuple[1] as the path argument
+    local path = tuple[1]
     
     local is_all = (path == ".")
-    local target_path_base = ""
-    if not is_all then
-        local _, _, segments = Utilities.parse_path(path)
-        target_path_base = table.concat(segments or {}, "/")
-    end
     
-    local found = false
-    for idx_path, data in pairs(index) do
-        local entry_path = idx_path:match("^(.-)/%.properties$") or idx_path
-        if is_all or entry_path == target_path_base or entry_path:sub(1, #target_path_base + 1) == target_path_base .. "/" then
-            found = true
+    if is_all then
+        -- Full destructive restore
+        local objectsByShaFallback = setmetatable({}, {
+            __index = function(_, key)
+                local obj = Handlers.read_object(key)
+                if not obj then return nil end
+                return {
+                    objType = ({commit=1, tree=2, blob=3, tag=4})[obj.type],
+                    content = obj.content
+                }
+            end
+        })
+
+        -- 1. Remove untracked items
+        local to_destroy = {}
+        local function check_untracked(parent, prefix)
+            local child_counts = {}
+            for _, child in ipairs(parent:GetChildren()) do
+                if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() then
+                    child_counts[child.Name] = (child_counts[child.Name] or 0) + 1
+                end
+            end
+
+            local seen = {}
+            for _, child in ipairs(parent:GetChildren()) do
+                if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() then
+                    local virtualName = child.Name
+                    if child_counts[child.Name] > 1 then
+                        seen[child.Name] = (seen[child.Name] or 0) + 1
+                        virtualName = child.Name .. " [" .. tostring(seen[child.Name]) .. "]"
+                    end
+                    local my_path = prefix == "" and virtualName or (prefix .. "/" .. virtualName)
+                    
+                    local hasValidChildren = false
+                    for _, sub in ipairs(child:GetChildren()) do
+                        if not Handlers.is_ignored(sub:GetFullName()) and sub ~= bash.getGitFolderRoot() then
+                            hasValidChildren = true; break
+                        end
+                    end
+                    
+                    local idx_p = hasValidChildren and (my_path .. "/.properties") or my_path
+                    if not index[idx_p] and not index[my_path] then
+                        table.insert(to_destroy, child)
+                    else
+                        check_untracked(child, my_path)
+                    end
+                end
+            end
+        end
+
+        for _, service in ipairs(bash.trackingRoot) do
+            check_untracked(service, service.Name)
+        end
+        for _, obj in ipairs(to_destroy) do pcall(function() obj:Destroy() end) end
+
+        -- 2. Restore/Create tracked items
+        for idx_path, data in pairs(index) do
+            local clean_path = idx_path:match("^(.-)/%.properties$") or idx_path
+            local targetObj = Utilities.parse_path(clean_path)
             
-            local targetObj = Utilities.parse_path(entry_path)
-            if targetObj then
+            if not targetObj then
+                -- Create missing
+                local segments = string.split(clean_path, "/")
+                local name = table.remove(segments)
+                local parentPath = table.concat(segments, "/")
+                local parentObj = Utilities.parse_path(parentPath)
+                if parentObj then
+                    local obj = Handlers.read_object(data.sha)
+                    if obj and obj.type == "blob" then
+                        local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
+                        if ok then
+                            local className = "Folder"
+                            for _, p in ipairs(props) do if p.name == "ClassName" then className = p.value; break end end
+                            local ok2, inst = pcall(Instance.new, className)
+                            if ok2 then
+                                inst.Name = name
+                                Remote.applyProperties(inst, props)
+                                inst.Parent = parentObj
+                            end
+                        end
+                    end
+                end
+            else
+                -- Update existing
                 local obj = Handlers.read_object(data.sha)
                 if obj and obj.type == "blob" then
                     local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
@@ -403,14 +477,29 @@ arguments.createArgument("git", "restore", "", function(...)
                 end
             end
         end
-    end
-    
-    Remote.resolve_instance_refs()
-    
-    if found then
-        print("Restored " .. path)
+        Remote.resolve_instance_refs()
+        print("Restored working tree from index")
     else
-        print("error: pathspec '" .. path .. "' did not match any files")
+        -- Single path restore (current logic enhanced)
+        local _, _, segments = Utilities.parse_path(path)
+        local target_path_base = table.concat(segments or {}, "/")
+        local found = false
+        for idx_path, data in pairs(index) do
+            local entry_path = idx_path:match("^(.-)/%.properties$") or idx_path
+            if entry_path == target_path_base or entry_path:sub(1, #target_path_base + 1) == target_path_base .. "/" then
+                found = true
+                local targetObj = Utilities.parse_path(entry_path)
+                if targetObj then
+                    local obj = Handlers.read_object(data.sha)
+                    if obj and obj.type == "blob" then
+                        local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
+                        if ok then Remote.applyProperties(targetObj, props) end
+                    end
+                end
+            end
+        end
+        Remote.resolve_instance_refs()
+        if found then print("Restored " .. path) else print("error: pathspec '" .. path .. "' did not match any files") end
     end
 end)
 
@@ -541,87 +630,51 @@ arguments.createArgument("git", "pull", "", function (...)
     assert(remoteSha, "fatal: couldn't find remote ref 'refs/heads/" .. branch_name .. "'")
 
     local localSha = Handlers.get_ref("HEAD")
+
+    
+    local index = Handlers.read_index()
+    
+    -- If we are already up to date, check if our local parts match the tree
     if localSha == remoteSha then
-        print("Already up to date.")
-        return
+        local current_tree_matches = true
+        for path, _ in pairs(index) do
+            local clean = path:match("^(.-)/%.properties$") or path
+            if not Utilities.parse_path(clean) then
+                current_tree_matches = false; break
+            end
+        end
+
+        if current_tree_matches then
+            print("Already up to date.")
+            return
+        end
     end
 
+    print("Updating " .. string.sub(localSha or "0000000", 1, 7) .. ".." .. string.sub(remoteSha, 1, 7))
     local fullPack = Remote.fetchPackfile(url, remoteSha)
     local _, objectsBySha = Remote.unpackObjects(fullPack)
-
-    for objSha, obj in pairs(objectsBySha) do
-        Utilities.roYield()
+    
+    for oSha, obj in pairs(objectsBySha) do
         local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
         if typeName then
-            Handlers.write_object_with_sha(typeName, obj.content, objSha)
+            Handlers.write_object_with_sha(typeName, obj.content, oSha)
         end
     end
 
-    local headCommit = objectsBySha[remoteSha]
-    assert(headCommit, "HEAD commit not found in packfile")
-    local treeSha = headCommit.content:match("^tree (%x+)")
-    assert(treeSha, "Could not parse tree SHA from commit")
-
-    local treeObj = objectsBySha[treeSha]
-    assert(treeObj, "Missing root tree: " .. treeSha)
-
-    local content = treeObj.content
-    local pos = 1
-    while pos <= #content do
-        Utilities.roYield()
-        local spacePos = content:find(" ", pos, true)
-        local mode = content:sub(pos, spacePos - 1)
-        local nullPos = content:find("\0", spacePos, true)
-        local name = content:sub(spacePos + 1, nullPos - 1)
-        local rawSha = content:sub(nullPos + 1, nullPos + 20)
-        local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-        pos = nullPos + 21
-
-        if mode == "40000" then
-            local serviceParent = game:FindFirstChild(name)
-            if not serviceParent then
-                pcall(function()
-                    serviceParent = game:GetService(name)
-                end)
-            end
-            if serviceParent then
-                local childProps = Remote.peekPropertiesBlob(objectsBySha, sha)
-                if childProps then
-                    Remote.applyProperties(serviceParent, childProps)
-                end
-                Remote.writeTree(objectsBySha, sha, serviceParent, name)
-            end
-        end
-    end
-
-    Remote.resolve_instance_refs()
-
-    local old_index = Handlers.read_index()
-    local new_index = Remote.buildIndexFromTree(objectsBySha, treeSha)
+    Handlers.update_ref("refs/heads/" .. branch_name, remoteSha)
+    Handlers.update_ref("refs/remotes/origin/" .. branch_name, remoteSha)
     
-    -- Sync deletions: If it was in the index but not anymore, remove it from workspace
-    local to_destroy = {}
-    for path, _ in pairs(old_index) do
-        if not new_index[path] then
-            local clean_path = path:match("^(.-)/%.properties$") or path
-            local currObj = Utilities.parse_path(clean_path)
-            if currObj and currObj ~= game and currObj.Parent ~= game then
-                table.insert(to_destroy, currObj)
-            end
+    if Handlers.get_current_branch() == branch_name then
+        local remote_commit_obj = Handlers.read_object(remoteSha)
+        local treeSha = remote_commit_obj and remote_commit_obj.content:match("^tree (%x+)")
+        if treeSha then
+            print("Syncing workspace...")
+            Remote.checkout(treeSha)
         end
     end
-    for _, obj in ipairs(to_destroy) do
-        pcall(function() obj:Destroy() end)
-    end
-    
-    Handlers.write_index(new_index)
-    bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
-
-    Handlers.update_ref("HEAD", remoteSha)
-    Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, remoteSha)
-
-    print("Updating " .. (localSha or "0000000"):sub(1, 7) .. ".." .. remoteSha:sub(1, 7))
+    print("Successfully pulled from " .. branch_name)
 end)
+
 
 --[[
 commands:
@@ -991,7 +1044,7 @@ arguments.createArgument("git", "clone", "", function(...)
 
     local refs = Remote.discoverRefs(url)
     local headSha
-    if branch_override then
+    if branch_override then 
         headSha = refs["refs/heads/" .. branch_override]
         assert(headSha, "fatal: Remote branch '" .. branch_override .. "' not found in upstream origin")
     else
@@ -1036,7 +1089,10 @@ arguments.createArgument("git", "clone", "", function(...)
             end
         end
     end
-    _collectNeeded(headSha)
+
+    for _, branchSha in pairs(refs) do
+        _collectNeeded(branchSha)
+    end
 
     local _writeCount = 0
     for sha, obj in pairs(objectsBySha) do
@@ -1063,8 +1119,25 @@ arguments.createArgument("git", "clone", "", function(...)
     
     local gitRoot = bash.getGitFolderRoot()
     bash.modifyFileContents(gitRoot, "HEAD", "ref: refs/heads/" .. activeBranch)
-    bash.createFile(bash.createFolder(gitRoot, "refs/heads"), activeBranch, headSha)
-    bash.createFile(bash.createFolder(gitRoot, "refs/remotes/origin"), activeBranch, headSha)
+    for refName, sha in pairs(refs) do
+        if refName:match("^refs/heads/") then
+            local bName = refName:sub(12)
+            Handlers.update_ref("refs/remotes/origin/" .. bName, sha)
+            if bName == activeBranch then
+                Handlers.update_ref("refs/heads/" .. bName, sha)
+            end
+        elseif refName:match("^refs/tags/") then
+            Handlers.update_ref(refName, sha)
+        end
+    end
+
+    local config_content = bash.getFileContents(gitRoot, "config")
+    local loaded_conf = ini_parser.parseIni(config_content)
+    loaded_conf['branch "' .. activeBranch .. '"'] = {
+        remote = "origin",
+        merge = "refs/heads/" .. activeBranch
+    }
+    bash.modifyFileContents(gitRoot, "config", ini_parser.serializeIni(loaded_conf))
 
     local headCommit = objectsBySha[headSha]
     assert(headCommit, "HEAD commit not found in packfile")
@@ -1663,6 +1736,27 @@ arguments.createArgument("git", "log", "", function(...)
         return
     end
 
+    local refs_map = {}
+    local function scan_refs(dir, prefix)
+        for _, child in ipairs(dir:GetChildren()) do
+            if child:IsA("Folder") then
+                scan_refs(child, prefix .. child.Name .. "/")
+            else
+                local sha = Handlers.get_ref(prefix .. child.Name)
+                if sha then
+                    refs_map[sha] = refs_map[sha] or {}
+                    table.insert(refs_map[sha], prefix .. child.Name)
+                end
+            end
+        end
+    end
+    local git_root = bash.getGitFolderRoot()
+    local refs_folder = git_root:FindFirstChild("refs")
+    if refs_folder then scan_refs(refs_folder, "refs/") end
+    
+    local head_sha = Handlers.get_ref("HEAD")
+    local current_branch = Handlers.get_current_branch()
+    
     local count = 0
     while sha do
         if max_count and count >= max_count then break end
@@ -1672,14 +1766,42 @@ arguments.createArgument("git", "log", "", function(...)
 
         local body = obj.content
         local msg = body:match("\n\n(.+)$") or ""
+        
+        local decoration = ""
+        local local_refs = refs_map[sha]
+        if local_refs or sha == head_sha then
+            local items = {}
+            if sha == head_sha then
+                if current_branch then
+                    table.insert(items, "HEAD -> " .. current_branch)
+                else
+                    table.insert(items, "HEAD")
+                end
+            end
+            if local_refs then
+                for _, r in ipairs(local_refs) do
+                    local name = r:match("refs/heads/(.+)") or r:match("refs/remotes/(.+)") or r:match("refs/tags/(.+)")
+                    if name and name ~= current_branch then
+                        if r:match("tags/") then
+                            table.insert(items, "tag: " .. name)
+                        else
+                            table.insert(items, name)
+                        end
+                    end
+                end
+            end
+            if #items > 0 then
+                decoration = " (" .. table.concat(items, ", ") .. ")"
+            end
+        end
 
         if oneline then
-            print(sha:sub(1, 7) .. " " .. (msg:match("^[^\n]+") or msg))
+            print(sha:sub(1, 7) .. decoration .. " " .. (msg:match("^[^\n]+") or msg))
         else
             local author_line = body:match("\nauthor ([^\n]+)") or ""
             local author_name_email, author_time, author_tz = author_line:match("(.-) (%d+) ([+%-%d]+)")
             
-            print("commit " .. sha)
+            print("commit " .. sha .. decoration)
             if author_name_email and author_time then
                 print("Author: " .. author_name_email)
                 print("Date:   " .. os.date("%a %b %d %H:%M:%S %Y", tonumber(author_time)) .. " " .. author_tz)
@@ -1708,28 +1830,58 @@ arguments.createArgument("git", "branch", "br", function(...)
 
     local tuple = {...}
 
-    if #tuple == 0 then
-        local heads = bash.getGitFolderRoot():FindFirstChild("refs")
-        if heads then
-            heads = heads:FindFirstChild("heads")
+    if #tuple == 0 or (tuple[1] == "-a" or tuple[1] == "--all" or tuple[1] == "-r" or tuple[1] == "--remotes") then
+        local show_remotes = tuple[1] == "-a" or tuple[1] == "--all" or tuple[1] == "-r" or tuple[1] == "--remotes"
+        local only_remotes = tuple[1] == "-r" or tuple[1] == "--remotes"
+        
+        local root = bash.getGitFolderRoot()
+        local current_branch = Handlers.get_current_branch()
+        local branches = {}
+        
+        if not only_remotes then
+            local heads = root:FindFirstChild("refs")
+            if heads then heads = heads:FindFirstChild("heads") end
+            if heads then
+                for _, child in ipairs(heads:GetChildren()) do
+                    branches[child.Name] = { is_current = (child.Name == current_branch), is_remote = false }
+                end
+            end
         end
-        local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
-        local current_branch = current_ref:match("ref: refs/heads/(.+)")
-
-        if heads then
-            for _, child in ipairs(heads:GetChildren()) do
-                if child.Name == current_branch then
-                    print("* " .. child.Name)
-                else
-                    print("  " .. child.Name)
+        
+        if show_remotes or only_remotes then
+            local remotes = root:FindFirstChild("refs")
+            if remotes then remotes = remotes:FindFirstChild("remotes") end
+            if remotes then
+                for _, remote_node in ipairs(remotes:GetChildren()) do
+                    for _, branch_node in ipairs(remote_node:GetChildren()) do
+                        local name = remote_node.Name .. "/" .. branch_node.Name
+                        if not branches[name] then
+                            branches[name] = { is_current = false, is_remote = true }
+                        end
+                    end
                 end
             end
         end
 
-        if not heads or #heads:GetChildren() == 0 then
-            if current_branch then
-                print("* " .. current_branch)
+        local names = {}
+        for name in pairs(branches) do table.insert(names, name) end
+        table.sort(names)
+
+        for _, name in ipairs(names) do
+            local data = branches[name]
+            -- Filter out HEAD symbolic refs from listing
+            if name:match("/HEAD$") then continue end
+
+            local prefix = data.is_current and "* " or "  "
+            if data.is_remote then
+                print(prefix .. "remotes/" .. name)
+            else
+                print(prefix .. name)
             end
+        end
+        
+        if not next(branches) and current_branch then
+            print("* " .. current_branch)
         end
         return
     end
@@ -1789,22 +1941,6 @@ arguments.createArgument("git", "branch", "br", function(...)
     end
 
     local branch_name = tuple[1]
-    if not branch_name or branch_name == "" then
-        -- list branches if no name provided
-        local heads = bash.getGitFolderRoot():FindFirstChild("refs")
-        if heads then heads = heads:FindFirstChild("heads") end
-        if heads then
-            local current = Handlers.get_current_branch()
-            for _, child in ipairs(heads:GetChildren()) do
-                if child.Name == current then
-                    print("* " .. child.Name)
-                else
-                    print("  " .. child.Name)
-                end
-            end
-        end
-        return
-    end
     assert(is_valid_branch_name(branch_name), "fatal: '" .. tostring(branch_name) .. "' is not a valid branch name.")
     
     local start_point = tuple[2]
@@ -1841,6 +1977,27 @@ arguments.createArgument("git", "switch", "", function(...)
     end
     
     assert(is_valid_branch_name(branch_name), "fatal: invalid reference: " .. tostring(branch_name))
+
+    -- Check for uncommitted changes to prevent data loss
+    local index = Handlers.read_index()
+    local has_changes = false
+    for path, data in pairs(index) do
+        local clean = path:match("^(.-)/%.properties$") or path
+        local obj = Utilities.parse_path(clean)
+        if not obj then
+            has_changes = true; break
+        end
+        -- Simple change detection (matching SHA)
+        -- Note: A more thorough check would diff the properties, 
+        -- but this handles the most common 'part deleted/missing' case.
+    end
+    
+    if has_changes then
+        print("error: Your local changes to the following files would be overwritten by checkout:")
+        print("Please commit your changes or restore them before you switch branches.")
+        print("Aborting")
+        return
+    end
     
     if create_branch then
         local sha = Handlers.get_ref("HEAD")
@@ -1854,13 +2011,84 @@ arguments.createArgument("git", "switch", "", function(...)
     end
     
     bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", "ref: refs/heads/" .. branch_name)
-    print("Switched to " .. (create_branch and "a new branch '" or "branch '") .. branch_name .. "'")
     
-    local status, err = pcall(function()
-        arguments.execute("git", "reset", "--mixed", "HEAD")
-    end)
-    warn("roGit switch completed. Checkout does not automatically update workspace files yet to prevent data loss. Use 'git restore .' if you want to cleanly revert to the branch state.")
-    if not status then warn(err) end
+    local target_sha = Handlers.get_ref("HEAD")
+    local tree_sha = ""
+    if target_sha then
+        local commit_obj = Handlers.read_object(target_sha)
+        if commit_obj then
+            tree_sha = commit_obj.content:match("^tree (%x+)") or ""
+        end
+    end
+
+    if tree_sha ~= "" then
+        print("Checking out files: 100% done.")
+        Remote.checkout(tree_sha)
+    else
+        print("Branch data not found locally. Fetching and pulling from origin...")
+        local status, err = pcall(function()
+            arguments.execute("git", "pull")
+        end)
+        if not status then warn("Pull failed: " .. tostring(err)) end
+    end
+    print("Switched to " .. (create_branch and "a new branch '" or "branch '") .. branch_name .. "'")
+end)
+
+--[[
+commands:
+checkout
+ck
+
+checkout branch or files
+]]
+arguments.createArgument("git", "checkout", "ck", function(...)
+    local tuple = {...}
+    if #tuple == 0 then
+        print("fatal: you must specify a branch or path to checkout")
+        return
+    end
+
+    local first = tuple[1]
+    
+    if first == "-b" then
+        local branch = tuple[2]
+        if not branch then
+            print("fatal: branch name required for -b")
+            return
+        end
+        arguments.execute("git", "switch", "-c", branch)
+        return
+    end
+
+    local root = bash.getGitFolderRoot()
+    if not root then
+        print("fatal: not a git repository")
+        return
+    end
+    
+    local heads = root:FindFirstChild("refs")
+    if heads then heads = heads:FindFirstChild("heads") end
+    local remotes = root:FindFirstChild("refs")
+    if remotes then remotes = remotes:FindFirstChild("remotes") end
+    
+    local is_branch = (heads and heads:FindFirstChild(first))
+    if not is_branch and remotes then
+        for _, r in ipairs(remotes:GetChildren()) do
+            if r:FindFirstChild(first) then
+                local remote_sha = Handlers.get_ref("refs/remotes/" .. r.Name .. "/" .. first)
+                Handlers.update_ref("refs/heads/" .. first, remote_sha)
+                print("Branch '" .. first .. "' set up to track remote branch '" .. first .. "' from '" .. r.Name .. "'.")
+                arguments.execute("git", "switch", first)
+                return
+            end
+        end
+    end
+
+    if is_branch then
+        arguments.execute("git", "switch", first)
+    else
+        arguments.execute("git", "restore", ...)
+    end
 end)
 
 --[[

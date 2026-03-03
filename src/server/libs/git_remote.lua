@@ -538,6 +538,75 @@ function Remote.fetch(remote_name)
     end
 end
 
+function Remote.checkout(treeSha)
+    local objectsByShaFallback = setmetatable({}, {
+        __index = function(_, key)
+            local obj = _Handlers.read_object(key)
+            if not obj then return nil end
+            return {
+                objType = ({commit=1, tree=2, blob=3, tag=4})[obj.type],
+                content = obj.content
+            }
+        end
+    })
+
+    local treeObj = objectsByShaFallback[treeSha]
+    if not treeObj then return false, "Tree " .. treeSha .. " not found" end
+    
+    local content = treeObj.content
+    local pos = 1
+    while pos <= #content do
+        Utilities.roYield()
+        local spacePos = content:find(" ", pos, true)
+        if not spacePos then break end
+        local mode = content:sub(pos, spacePos - 1)
+        local nullPos = content:find("\0", spacePos, true)
+        if not nullPos then break end
+        local name = content:sub(spacePos + 1, nullPos - 1)
+        local rawSha = content:sub(nullPos + 1, nullPos + 20)
+        local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+        pos = nullPos + 21
+
+        if mode == "40000" then
+            local serviceParent = game:FindFirstChild(name)
+            if not serviceParent then
+                pcall(function() serviceParent = game:GetService(name) end)
+            end
+            if serviceParent then
+                local childProps = Remote.peekPropertiesBlob(objectsByShaFallback, sha)
+                if childProps then
+                    Remote.applyProperties(serviceParent, childProps)
+                end
+                Remote.writeTree(objectsByShaFallback, sha, serviceParent, name)
+            end
+        end
+    end
+
+    Remote.resolve_instance_refs()
+
+    local new_index = Remote.buildIndexFromTree(objectsByShaFallback, treeSha)
+    local old_index = _Handlers.read_index()
+    
+    local to_destroy = {}
+    for path, _ in pairs(old_index) do
+        if not new_index[path] then
+            local clean_path = path:match("^(.-)/%.properties$") or path
+            local currObj = Utilities.parse_path(clean_path)
+            if currObj and currObj ~= game and currObj.Parent ~= game then
+                table.insert(to_destroy, currObj)
+            end
+        end
+    end
+    for _, obj in ipairs(to_destroy) do
+        pcall(function() obj:Destroy() end)
+    end
+
+    _Handlers.write_index(new_index)
+    bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
+    
+    return true
+end
+
 function Remote.buildIndexFromTree(objectsBySha, treeSha)
     local index = {}
 

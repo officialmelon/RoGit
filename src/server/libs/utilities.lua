@@ -30,7 +30,15 @@ function Utilities.parse_path(path)
     end
 
     local ROGIT_ID = "_rogit_id"
-    local cleaned = path:gsub("^game[./]", ""):gsub("^Workspace[./]", "Workspace/"):gsub("%.", "/")
+    local cleaned = path:gsub("^game[./]", "")
+    if not cleaned:find("/", 1, true) then
+        -- Dot notation from user input (example: game.Workspace.Part).
+        cleaned = cleaned:gsub("%.", "/")
+    else
+        -- Slash notation can contain literal dots in instance names.
+        cleaned = cleaned:gsub("^Workspace%.", "Workspace/")
+    end
+    cleaned = cleaned:gsub("^Workspace[./]", "Workspace/")
     local segments = string.split(cleaned, "/")
     local currObj = game
 

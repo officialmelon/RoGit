@@ -66,6 +66,71 @@ local function is_valid_branch_name(name)
     return true
 end
 
+local function compute_blob_sha(content)
+    return hashlib.sha1("blob " .. tostring(#content) .. "\0" .. content)
+end
+
+-- Returns tracked files that differ between index and current workspace.
+local function collect_worktree_changes(index)
+    local modified = {}
+    local deleted = {}
+
+    for path, data in pairs(index) do
+        Utilities.roYield()
+        local clean_path = path:match("^(.-)/%.properties$") or path
+        local currObj = Utilities.parse_path(clean_path)
+
+        if not currObj then
+            table.insert(deleted, path)
+        else
+            local serialized = instances.serialize_instance(currObj)
+            local current_sha = compute_blob_sha(serialized)
+            if current_sha ~= data.sha then
+                table.insert(modified, path)
+            end
+        end
+    end
+
+    table.sort(modified)
+    table.sort(deleted)
+    return modified, deleted
+end
+
+-- Returns true when ancestor_sha is reachable from descendant_sha.
+local function is_ancestor_commit(ancestor_sha, descendant_sha)
+    if not ancestor_sha or not descendant_sha then
+        return false
+    end
+    if ancestor_sha == descendant_sha then
+        return true
+    end
+
+    local queue = {descendant_sha}
+    local visited = {}
+    local cursor = 1
+
+    while cursor <= #queue do
+        local sha = queue[cursor]
+        cursor += 1
+
+        if not visited[sha] then
+            visited[sha] = true
+            local obj = Handlers.read_object(sha)
+            if obj and obj.type == "commit" then
+                for parent in obj.content:gmatch("\nparent (%x+)") do
+                    if parent == ancestor_sha then
+                        return true
+                    end
+                    table.insert(queue, parent)
+                end
+            end
+        end
+        Utilities.roYield()
+    end
+
+    return false
+end
+
 
 -- Create command
 arguments.createCommand("git", function(...)
@@ -208,7 +273,7 @@ arguments.createArgument("git", "diff", "", function()
             has_diff = true
         else
             local serialized = instances.serialize_instance(currObj)
-            local current_sha = hashlib.sha1(serialized)
+            local current_sha = compute_blob_sha(serialized)
             if current_sha ~= data.sha then
                 print("\27[33mM\27[0m  " .. path)
                 print("--- a/" .. path)
@@ -629,13 +694,17 @@ arguments.createArgument("git", "pull", "", function (...)
     local remoteSha = refs["refs/heads/" .. branch_name] or refs["HEAD"]
     assert(remoteSha, "fatal: couldn't find remote ref 'refs/heads/" .. branch_name .. "'")
 
-    local localSha = Handlers.get_ref("HEAD")
+    local current_branch = Handlers.get_current_branch()
+    local head_sha = Handlers.get_ref("HEAD")
+    local local_branch_sha = Handlers.get_ref("refs/heads/" .. branch_name)
+    if not local_branch_sha and current_branch == branch_name then
+        local_branch_sha = head_sha
+    end
 
-    
     local index = Handlers.read_index()
     
     -- If we are already up to date, check if our local parts match the tree
-    if localSha == remoteSha then
+    if local_branch_sha == remoteSha then
         local current_tree_matches = true
         for path, _ in pairs(index) do
             local clean = path:match("^(.-)/%.properties$") or path
@@ -650,7 +719,37 @@ arguments.createArgument("git", "pull", "", function (...)
         end
     end
 
-    print("Updating " .. string.sub(localSha or "0000000", 1, 7) .. ".." .. string.sub(remoteSha, 1, 7))
+    if local_branch_sha and remoteSha and local_branch_sha ~= remoteSha then
+        if is_ancestor_commit(remoteSha, local_branch_sha) then
+            print("Already up to date.")
+            return
+        end
+
+        if not is_ancestor_commit(local_branch_sha, remoteSha) then
+            print("fatal: Not possible to fast-forward, aborting.")
+            print("hint: Local and remote branches have diverged.")
+            print("hint: Use 'git merge', or manually move refs if you intend to overwrite history.")
+            return
+        end
+    end
+
+    if current_branch == branch_name and local_branch_sha and local_branch_sha ~= remoteSha then
+        local modified, deleted = collect_worktree_changes(index)
+        if #modified + #deleted > 0 then
+            print("error: Your local changes to the following files would be overwritten by merge:")
+            for _, path in ipairs(modified) do
+                print("\t" .. path)
+            end
+            for _, path in ipairs(deleted) do
+                print("\t" .. path)
+            end
+            print("Please commit your changes or restore them before you merge.")
+            print("Aborting")
+            return
+        end
+    end
+
+    print("Updating " .. string.sub(local_branch_sha or "0000000", 1, 7) .. ".." .. string.sub(remoteSha, 1, 7))
     local fullPack = Remote.fetchPackfile(url, remoteSha)
     local _, objectsBySha = Remote.unpackObjects(fullPack)
     
@@ -662,9 +761,9 @@ arguments.createArgument("git", "pull", "", function (...)
     end
 
     Handlers.update_ref("refs/heads/" .. branch_name, remoteSha)
-    Handlers.update_ref("refs/remotes/origin/" .. branch_name, remoteSha)
+    Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, remoteSha)
     
-    if Handlers.get_current_branch() == branch_name then
+    if current_branch == branch_name then
         local remote_commit_obj = Handlers.read_object(remoteSha)
         local treeSha = remote_commit_obj and remote_commit_obj.content:match("^tree (%x+)")
         if treeSha then
@@ -683,6 +782,8 @@ rm
 Removes file from staged
 ]]
 arguments.createArgument("git", "rm", "", function (...)
+    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+
     local tuple = {...}
     local is_cached = false
     local recursive = false
@@ -759,6 +860,8 @@ commit
 commit staged changes
 ]]
 arguments.createArgument("git", "commit", "", function(...)
+    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+
     local tuple = { ... }
     local message = ""
     local allow_empty = false
@@ -1240,6 +1343,8 @@ remote
 manages remotes of repository
 ]]
 arguments.createArgument("git", "remote", "", function(...)
+    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+
     local tuple = {...}
 
     if #tuple == 0 or tuple[1] == "-v" or tuple[1] == "--verbose" then
@@ -1477,9 +1582,15 @@ arguments.createArgument("git", "push", "", function(...)
     local url = remote_section.url
 
     local refs = Remote.discoverRefs(url, "git-receive-pack")
-    local remoteSha = refs["refs/heads/" .. branch_name] or refs["HEAD"]
+    local remoteSha = refs["refs/heads/" .. branch_name]
 
-    local localSha = Handlers.get_ref("HEAD")
+    local localSha = nil
+    if positional[2] then
+        localSha = Handlers.get_ref("refs/heads/" .. branch_name)
+        assert(localSha, "error: src refspec '" .. branch_name .. "' does not match any")
+    else
+        localSha = Handlers.get_ref("HEAD")
+    end
     assert(localSha, "Nothing to push (no commits)")
 
     if localSha == remoteSha then
@@ -1687,6 +1798,9 @@ arguments.createArgument("git", "status", "st", function()
         print("On branch " .. current_branch)
     end
 
+    local unstaged_modified, unstaged_deleted = collect_worktree_changes(index)
+    local has_unstaged = #unstaged_modified + #unstaged_deleted > 0
+
     local has_staged = #staged_new + #staged_modified + #staged_deleted > 0
     if has_staged then
         print("Changes to be committed:")
@@ -1699,7 +1813,19 @@ arguments.createArgument("git", "status", "st", function()
         for _, path in ipairs(staged_deleted) do
             print("\tdeleted:    " .. path)
         end
-    else
+    end
+
+    if has_unstaged then
+        print("Changes not staged for commit:")
+        for _, path in ipairs(unstaged_modified) do
+            print("\tmodified:   " .. path)
+        end
+        for _, path in ipairs(unstaged_deleted) do
+            print("\tdeleted:    " .. path)
+        end
+    end
+
+    if not has_staged and not has_unstaged then
         print("nothing to commit, working tree clean")
     end
 end)
@@ -1915,9 +2041,9 @@ arguments.createArgument("git", "branch", "br", function(...)
         local old_branch = tuple[2]
         local new_branch = tuple[3]
         if not new_branch then
+            new_branch = old_branch
             local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
             old_branch = current_ref:match("ref: refs/heads/(.+)")
-            new_branch = old_branch
         end
         assert(old_branch and new_branch, "usage: git branch -m [<old>] <new>")
 
@@ -1944,6 +2070,15 @@ arguments.createArgument("git", "branch", "br", function(...)
     assert(is_valid_branch_name(branch_name), "fatal: '" .. tostring(branch_name) .. "' is not a valid branch name.")
     
     local start_point = tuple[2]
+    if not start_point then
+        local head_sha = Handlers.get_ref("HEAD")
+        if not head_sha or head_sha == "" then
+            print("fatal: cannot create branch '" .. branch_name .. "' because there are no commits yet")
+            print("hint: create your first commit, then run 'git branch " .. branch_name .. "'")
+            return
+        end
+    end
+
     local sha = start_point and Handlers.get_ref("refs/heads/" .. start_point) or Handlers.get_ref("HEAD")
     assert(sha and sha ~= "", "fatal: Not a valid object name: '" .. (start_point or "HEAD") .. "'.")
     Handlers.update_ref("refs/heads/" .. branch_name, sha)
@@ -1978,41 +2113,51 @@ arguments.createArgument("git", "switch", "", function(...)
     
     assert(is_valid_branch_name(branch_name), "fatal: invalid reference: " .. tostring(branch_name))
 
-    -- Check for uncommitted changes to prevent data loss
-    local index = Handlers.read_index()
-    local has_changes = false
-    for path, data in pairs(index) do
-        local clean = path:match("^(.-)/%.properties$") or path
-        local obj = Utilities.parse_path(clean)
-        if not obj then
-            has_changes = true; break
-        end
-        -- Simple change detection (matching SHA)
-        -- Note: A more thorough check would diff the properties, 
-        -- but this handles the most common 'part deleted/missing' case.
-    end
-    
-    if has_changes then
-        print("error: Your local changes to the following files would be overwritten by checkout:")
-        print("Please commit your changes or restore them before you switch branches.")
-        print("Aborting")
+    local current_branch = Handlers.get_current_branch()
+    if not create_branch and current_branch == branch_name then
+        print("Already on '" .. branch_name .. "'")
         return
     end
-    
+
+    local current_sha = Handlers.get_ref("HEAD")
+    local target_sha = nil
+
     if create_branch then
-        local sha = Handlers.get_ref("HEAD")
-        assert(sha and sha ~= "", "fatal: you are on a branch with no commits yet")
-        Handlers.update_ref("refs/heads/" .. branch_name, sha)
+        assert(current_sha and current_sha ~= "", "fatal: you are on a branch with no commits yet")
+        target_sha = current_sha
     else
         local heads = bash.getGitFolderRoot():FindFirstChild("refs")
         if heads then heads = heads:FindFirstChild("heads") end
         local branch_exists = heads and heads:FindFirstChild(branch_name)
         assert(branch_exists, "fatal: invalid reference: " .. branch_name)
+        target_sha = Handlers.get_ref("refs/heads/" .. branch_name)
+        assert(target_sha and target_sha ~= "", "fatal: invalid reference: " .. branch_name)
+    end
+
+    if target_sha ~= current_sha then
+        local index = Handlers.read_index()
+        local modified, deleted = collect_worktree_changes(index)
+        if #modified + #deleted > 0 then
+            print("error: Your local changes to the following files would be overwritten by checkout:")
+            for _, path in ipairs(modified) do
+                print("\t" .. path)
+            end
+            for _, path in ipairs(deleted) do
+                print("\t" .. path)
+            end
+            print("Please commit your changes or restore them before you switch branches.")
+            print("Aborting")
+            return
+        end
+    end
+
+    if create_branch then
+        Handlers.update_ref("refs/heads/" .. branch_name, target_sha)
     end
     
     bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", "ref: refs/heads/" .. branch_name)
     
-    local target_sha = Handlers.get_ref("HEAD")
+    target_sha = Handlers.get_ref("HEAD")
     local tree_sha = ""
     if target_sha then
         local commit_obj = Handlers.read_object(target_sha)
@@ -2337,13 +2482,17 @@ arguments.createArgument("git", "reset", "", function(...)
     local new_index = {}
     build_index_from_tree(target_tree_sha, "", new_index)
     
+    local old_index = nil
+    if mode == "--hard" then
+        old_index = Handlers.read_index()
+    end
+
     Handlers.write_index(new_index)
     bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
 
     if mode == "--hard" then
-        local index = Handlers.read_index()
         local to_destroy = {}
-        for path, _ in pairs(index) do
+        for path, _ in pairs(old_index) do
             if not new_index[path] then
                 local clean_path = path:match("^(.-)/%.properties$") or path
                 local currObj = Utilities.parse_path(clean_path)

@@ -449,4 +449,35 @@ function Handlers.get_content_lines(sha)
     end
 end
 
+--[[
+Retrieves a list of all local branches.
+]]
+function Handlers.get_branches()
+    local gitRoot = bash.getGitFolderRoot()
+    if not gitRoot then
+        return {}
+    end
+    
+    local headsDir = bash.getDirectoryOrFile(gitRoot, "refs/heads")
+    if not headsDir then
+        return {}
+    end
+
+    local branches = {}
+
+    local function recursiveDir(dir, prefix)
+        for _, child in ipairs(dir:GetChildren()) do
+            if child:IsA("StringValue") then
+                table.insert(branches, prefix .. child.Name)
+            elseif child:IsA("Folder") then
+                recursiveDir(child, prefix .. child.Name .. "/")
+            end
+        end
+    end
+
+    recursiveDir(headsDir, "")
+
+    return branches
+end
+
 return Handlers

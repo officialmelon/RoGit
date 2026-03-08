@@ -10,7 +10,7 @@ local HttpService = game:GetService("HttpService")
 
 local config = require(script.Parent.config)
 local arguments = require(script.Parent.arguments)
-local git_remote= require(script.Parent.libs.git_remote)
+local git_remote = require(script.Parent.libs.git_remote)
 
 local hashlib = require(script.Parent.libs.hashlib)
 local _zlib = require(script.Parent.libs.zlib)
@@ -131,6 +131,119 @@ local function is_ancestor_commit(ancestor_sha, descendant_sha)
     return false
 end
 
+-- Returns a combined table of all active working tree/index changes for the UI.
+function git.get_changes()
+    local index = Handlers.read_index()
+
+    local last_index = {}
+    local last_index_str = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
+    if last_index_str and last_index_str ~= "" then
+        last_index = HttpService:JSONDecode(last_index_str)
+    end
+
+    local changes = {}
+    local seen_paths = {}
+
+    -- STAGED (Compared to last commit)
+    for path, data in pairs(index) do
+        if not last_index[path] then
+            table.insert(changes, {path = path, status = "A"})
+            seen_paths[path] = true
+        elseif last_index[path].sha ~= data.sha then
+            table.insert(changes, {path = path, status = "M"})
+            seen_paths[path] = true
+        end
+    end
+    for path, _ in pairs(last_index) do
+        if not index[path] then
+            table.insert(changes, {path = path, status = "D"})
+            seen_paths[path] = true
+        end
+    end
+
+    -- UNSTAGED (Compared to index)
+    local unstaged_modified, unstaged_deleted = collect_worktree_changes(index)
+    for _, path in ipairs(unstaged_modified) do
+         if not seen_paths[path] then
+             table.insert(changes, {path = path, status = "M"})
+             seen_paths[path] = true
+         end
+    end
+    for _, path in ipairs(unstaged_deleted) do
+         if not seen_paths[path] then
+             table.insert(changes, {path = path, status = "D"})
+             seen_paths[path] = true
+         end
+    end
+
+    -- UNTRACKED (Files not in index at all)
+    local untracked = {}
+    local function traverse_untracked_for_changes(parent, path_prefix, seen_ids)
+        local child_counts = {}
+        for _, child in ipairs(parent:GetChildren()) do
+            if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
+                child_counts[child.Name] = (child_counts[child.Name] or 0) + 1
+            end
+        end
+
+        local seen_local = {}
+        for _, child in ipairs(parent:GetChildren()) do
+            Utilities.roYield()
+            if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
+                local rogit_id = child:GetAttribute(ROGIT_ID)
+                local collisionBase = child.Name
+                local virtualName = child.Name
+                
+                if child_counts[child.Name] > 1 then
+                    local id_to_use = rogit_id
+                    if not id_to_use or id_to_use == "" or seen_ids[id_to_use] then
+                        id_to_use = HttpService:GenerateGUID(false)
+                        child:SetAttribute(ROGIT_ID, id_to_use)
+                    end
+                    seen_ids[id_to_use] = true
+                    
+                    seen_local[child.Name] = (seen_local[child.Name] or 0) + 1
+                    virtualName = collisionBase .. " [" .. tostring(seen_local[child.Name]) .. "]"
+                end
+                
+                local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
+                
+                local hasValidChildren = false
+                for _, sub in ipairs(child:GetChildren()) do
+                    if sub ~= bash.getGitFolderRoot() and not Handlers.is_ignored(sub:GetFullName()) and not sub:IsDescendantOf(bash.getGitFolderRoot()) then
+                        hasValidChildren = true
+                        break
+                    end
+                end
+                
+                local index_path = hasValidChildren and (my_path .. "/.properties") or my_path
+                if not index[index_path] and not index[my_path] then
+                    untracked[my_path] = true
+                end
+                
+                traverse_untracked_for_changes(child, my_path, seen_ids)
+            end
+        end
+    end
+
+    local global_seen = {}
+    for _, child in ipairs(bash.trackingRoot) do
+        local child_path = child.Name
+        traverse_untracked_for_changes(child, child_path, global_seen)
+    end
+    
+    for path, _ in pairs(untracked) do
+        if not seen_paths[path] then
+            table.insert(changes, {path = path, status = "U"})
+        end
+    end
+
+    table.sort(changes, function(a, b)
+        return a.path < b.path
+    end)
+    return changes
+end
+
 
 -- Create command
 arguments.createCommand("git", function(...)
@@ -165,15 +278,14 @@ arguments.createArgument("git", "help", "h", function (...)
             push = "git-push - Update remote refs along with associated objects.\n\nUsage: git push [<options>] [<repository> [<refspec>...]]\n\n    -u, --set-upstream    set upstream for git pull/status",
             pull = "git-pull - Fetch from and integrate with another repository or a local branch.\n\nUsage: git pull [<options>] [<repository> [<refspec>...]]",
             status = "git-status - Show the working tree status.\n\nUsage: git status",
-            branch = "git-branch - List, create, or delete branches.\n\nUsage: git branch [<branchname>]\n       git branch -d <branchname>\n       git branch -m <oldbranch> <newbranch>",
-            switch = "git-switch - Switch branches.\n\nUsage: git switch [<options>] <branch>\n\n    -c, --create <branch>  create and switch to a new branch",
+            -- branch = "git-branch - List, create, or delete branches.\n\nUsage: git branch [<branchname>]\n       git branch -d <branchname>\n       git branch -m <oldbranch> <newbranch>",
+            -- switch = "git-switch - Switch branches.\n\nUsage: git switch [<options>] <branch>\n\n    -c, --create <branch>  create and switch to a new branch",
             clone = "git-clone - Clone a repository into a new directory.\n\nUsage: git clone <repository>",
             fetch = "git-fetch - Download objects and refs from another repository.\n\nUsage: git fetch [<options>] [<repository>]",
             reset = "git-reset - Reset current HEAD to the specified state.\n\nUsage: git reset [--soft | --mixed | --hard] [<commit>]\n\n    --hard       reset HEAD, index and working tree",
             rm = "git-rm - Remove files from the working tree and from the index.\n\nUsage: git rm [-r] <file>...",
             diff = "git-diff - Show changes between commits, commit and working tree, etc.\n\nUsage: git diff",
             merge = "git-merge - Join two or more development histories together.\n\nUsage: git merge <commit-or-branch>",
-            rebase = "git-rebase - Reapply commits on top of another base tip.\n\nUsage: git rebase\n\nfatal: 'rebase' requires interactive graph rewrites which are complex in Luau. Please use 'git merge' instead.",
             mv = "git-mv - Move or rename a file, a directory, or a symlink.\n\nUsage: git mv <source> <destination>",
             restore = "git-restore - Restore working tree files.\n\nUsage: git restore <pathspec>",
             remote = "git-remote - Manage set of tracked repositories.\n\nUsage: git remote [-v | --verbose]\n       git remote add [-f] <name> <url>\n       git remote remove <name>\n       git remote set-url <name> <newurl>",
@@ -1953,6 +2065,7 @@ manage your branches
 ]]
 arguments.createArgument("git", "branch", "br", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    assert(nil, "this command has been disabled as it has yet not been complete.")
 
     local tuple = {...}
 
@@ -2093,6 +2206,9 @@ switch branches in repository
 ]]
 arguments.createArgument("git", "switch", "", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+
+    assert(nil, "this command has been disabled as it has yet not been complete.")
+
     local tuple = {...}
     
     local create_branch = false
@@ -2187,6 +2303,9 @@ ck
 checkout branch or files
 ]]
 arguments.createArgument("git", "checkout", "ck", function(...)
+    
+    assert(nil, "this command has been disabled as it has yet not been complete.")
+
     local tuple = {...}
     if #tuple == 0 then
         print("fatal: you must specify a branch or path to checkout")

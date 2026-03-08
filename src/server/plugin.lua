@@ -16,7 +16,6 @@ local bash = require(script.Parent.bash)
 local StudioService = game:GetService("StudioService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local ServerScriptService = game:GetService("ServerScriptService")
 local git_handlers = require(script.Parent.libs.git_handlers)
 
 local user = "User"
@@ -154,46 +153,51 @@ function initDesktop(gui)
     --// show modal message!
     local function showModalMessage(parentModal, title, message)
         local ModalInner = parentModal:FindFirstChild("Modal")
-        local ProblemFrame = ModalInner:FindFirstChild("Problem")
+        ModalInner.Problem.Text = message
+        ModalInner.Problem.Visible = true
+        ModalInner.PromptInputBg.Visible = false
         
         --// clear out old text if any.
         for _, child in ipairs(ModalInner:GetChildren()) do
             if child.Name == "Title" then child:Destroy() end
         end
 
-        for _, child in ipairs(ProblemFrame:GetChildren()) do
-            if child:IsA("TextLabel") then child:Destroy() end
-        end
-
-        local TitleLabel = Instance.new("TextLabel")
-        TitleLabel.Name = "Title"
-        TitleLabel.Parent = ModalInner
-        TitleLabel.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-        TitleLabel.BackgroundTransparency = 1.000
-        TitleLabel.LayoutOrder = 1
-        TitleLabel.Size = UDim2.new(1, 0, 0, 20)
-        TitleLabel.Font = Enum.Font.Ubuntu
-        TitleLabel.Text = "<b>" .. title .. "</b>"
-        TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-        TitleLabel.TextSize = 14.000
-        TitleLabel.ZIndex = 122
-        TitleLabel.RichText = true
-
-        local MessageLabel = Instance.new("TextLabel")
-        MessageLabel.Parent = ProblemFrame
-        MessageLabel.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-        MessageLabel.BackgroundTransparency = 1.000
-        MessageLabel.Size = UDim2.new(1, 0, 0, 0)
-        MessageLabel.AutomaticSize = Enum.AutomaticSize.Y
-        MessageLabel.Font = Enum.Font.Ubuntu
-        MessageLabel.Text = message
-        MessageLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-        MessageLabel.TextSize = 13.000
-        MessageLabel.TextWrapped = true
-        MessageLabel.TextYAlignment = Enum.TextYAlignment.Center
-        MessageLabel.ZIndex = 122
+        local Title = Instance.new("TextLabel")
+        Title.Name = "Title"
+        Title.Parent = ModalInner
+        Title.BackgroundTransparency = 1.000
+        Title.Size = UDim2.new(1, 0, 0, 32)
+        Title.Font = Enum.Font.Ubuntu
+        Title.Text = "<b>" .. title .. "</b>"
+        Title.RichText = true
+        Title.TextColor3 = Color3.fromRGB(230, 237, 243)
+        Title.TextSize = 18.000
+        Title.LayoutOrder = 0
 
         parentModal.Visible = true
+    end
+
+    local function showModalInput(parentModal, title, message, isPassword)
+        showModalMessage(parentModal, title, message)
+        local ModalInner = parentModal:FindFirstChild("Modal")
+        ModalInner.PromptInputBg.Visible = true
+        ModalInner.PromptInputBg.PromptInput.Text = ""
+        ModalInner.PromptInputBg.PromptInput.PlaceholderText = isPassword and "Password/Token..." or "Username..."
+        ModalInner.PromptInputBg.PromptInput:CaptureFocus()
+
+        local bindable = Instance.new("BindableEvent")
+        local result = ""
+        local connection
+        connection = ModalInner.Options.OkayBtn.Activated:Connect(function()
+            result = ModalInner.PromptInputBg.PromptInput.Text
+            if connection then connection:Disconnect() end
+            parentModal.Visible = false
+            bindable:Fire()
+        end)
+
+        bindable.Event:Wait()
+        bindable:Destroy()
+        return result
     end
 
     local function populateBranchList()
@@ -274,9 +278,15 @@ function initDesktop(gui)
     end
 
     --// dismiss generic modal (Global)
-    gui.Modal:FindFirstChild("Modal").Options.OkayBtn.Activated:Connect(function()
-        gui.Modal.Visible = false
-    end)
+        --// Global Modal Okay button
+        local modalInner = gui.Modal:FindFirstChild("Modal")
+        if modalInner then
+            modalInner.Options.OkayBtn.Activated:Connect(function()
+                if not modalInner.PromptInputBg.Visible then
+                    gui.Modal.Visible = false
+                end
+            end)
+        end
 
     local function onReady()
         gui.InitRepoView.Visible = false
@@ -301,6 +311,8 @@ function initDesktop(gui)
         end)
 
         addBranchBtn.Activated:Connect(function()
+            local currBranch = git_handlers.get_current_branch() or "main"
+            gui.CreateBranchModal.ModalInner.Body.InfoLbl.Text = "Your new branch will be based on your currently checked out branch (<font color='#e6edf3'>" .. currBranch .. "</font>)."
             gui.CreateBranchModal.ModalInner.Body.NameBg.NameInput.Text = ""
             gui.CreateBranchModal.Visible = true
         end)
@@ -364,7 +376,7 @@ function initDesktop(gui)
             end
 
             -- Only load name, NEVER automatically load a raw token into the UI (safety precaution)!
-            local currentUser = Auth.ACTIVE_PLUGIN and Auth.ACTIVE_PLUGIN:GetSetting("user.name") or ""
+            local currentUser = (_G.ACTIVE_PLUGIN or Auth.ACTIVE_PLUGIN) and (_G.ACTIVE_PLUGIN or Auth.ACTIVE_PLUGIN):GetSetting("user_name") or ""
             gui.SettingsView.ModalInner.Body.UsernameInputBg.UsernameInput.Text = currentUser
 
             gui.SettingsView.Visible = not gui.SettingsView.Visible
@@ -383,9 +395,9 @@ function initDesktop(gui)
             local userSet = gui.SettingsView.ModalInner.Body.UsernameInputBg.UsernameInput.Text
             local tokenSet = gui.SettingsView.ModalInner.Body.TokenInputBg.TokenInput.Text
 
-            if Auth.ACTIVE_PLUGIN then
-                if userSet ~= "" then Auth.ACTIVE_PLUGIN:SetSetting("user.name", userSet) end
-                if tokenSet ~= "" then Auth.ACTIVE_PLUGIN:SetSetting("user.token", tokenSet) end
+            if (_G.ACTIVE_PLUGIN or Auth.ACTIVE_PLUGIN) then
+                if userSet ~= "" then (_G.ACTIVE_PLUGIN or Auth.ACTIVE_PLUGIN):SetSetting("user_name", userSet) end
+                if tokenSet ~= "" then (_G.ACTIVE_PLUGIN or Auth.ACTIVE_PLUGIN):SetSetting("user_token", tokenSet) end
             end
 
             gui.SettingsView.ModalInner.Body.TokenInputBg.TokenInput.Text = ""
@@ -434,6 +446,9 @@ function initDesktop(gui)
         --// pull
         gui.Body.BottomArea.ActionsRow.PullBtn.Activated:Connect(function()
             local succ, err = pcall(function()
+                git.replacePromptCallback(function(prompt, pass)
+                    return showModalInput(gui.Modal, "Authentication Required", prompt, pass)
+                end)
                 arguments.execute("git", "pull")
             end)
 
@@ -448,6 +463,9 @@ function initDesktop(gui)
         --// push
         gui.Body.BottomArea.ActionsRow.PushBtn.Activated:Connect(function()
             local succ, err = pcall(function()
+                git.replacePromptCallback(function(prompt, pass)
+                    return showModalInput(gui.Modal, "Authentication Required", prompt, pass)
+                end)
                 arguments.execute("git", "push")
             end)
 
@@ -653,7 +671,6 @@ Handles the callback of the interactive commands.
 ]]
 function handleCommandCallback(TextBox:TextBox, parent)
     local UserInputService = game:GetService("UserInputService")
-local git_handlers = require(ServerScriptService.Server.libs.git_handlers)
     local unsubmittedText = ""
     local localHistoryIndex = #commandHistory + 1
     
@@ -844,7 +861,6 @@ function plugins.createBashTerminal(plugin)
     remote.print = printOutput
     remote.warn = warnOutput
     remote.error = errOutput
-    Auth.print = printOutput
 
 
     local activeEntryBox = nil
@@ -959,7 +975,7 @@ end
 self-explanatory, initialzes the plugin itself.
 ]]
 function plugins.initializePlugin(plugin)
-    git.setPlugin(plugin)
+    git.setPlugin(plugin); _G.ACTIVE_PLUGIN = plugin
     local toolbar = plugin:CreateToolbar("roGit")
 
     local buttons = {

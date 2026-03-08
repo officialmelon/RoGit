@@ -337,14 +337,49 @@ function gui.create(Parent)
     UIPadding_modal2.PaddingLeft = UDim.new(0, 16)
     UIPadding_modal2.PaddingRight = UDim.new(0, 16)
 
-    local Problem = Instance.new("Frame")
+    local Problem = Instance.new("TextLabel")
     Problem.Name = "Problem"
     Problem.Parent = Modal_2
     Problem.BackgroundTransparency = 1.000
     Problem.Size = UDim2.new(1, 0, 0, 0)
     Problem.AutomaticSize = Enum.AutomaticSize.Y
-    Problem.LayoutOrder = 2
+    Problem.LayoutOrder = 1
+    Problem.Font = Enum.Font.Ubuntu
+    Problem.TextSize = 14
+    Problem.TextColor3 = Color3.fromRGB(230, 237, 243)
+    Problem.TextWrapped = true
+    Problem.RichText = true
     Problem.ZIndex = 122
+
+    local PromptInputBg = Instance.new("Frame")
+    PromptInputBg.Name = "PromptInputBg"
+    PromptInputBg.Parent = Modal_2
+    PromptInputBg.BackgroundColor3 = Color3.fromRGB(1, 4, 9)
+    PromptInputBg.BorderColor3 = Color3.fromRGB(48, 54, 61)
+    PromptInputBg.BorderSizePixel = 1
+    PromptInputBg.Size = UDim2.new(1, 0, 0, 32)
+    PromptInputBg.LayoutOrder = 2
+    PromptInputBg.ZIndex = 122
+    PromptInputBg.Visible = false
+
+    local UICorner_promo = Instance.new("UICorner")
+    UICorner_promo.CornerRadius = UDim.new(0, 6)
+    UICorner_promo.Parent = PromptInputBg
+
+    local PromptInput = Instance.new("TextBox")
+    PromptInput.Name = "PromptInput"
+    PromptInput.Parent = PromptInputBg
+    PromptInput.BackgroundTransparency = 1.000
+    PromptInput.Position = UDim2.new(0, 10, 0, 0)
+    PromptInput.Size = UDim2.new(1, -20, 1, 0)
+    PromptInput.ZIndex = 123
+    PromptInput.Font = Enum.Font.Ubuntu
+    PromptInput.Text = ""
+    PromptInput.PlaceholderText = ""
+    PromptInput.PlaceholderColor3 = Color3.fromRGB(139, 148, 158)
+    PromptInput.TextColor3 = Color3.fromRGB(230, 237, 243)
+    PromptInput.TextSize = 13.000
+    PromptInput.TextXAlignment = Enum.TextXAlignment.Left
 
     local Options = Instance.new("Frame")
     Options.Name = "Options"

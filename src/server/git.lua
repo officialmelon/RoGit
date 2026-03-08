@@ -469,7 +469,7 @@ rebase
 stubbed.
 ]]
 arguments.createArgument("git", "rebase", "", function()
-    print("fatal: 'rebase' requires interactive graph rewrites which are complex in Luau. Please use 'git merge' instead.")
+    error("fatal: 'rebase' requires interactive graph rewrites which are complex in Luau. Please use 'git merge' instead.")
 end)
 
 arguments.createArgument("git", "merge", "", function(...)
@@ -477,13 +477,13 @@ arguments.createArgument("git", "merge", "", function(...)
     local branch = tuple[1]
 
     if not branch then
-        print("fatal: No commit specified and merge.defaultToUpstream not set.")
+        error("fatal: No commit specified and merge.defaultToUpstream not set.")
         return
     end
 
     local root = bash.getGitFolderRoot()
     if not root then
-        print("fatal: not a git repository (or any of the parent directories): .git")
+        error("fatal: not a git repository (or any of the parent directories): .git")
         return
     end
     
@@ -515,7 +515,7 @@ arguments.createArgument("git", "mv", "", function(...)
     local destination = tuple[2]
 
     if not source or not destination then
-        print("fatal: bad source, source=")
+        error("fatal: bad source, source=")
         return
     end
 
@@ -551,7 +551,7 @@ restores removed file
 arguments.createArgument("git", "restore", "", function(...)
     local tuple = {...}
     if #tuple == 0 then
-        print("fatal: you must specify path(s) to restore")
+        error("fatal: you must specify path(s) to restore")
         return
     end
 
@@ -763,7 +763,7 @@ arguments.createArgument("git", "add", "a", function (...)
         local currObj, _, segments = Utilities.parse_path(target)
 
         if not currObj then
-            print("fatal: pathspec '" .. target .. "' did not match any files")
+            error("fatal: pathspec '" .. target .. "' did not match any files")
             return
         end
 
@@ -838,7 +838,7 @@ arguments.createArgument("git", "pull", "", function (...)
         end
 
         if not is_ancestor_commit(local_branch_sha, remoteSha) then
-            print("fatal: Not possible to fast-forward, aborting.")
+            error("fatal: Not possible to fast-forward, aborting.")
             print("hint: Local and remote branches have diverged.")
             print("hint: Use 'git merge', or manually move refs if you intend to overwrite history.")
             return
@@ -915,7 +915,7 @@ arguments.createArgument("git", "rm", "", function (...)
     end
 
     if #paths == 0 then
-        print("fatal: No pathspec was given. Which files should I remove?")
+        error("fatal: No pathspec was given. Which files should I remove?")
         return
     end
 
@@ -943,7 +943,7 @@ arguments.createArgument("git", "rm", "", function (...)
                 index[path_to_remove .. "/.properties"] = nil
                 table.insert(removed, path_to_remove .. "/.properties")
             else
-                warn("fatal: pathspec '" .. path_to_remove .. "' did not match any files")
+                error("fatal: pathspec '" .. path_to_remove .. "' did not match any files")
             end
         end
     end
@@ -1090,8 +1090,8 @@ arguments.createArgument("git", "commit", "", function(...)
     end
 
     local timestamp = os.time()
-    local user_name = Auth.getConfigValue("user.name") or "roGit"
-    local user_email = Auth.getConfigValue("user.email") or "ro-git@example.com"
+    local user_name = Auth.getConfigValue("user_name") or Auth.getConfigValue("user.name") or "roGit"
+    local user_email = Auth.getConfigValue("user_email") or Auth.getConfigValue("user.email") or "ro-git@example.com"
     commit_content = commit_content .. string.format("author %s <%s> %d +0000\n", user_name, user_email, timestamp)
     commit_content = commit_content .. string.format("committer %s <%s> %d +0000\n", user_name, user_email, timestamp)
     commit_content = commit_content .. "\n" .. message
@@ -1241,7 +1241,7 @@ arguments.createArgument("git", "clone", "", function(...)
     end
 
     if not url or url == "" then
-        print("fatal: You must specify a repository to clone.")
+        error("fatal: You must specify a repository to clone.")
         print("\nusage: git clone [<options>] [--] <repo> [<dir>]\n\n    -v, --verbose         be more verbose\n    -q, --quiet           be more quiet\n    --progress            force progress reporting\n    -n, --no-checkout     don't create a checkout")
         return
     end
@@ -1396,7 +1396,7 @@ arguments.createArgument("git", "clone", "", function(...)
     local is_rogit_project = find_rogit_project(treeSha)
     
     if not is_rogit_project then
-        print("fatal: repository does not appear to be a rogit project (missing .rogit_project file).")
+        error("fatal: repository does not appear to be a rogit project (missing .rogit_project file).")
         local gitRoot_to_destroy = bash.getGitFolderRoot()
         if gitRoot_to_destroy then gitRoot_to_destroy:Destroy() end
         return
@@ -1970,7 +1970,7 @@ arguments.createArgument("git", "log", "", function(...)
 
     local sha = Handlers.get_ref("HEAD")
     if not sha or sha == "" then
-        print("fatal: your current branch 'master' does not have any commits yet")
+        error("fatal: your current branch 'master' does not have any commits yet")
         return
     end
 
@@ -2186,7 +2186,7 @@ arguments.createArgument("git", "branch", "br", function(...)
     if not start_point then
         local head_sha = Handlers.get_ref("HEAD")
         if not head_sha or head_sha == "" then
-            print("fatal: cannot create branch '" .. branch_name .. "' because there are no commits yet")
+            error("fatal: cannot create branch '" .. branch_name .. "' because there are no commits yet")
             print("hint: create your first commit, then run 'git branch " .. branch_name .. "'")
             return
         end
@@ -2222,7 +2222,7 @@ arguments.createArgument("git", "switch", "", function(...)
     end
     
     if not branch_name or branch_name == "" then
-        print("fatal: branch name required")
+        error("fatal: branch name required")
         print("usage: git switch [-c | --create] <branch>")
         return
     end
@@ -2308,7 +2308,7 @@ arguments.createArgument("git", "checkout", "ck", function(...)
 
     local tuple = {...}
     if #tuple == 0 then
-        print("fatal: you must specify a branch or path to checkout")
+        error("fatal: you must specify a branch or path to checkout")
         return
     end
 
@@ -2317,7 +2317,7 @@ arguments.createArgument("git", "checkout", "ck", function(...)
     if first == "-b" then
         local branch = tuple[2]
         if not branch then
-            print("fatal: branch name required for -b")
+            error("fatal: branch name required for -b")
             return
         end
         arguments.execute("git", "switch", "-c", branch)
@@ -2326,7 +2326,7 @@ arguments.createArgument("git", "checkout", "ck", function(...)
 
     local root = bash.getGitFolderRoot()
     if not root then
-        print("fatal: not a git repository")
+        error("fatal: not a git repository")
         return
     end
     
@@ -2471,7 +2471,7 @@ arguments.createArgument("git", "reset", "", function(...)
                 end
             end
             if not found then
-                warn("fatal: pathspec '" .. target_path .. "' did not match any files")
+                error("fatal: pathspec '" .. target_path .. "' did not match any files")
             end
         end
         
@@ -2694,20 +2694,25 @@ arguments.createArgument("git", "config", "", function(...)
         ["user.name"] = true,
         ["user.email"] = true,
         ["user.token"] = true,
-        ["user.password"] = true
+        ["user.password"] = true,
+        ["user_name"] = true,
+        ["user_email"] = true,
+        ["user_token"] = true,
+        ["user_password"] = true
     }
 
     if value then
         if (is_global or sensitive_keys[key]) and ACTIVE_PLUGIN then
-            ACTIVE_PLUGIN:SetSetting(key, value)
-            print("Set '" .. key .. "' in plugin settings")
+            local sanitized_key = key:gsub("%.", "_")
+            ACTIVE_PLUGIN:SetSetting(sanitized_key, value)
+            print("Set '" .. sanitized_key .. "' in plugin settings")
             return
         end
     end
 
     local root = bash.getGitFolderRoot()
     if not root then
-        print("fatal: not in a git directory")
+        error("fatal: not in a git directory")
         return
     end
     

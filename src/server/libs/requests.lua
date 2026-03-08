@@ -52,10 +52,11 @@ function Requests.url_request_with_retry(req_options)
             you decided to be a bitch today. SAVE THE FUCKING CREDENTIALS
             pls uwu
             ]]
-            if Auth.ACTIVE_PLUGIN then
+            local plugin_ref = Auth.ACTIVE_PLUGIN or _G.ACTIVE_PLUGIN
+            if plugin_ref then
                 pcall(function()
-                    Auth.ACTIVE_PLUGIN:SetSetting("user.name", username)
-                    Auth.ACTIVE_PLUGIN:SetSetting("user.password", password)
+                    plugin_ref:SetSetting("user_name", username)
+                    plugin_ref:SetSetting("user_token", password)
                 end)
             end
             

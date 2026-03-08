@@ -7,7 +7,6 @@ local ini_parser = require(script.Parent.ini_parser)
 --// Creds & temp variables
 Auth.memory_credentials = {}
 Auth.ACTIVE_PLUGIN = nil
-Auth.print = nil
 
 --[[
 Returns the authorization header used in git requests.
@@ -20,12 +19,9 @@ function Auth.getAuthHeader(url)
         return "Basic " .. Utilities.b64Encode(creds.username .. ":" .. creds.password)
     end
     
-    local token = Auth.getConfigValue("user.token") or Auth.getConfigValue("user.password")
+    local token = Auth.getConfigValue("user_token") or Auth.getConfigValue("user_password")
     if token then
-        local userName = Auth.getConfigValue("user.name") or "x"
-        if Auth.print then
-            Auth.print("Authenticating as '" .. userName .. "' (using global config)")
-        end
+        local userName = Auth.getConfigValue("user_name") or "x"
         return "Basic " .. Utilities.b64Encode(userName .. ":" .. token)
     end
     return nil
@@ -47,7 +43,7 @@ function Auth.getConfigValue(key)
     
     -- Try local config first
     local key_parts = string.split(key, ".")
-    if loaded_conf[key_parts[1]] then
+    if #key_parts >= 2 and loaded_conf[key_parts[1]] then
         local val = loaded_conf[key_parts[1]][key_parts[2]]
         if val then
             if type(val) == "string" then
@@ -58,12 +54,18 @@ function Auth.getConfigValue(key)
     end
 
     -- If not found (or for sensitive/global keys), try plugin settings
-    if Auth.ACTIVE_PLUGIN then
+    local plugin_ref = Auth.ACTIVE_PLUGIN or _G.ACTIVE_PLUGIN
+    if plugin_ref then
         local val
         pcall(function()
-            val = Auth.ACTIVE_PLUGIN:GetSetting(key)
+            val = plugin_ref:GetSetting(key)
         end)
-        if val then return val end
+        if val then
+            if type(val) == "string" then
+                val = val:gsub('^"(.*)"$', '%1'):gsub("^'(.*)'$", "%1")
+            end
+            return val
+        end
     end
 
     return nil

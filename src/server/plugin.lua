@@ -38,6 +38,9 @@ Gui/"Desktop" mode related stuff
 function initDesktop(gui)
     gui = gui.PluginGui
 
+    local populateBranchList
+    local populateChangesList
+
     --// Runs on start (or when initalized)
 
     --// Create change item (what we are tracking)
@@ -118,7 +121,7 @@ function initDesktop(gui)
         CheckIcon.Size = UDim2.new(0, 12, 0, 12)
         CheckIcon.ZIndex = 63
         CheckIcon.Font = Enum.Font.Ubuntu
-        CheckIcon.Text = isCurrentBranch and "✓" or ""
+        CheckIcon.Text = isCurrentBranch and "*" or ""
         CheckIcon.TextColor3 = Color3.fromRGB(230, 237, 243)
         CheckIcon.TextSize = 12.000
 
@@ -200,7 +203,7 @@ function initDesktop(gui)
         return result
     end
 
-    local function populateBranchList()
+    function populateBranchList()
         local branchContainer = gui.BranchDropdown.BranchList
 
         for _, child in ipairs(branchContainer:GetChildren()) do
@@ -224,6 +227,10 @@ function initDesktop(gui)
                 --// modal
                 if not succ then
                     showModalMessage(gui.Modal, "Couldn't checkout branch!", err:match(":%d+: (.+)$") or err)
+                else
+                    populateBranchList()
+                    populateChangesList()
+                    gui.BranchDropdown.Visible = false
                 end
             end)
         end
@@ -232,7 +239,7 @@ function initDesktop(gui)
         gui.Body.BottomArea.ActionsRow.CommitBtn.Text = "<b>Commit to " .. (currBranch or "main") .. "</b>"
     end
 
-    local function populateChangesList()
+    function populateChangesList()
         local list = gui.Body.ChangesArea.ChangesBg.List
         local label = gui.Body.ChangesArea.ChangesLabel
         local commitBtn = gui.Body.BottomArea.ActionsRow.CommitBtn
@@ -335,8 +342,9 @@ function initDesktop(gui)
             --// cant create!
             if not succ then
                 showModalMessage(gui.Modal, "Couldn't create branch!", err:match(":%d+: (.+)$") or err)
-                gui.CreateBranchModal.Visible = false
             end
+
+            gui.CreateBranchModal.Visible = false
             populateBranchList()
         end)
 

@@ -2065,7 +2065,6 @@ manage your branches
 ]]
 arguments.createArgument("git", "branch", "br", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
-    assert(nil, "this command has been disabled as it has yet not been complete.")
 
     local tuple = {...}
 
@@ -2207,8 +2206,6 @@ switch branches in repository
 arguments.createArgument("git", "switch", "", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
 
-    assert(nil, "this command has been disabled as it has yet not been complete.")
-
     local tuple = {...}
     
     local create_branch = false
@@ -2304,8 +2301,6 @@ checkout branch or files
 ]]
 arguments.createArgument("git", "checkout", "ck", function(...)
     
-    assert(nil, "this command has been disabled as it has yet not been complete.")
-
     local tuple = {...}
     if #tuple == 0 then
         error("fatal: you must specify a branch or path to checkout")

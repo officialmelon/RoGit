@@ -28,6 +28,14 @@
 
 ---
 
+## Features to implement
+
+- [ ] Implement MInstance instead of custom solution! (better support)
+
+- [ ] Make branching much better
+
+- [x] Improve speeds
+
 ## Features & Supported Commands
 
 `roGit` currently supports a subset of standard Git commands, adapted for the Roblox `Instance` tree:
@@ -54,7 +62,7 @@
 
 ---
 ## Example
-> WARNING: You may experience lag for a short period (1~ minute), this is where the instances are deserialising. (SPEEDS WILL IMPROVE IN THE FUTURE, SLOW IMPLEMENTATIONS.)
+> WARNING: You may experience lag for a short period (15-20~ seconds), this is where the instances are cloning.
 - Lets start by cloning in a repository (this is the original crossroads map!):
 ```
 git clone https://github.com/officialmelon/crossroads-rogit.git

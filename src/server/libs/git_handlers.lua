@@ -37,6 +37,9 @@ function Handlers.write_object(typeName, content)
     return sha
 end
 
+--[[
+Writes an object to the .git/objects folder with a specified SHA.
+]]
 function Handlers.write_object_with_sha(typeName, content, sha)
     local prefix = string.sub(sha, 1, 2)
     local dir = objects_dir_cache[prefix]
@@ -61,6 +64,9 @@ function Handlers.write_object_with_sha(typeName, content, sha)
     return sha
 end
 
+--[[
+self explanatory: Clears the object cache.
+]]
 function Handlers.clear_objects_cache()
     table.clear(objects_dir_cache)
 end

@@ -29,7 +29,9 @@ Kind-of emulates "bash"?
 Needs a real filesystem setup/filesystem navigation commands.
 ]]
 
--- Returns where we hold .git
+--[[
+Returns our git root folder
+]]
 function Bash.getGitFolderRoot()
     if conf.gitRoot:FindFirstChild(".git") then
         return conf.gitRoot:FindFirstChild(".git")
@@ -37,11 +39,16 @@ function Bash.getGitFolderRoot()
     return nil
 end
 
+--[[
+Does file exist?
+]]
 function Bash.exists(parent, name)
     return parent:FindFirstChild(name) ~= nil
 end
 
--- Creates .git folder (e.g. for init)
+--[[
+Creates the git root folder in ServerStorage (hardcoded!)
+]]
 function Bash.createGitFolderRoot()
     local root = Instance.new("Folder")
     root.Parent = ServerStorage
@@ -49,25 +56,27 @@ function Bash.createGitFolderRoot()
     return root
 end
 
--- Create files
+--[[
+Create a "file" using some stringvalues (or folder + stringvalues if too large!)
+tbh this is probably a hack sort of thing for now>
+]]
 function Bash.createFile(parent, name, content)
-    -- Quick checks
     assert(typeof(parent) == "Instance", "Parent doesnt exist, or not instance!")
     assert(name, "File name is nil!")
     assert(content, "Content is nil!")
 
     if parent:FindFirstChild(name) then 
-        -- warn("Bash: File '" .. name .. "' already exists in '" .. parent:GetFullName() .. "'")
         return parent:FindFirstChild(name)
     end
 
+    --// Small content
     if #content <= 199000 then
-        -- create "File" (stringvalue)
         local str = Instance.new("StringValue")
         str.Parent = parent
         str.Value = content
         str.Name = name
         return str
+    --// Big content, split it up!
     else
         local folder = Instance.new("Folder")
         folder.Name = name
@@ -84,8 +93,9 @@ function Bash.createFile(parent, name, content)
     end
 end
 
--- Get folders
-
+--[[
+Gets the directory/file
+]]
 function Bash.getDirectoryOrFile(parent, name)
     -- Quick checks
     assert(typeof(parent) == "Instance", "Parent doesnt exist, or not instance!")
@@ -101,8 +111,11 @@ function Bash.getDirectoryOrFile(parent, name)
     return parent
 end
 
+--[[
+Gets the contents of a file.
+if file is split up into folders? we piece chunks together and return that.
+]]
 function Bash.getFileContents(parent, name)
-    -- Quick checks
     assert(typeof(parent) == "Instance", "Parent doesnt exist, or not instance!")
     assert(name, "File name is nil!")
     
@@ -130,8 +143,10 @@ function Bash.getFileContents(parent, name)
     return nil
 end
 
+--[[
+Modifies the contents of a file (or split file)
+]]
 function Bash.modifyFileContents(parent, name, content)
-    -- Quick checks
     assert(typeof(parent) == "Instance", "Parent doesnt exist, or not instance!")
     assert(name, "File name is nil!")
     assert(content, "Content is nil!")
@@ -169,17 +184,18 @@ function Bash.modifyFileContents(parent, name, content)
     return nil
 end
 
--- Create files
+--[[
+Creates a folder at specific parent/name
+]]
 function Bash.createFolder(parent, name)
-    -- Quick checks
     assert(typeof(parent) == "Instance", "Parent doesnt exist, or not instance!")
 
-    -- Recursive folder creation (hierarchy)
+    --// Recursive folder creation (hierarchy)
     for _, rec in string.split(name, "/") do
         if parent:FindFirstChild(rec) then
             parent = parent:FindFirstChild(rec)
         else
-            -- Create folder
+            --// Create folder
             local fldr = Instance.new("Folder")
             fldr.Parent = parent
             fldr.Name = rec

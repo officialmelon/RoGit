@@ -12,13 +12,15 @@
 
 | Preview 1 | Preview 2 | Preview 3 |
 | :---: | :---: | :---: |
-| ![Interface](README/image.png) | ![Action](README/image-1.png) | ![Action](README/image-2.png) |
+| ![Interface](README/image.png) | ![Action](README/image-1.png) | ![Action](README/image-3.png) |
 
 ---
 
 ## About `roGit`
 
 **roGit** is a pure-Luau port of Git designed to run directly within **Roblox Studio**. It fundamentally allows developers to interact with the Git protocol (`https://`) to clone, commit, pull, and push Roblox Instances natively.
+While Rojo does exist, this is a pure luau implementation for ROBLOX. Meaning NO external tools are needed (such as rojo, external git)
+We have implemented a console to give the user a native git feel if they are advanced, as well as a "Github Desktop"-esque plugin for easier repository managment
 
 **Experimental Plugin** 
 > This plugin is experimental, contains bugs, and *can* cause data loss in your experience. I am **not** responsible for any lost work. Use entirely at your own risk!
@@ -45,9 +47,8 @@
 - `git add <path>` - Stage specific Instances or properties for commit.
 - `git commit -m "..."` - Create local commits natively.
 - `git push` & `git pull` - Sync with remote HTTPS repositories (GitHub, GitLab, etc.).
+- `git checkout` & `git switch` - Checkout at a certain branch or commit.
 - `git branch`, `git diff`, `git fetch`, `git config` and more!
-
-*(Note: Complex operations like `rebase` and interactive merges are currently stubbed because i'm lazy).*
 
 ---
 
@@ -58,7 +59,7 @@
 3. Open **Roblox Studio** and open any Experience.
 4. From the top toolbar, go to **Plugins** > **Plugins Folder**.
 5. Copy the downloaded plugin file into the window that opens.
-6. Restart **Roblox Studio**. The plugin will now appear in your toolbar as **"Git Terminal"**.
+6. Restart **Roblox Studio**. The plugin will now appear in your toolbar as **"Git Terminal"** and **"RoGit"**.
 
 ---
 ## Example

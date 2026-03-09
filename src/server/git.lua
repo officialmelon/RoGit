@@ -70,7 +70,9 @@ local function compute_blob_sha(content)
     return hashlib.sha1("blob " .. tostring(#content) .. "\0" .. content)
 end
 
--- Returns tracked files that differ between index and current workspace.
+--[[
+Get all changes in our worktree.
+]]
 local function collect_worktree_changes(index)
     local modified = {}
     local deleted = {}
@@ -96,7 +98,9 @@ local function collect_worktree_changes(index)
     return modified, deleted
 end
 
--- Returns true when ancestor_sha is reachable from descendant_sha.
+--[[
+Is ancestor a commit of descendant?
+]]
 local function is_ancestor_commit(ancestor_sha, descendant_sha)
     if not ancestor_sha or not descendant_sha then
         return false
@@ -131,7 +135,9 @@ local function is_ancestor_commit(ancestor_sha, descendant_sha)
     return false
 end
 
--- Returns a combined table of all active working tree/index changes for the UI.
+--[[
+Returns a combined table of all active working tree/index changes for the UI.
+]]
 function git.get_changes()
     local index = Handlers.read_index()
 
@@ -144,7 +150,7 @@ function git.get_changes()
     local changes = {}
     local seen_paths = {}
 
-    -- STAGED (Compared to last commit)
+    --// STAGED (Compared to last commit)
     for path, data in pairs(index) do
         if not last_index[path] then
             table.insert(changes, {path = path, status = "A"})
@@ -161,7 +167,7 @@ function git.get_changes()
         end
     end
 
-    -- UNSTAGED (Compared to index)
+    --// UNSTAGED (Compared to index)
     local unstaged_modified, unstaged_deleted = collect_worktree_changes(index)
     for _, path in ipairs(unstaged_modified) do
          if not seen_paths[path] then
@@ -176,7 +182,7 @@ function git.get_changes()
          end
     end
 
-    -- UNTRACKED (Files not in index at all)
+    --// UNTRACKED (Files not in index at all)
     local untracked = {}
     local function traverse_untracked_for_changes(parent, path_prefix, seen_ids)
         local child_counts = {}
@@ -309,7 +315,6 @@ arguments.createArgument("git", "help", "h", function (...)
             print("RoGit concept guides are not yet implemented.")
             return
         elseif cmd == "git" then
-            -- Fall through to main help message!
         elseif help_messages[cmd] then
             print(help_messages[cmd])
             return
@@ -562,7 +567,6 @@ arguments.createArgument("git", "restore", "", function(...)
     local is_all = (path == ".")
     
     if is_all then
-        -- Full destructive restore
         local objectsByShaFallback = setmetatable({}, {
             __index = function(_, key)
                 local obj = Handlers.read_object(key)
@@ -574,7 +578,6 @@ arguments.createArgument("git", "restore", "", function(...)
             end
         })
 
-        -- 1. Remove untracked items
         local to_destroy = {}
         local function check_untracked(parent, prefix)
             local child_counts = {}
@@ -616,13 +619,11 @@ arguments.createArgument("git", "restore", "", function(...)
         end
         for _, obj in ipairs(to_destroy) do pcall(function() obj:Destroy() end) end
 
-        -- 2. Restore/Create tracked items
         for idx_path, data in pairs(index) do
             local clean_path = idx_path:match("^(.-)/%.properties$") or idx_path
             local targetObj = Utilities.parse_path(clean_path)
             
             if not targetObj then
-                -- Create missing
                 local segments = string.split(clean_path, "/")
                 local name = table.remove(segments)
                 local parentPath = table.concat(segments, "/")
@@ -644,7 +645,6 @@ arguments.createArgument("git", "restore", "", function(...)
                     end
                 end
             else
-                -- Update existing
                 local obj = Handlers.read_object(data.sha)
                 if obj and obj.type == "blob" then
                     local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
@@ -657,7 +657,6 @@ arguments.createArgument("git", "restore", "", function(...)
         Remote.resolve_instance_refs()
         print("Restored working tree from index")
     else
-        -- Single path restore (current logic enhanced)
         local _, _, segments = Utilities.parse_path(path)
         local target_path_base = table.concat(segments or {}, "/")
         local found = false
@@ -725,7 +724,6 @@ arguments.createArgument("git", "add", "a", function (...)
     if has_dot then
         local index = Handlers.read_index()
         
-        -- Clear existing index entries for our tracking roots to reflect deletions/renames
         for path, _ in pairs(index) do
             for _, service in ipairs(bash.trackingRoot) do
                 if path == service.Name or path:sub(1, #service.Name + 1) == service.Name .. "/" then
@@ -815,7 +813,7 @@ arguments.createArgument("git", "pull", "", function (...)
 
     local index = Handlers.read_index()
     
-    -- If we are already up to date, check if our local parts match the tree
+    --// If we are already up to date, check if our local parts match the tree
     if local_branch_sha == remoteSha then
         local current_tree_matches = true
         for path, _ in pairs(index) do

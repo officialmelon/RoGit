@@ -1,5 +1,12 @@
 local gui = {}
 
+--[[
+Okay so I designed out a plugin in Studio then converted it from an Instance to code.
+SO its VERY messy here lol, however I dont think it needs any changes for now.
+
+I will be refactoring this in the future however.
+]]
+
 function gui.create(Parent)
     local Plugin = Instance.new("Frame")
     Plugin.Name = "PluginGui"

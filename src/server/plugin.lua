@@ -1,7 +1,8 @@
 --[[
-Plugin (handles the plugin itself)
-Creates UI for bash so far
-need to implement user-friendly
+This is the main plugin code that pulls all the strings.
+Wow, thats pretty cool!
+
+(p.s we may need to refactor this at a later date because YUCK!)
 ]]
 
 local plugins = {}
@@ -34,7 +35,6 @@ end
 --[[
 Gui/"Desktop" mode related stuff
 ]]
-
 function initDesktop(gui)
     gui = gui.PluginGui
 
@@ -203,6 +203,7 @@ function initDesktop(gui)
         return result
     end
 
+    --// Populate the branch list with all of our branches.
     function populateBranchList()
         local branchContainer = gui.BranchDropdown.BranchList
 
@@ -239,6 +240,7 @@ function initDesktop(gui)
         gui.Body.BottomArea.ActionsRow.CommitBtn.Text = "<b>Commit to " .. (currBranch or "main") .. "</b>"
     end
 
+    --// populate our changes!
     function populateChangesList()
         local list = gui.Body.ChangesArea.ChangesBg.List
         local label = gui.Body.ChangesArea.ChangesLabel
@@ -284,17 +286,17 @@ function initDesktop(gui)
         label.Text = "<b>Changes</b>   <font color='#8b949e'>" .. tostring(#changes) .. "</font>"
     end
 
-    --// dismiss generic modal (Global)
-        --// Global Modal Okay button
-        local modalInner = gui.Modal:FindFirstChild("Modal")
-        if modalInner then
-            modalInner.Options.OkayBtn.Activated:Connect(function()
-                if not modalInner.PromptInputBg.Visible then
-                    gui.Modal.Visible = false
-                end
-            end)
-        end
+    --// Global Modal Okay button
+    local modalInner = gui.Modal:FindFirstChild("Modal")
+    if modalInner then
+        modalInner.Options.OkayBtn.Activated:Connect(function()
+            if not modalInner.PromptInputBg.Visible then
+                gui.Modal.Visible = false
+            end
+        end)
+    end
 
+    --// We call this func to actually "start" the GUI.
     local function onReady()
         gui.InitRepoView.Visible = false
 
@@ -383,7 +385,7 @@ function initDesktop(gui)
                 gui.SettingsView.ModalInner.Body.OriginInputBg.OriginInput.Text = url
             end
 
-            -- Only load name, NEVER automatically load a raw token into the UI (safety precaution)!
+            --// Never load a token.
             local currentUser = (_G.ACTIVE_PLUGIN or Auth.ACTIVE_PLUGIN) and (_G.ACTIVE_PLUGIN or Auth.ACTIVE_PLUGIN):GetSetting("user_name") or ""
             gui.SettingsView.ModalInner.Body.UsernameInputBg.UsernameInput.Text = currentUser
 
@@ -518,6 +520,9 @@ function initDesktop(gui)
     end
 end
 
+--[[
+Creates the User-Friendly UI window
+]]
 function plugins.CreateUserFriendlyUI(plugin)
     --// Create terminal
     local window = DockWidgetPluginGuiInfo.new(
@@ -547,7 +552,7 @@ function plugins.CreateUserFriendlyUI(plugin)
 end
 
 --[[
-Down here is the Terminal related stuff!
+TERMINAL STUFF
 ]]
 
 --[[
@@ -980,7 +985,8 @@ function plugins.createBashTerminal(plugin)
 end
 
 --[[
-self-explanatory, initialzes the plugin itself.
+self-explanatory, initialzes the plugin itself by creating
+the toolbar and buttons.
 ]]
 function plugins.initializePlugin(plugin)
     git.setPlugin(plugin); _G.ACTIVE_PLUGIN = plugin
@@ -995,6 +1001,7 @@ function plugins.initializePlugin(plugin)
 
     --// Bash Mode (Terminal)
     local bashTerminalGui = nil
+    --// GUI Mode (User-Friendly)
     local userFriendlyGui = nil
     
     buttons.BashMode.Click:Connect(function()

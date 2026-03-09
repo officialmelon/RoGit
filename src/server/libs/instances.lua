@@ -175,12 +175,12 @@ function instances.serialize_instance(instance)
     }
 
     for _, propertyData in ipairs(instancePropertiesClassList) do
-        -- Often the 'true' serialized property is lowercase (e.g. 'size') or internal (e.g. 'Color3uint8')
-        -- We try to map it to its public PascalCase member if possible.
+        --// Often the 'true' serialized property is lowercase (e.g. 'size') or internal (e.g. 'Color3uint8')
+        --// We try to map it to its public PascalCase member if possible.
         local internalName = propertyData.Name
         local publicName = INTERNAL_TO_PUBLIC[internalName] or (internalName:sub(1,1):upper() .. internalName:sub(2))
         
-        -- Special case: Color3uint8 is just 'Color'
+        --// Special case: Color3uint8 is just 'Color'
         if internalName == "Color3uint8" then publicName = "Color" end
 
         if (propertyData.Serialized == true or publicName == "Color" or publicName == "Size") and not skipList[publicName] then
@@ -191,7 +191,7 @@ function instances.serialize_instance(instance)
                 end
 
                 if val ~= nil then
-                    -- Check if we already added this (e.g. redirected both 'size' and 'Size')
+                    --// Check if we already added this (e.g. redirected both 'size' and 'Size')
                     local found = false
                     for _, existing in ipairs(instanceProperties) do
                         if existing.name == publicName then
@@ -212,7 +212,7 @@ function instances.serialize_instance(instance)
         end
     end
 
-    -- No immediate sort here, we'll sort at the end
+    --// No immediate sort here, we'll sort at the end
     
     if instance:IsA("LuaSourceContainer") then
         pcall(function()
@@ -236,7 +236,7 @@ function instances.serialize_instance(instance)
         end)
     end
     
-    -- Serialization is now handled inside the loop for standard props
+    --// Serialization is now handled inside the loop for standard props
 
     local attributes = instance:GetAttributes()
     local attrKeys = {}
@@ -271,7 +271,7 @@ function instances.serialize_instance(instance)
         })
     end
 
-    -- Final stable sort of all properties (including internal ones)
+    --// Final stable sort of all properties (including internal ones)
     table.sort(instanceProperties, function(a, b)
         return a.name < b.name
     end)

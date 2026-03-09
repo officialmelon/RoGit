@@ -75,6 +75,9 @@ function Utilities.parse_path(path)
     return currObj, segments[#segments], segments
 end
 
+--[[
+Returns the URLs for the git service we need.
+]]
 function Utilities.return_urls(url: string, service: string?)
     local svc = service or "git-upload-pack"
     return {url .. "/info/refs?service=" .. svc, url .. "/" .. svc}

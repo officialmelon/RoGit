@@ -9,7 +9,7 @@ Auth.memory_credentials = {}
 Auth.ACTIVE_PLUGIN = nil
 
 --[[
-Returns the authorization header used in git requests.
+Encodes the auth in base64 followed by an 'x' and returns the header
 ]]
 function Auth.getAuthHeader(url)
     local base_url = url:match("^(https?://[^/]+)") or url
@@ -28,33 +28,11 @@ function Auth.getAuthHeader(url)
 end
 
 --[[
-Sets authorization to config file.
-(probably not safe? should probably not store in config.)
+Gets authorization from the plugin settings
+(Old did get from the config. However if in team create that leaks your key blah blah)
 ]]
 function Auth.getConfigValue(key)
-    local root = bash.getGitFolderRoot()
-    local loaded_conf = {}
-    if root then
-        local config_content = bash.getFileContents(root, "config")
-        if type(config_content) == "string" and config_content ~= "" then
-            loaded_conf = ini_parser.parseIni(config_content)
-        end
-    end
-    
-    -- Try local config first
-    local key_parts = string.split(key, ".")
-    if #key_parts >= 2 and loaded_conf[key_parts[1]] then
-        local val = loaded_conf[key_parts[1]][key_parts[2]]
-        if val then
-            if type(val) == "string" then
-                val = val:gsub('^"(.*)"$', '%1'):gsub("^'(.*)'$", "%1")
-            end
-            return val
-        end
-    end
-
-    -- If not found (or for sensitive/global keys), try plugin settings
-    local plugin_ref = Auth.ACTIVE_PLUGIN or _G.ACTIVE_PLUGIN
+    local plugin_ref = Auth.ACTIVE_PLUGIN
     if plugin_ref then
         local val
         pcall(function()

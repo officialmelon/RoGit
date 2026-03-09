@@ -3,6 +3,9 @@ Parses ini files and allows me to modify with ease.
 ]]
 local ini_parser = {}
 
+--[[
+Parses an ini file and returns a table.
+]]
 function ini_parser.parseIni(ini_string)
     local result = {}
     local current_section = nil
@@ -31,6 +34,9 @@ function ini_parser.parseIni(ini_string)
     return result
 end
 
+--[[
+Parses a table and outputs a ini string.
+]]
 function ini_parser.serializeIni(ini_table)
     
     local out_lines = {}

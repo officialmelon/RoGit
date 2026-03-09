@@ -12,6 +12,9 @@ function arguments.returnAllArguments(cmd)
     return arguments.existingCommands[cmd] and arguments.existingCommands[cmd].args or {}
 end
 
+--[[
+Calculates the levenshtein distance between two strings.
+]]
 local function levenshtein(s1, s2)
     local len1, len2 = #s1, #s2
     local matrix = {}
@@ -21,7 +24,7 @@ local function levenshtein(s1, s2)
         for j = 1, len2 do
             local cost = (string.lower(s1:sub(i, i)) == string.lower(s2:sub(j, j))) and 0 or 1
             matrix[i][j] = math.min(matrix[i-1][j] + 1, matrix[i][j-1] + 1, matrix[i-1][j-1] + cost)
-            -- transposition
+            --// transposition
             if i > 1 and j > 1 and s1:sub(i,i) == s2:sub(j-1,j-1) and s1:sub(i-1,i-1) == s2:sub(j,j) then
                 matrix[i][j] = math.min(matrix[i][j], matrix[i-2][j-2] + cost)
             end
@@ -30,6 +33,9 @@ local function levenshtein(s1, s2)
     return matrix[len1][len2]
 end
 
+--[[
+Replaces print callback.
+]]
 function arguments.replacePrint(callback)
     print = callback
 end
@@ -49,6 +55,9 @@ function arguments.retrieveArgument(command, argumentOrAlias)
     return nil
 end
 
+--[[
+Creates a 'command' you can run
+]]
 function arguments.createCommand(command, callback)
     assert(type(command) == "string", "command is either nil or not a string!, received: " .. tostring(command))
     assert(not arguments.existingCommands[command], "attempting to create command that already exists!")
@@ -61,6 +70,9 @@ function arguments.createCommand(command, callback)
     }
 end
 
+--[[
+Creates an 'argument' for a 'command'
+]]
 function arguments.createArgument(command, argument, alias, callback, ...)
     assert(type(command) == "string", "command must be a string, received: " .. tostring(command))
     assert(type(argument) == "string", "argument must be a string, received: " .. tostring(argument))
@@ -86,6 +98,9 @@ function arguments.createArgument(command, argument, alias, callback, ...)
     }
 end
 
+--[[
+Executes a 'command'
+]]
 function arguments.execute(command, argument, ...)
     assert(type(command) == "string", "command must be a string")
 

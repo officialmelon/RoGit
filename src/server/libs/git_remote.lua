@@ -538,6 +538,9 @@ function Remote.fetch(remote_name)
     end
 end
 
+--[[
+Checkout at a certain tree SHA.
+]]
 function Remote.checkout(treeSha)
     local objectsByShaFallback = setmetatable({}, {
         __index = function(_, key)
@@ -607,6 +610,9 @@ function Remote.checkout(treeSha)
     return true
 end
 
+--[[
+Builds the remote index from the tree!
+]]
 function Remote.buildIndexFromTree(objectsBySha, treeSha)
     local index = {}
 

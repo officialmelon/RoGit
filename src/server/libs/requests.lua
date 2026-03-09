@@ -14,7 +14,7 @@ function Requests.setPromptCallback(cb)
 end
 
 --[[
-Requests credentials for auth via plugin terminal.
+Requests credentials for auth
 ]]
 local function ask_for_credential(prompt_text, is_password)
     if prompt_callback then
@@ -24,7 +24,7 @@ local function ask_for_credential(prompt_text, is_password)
 end
 
 --[[
-Makes a request to the git repository.
+Makes a request to anything that we need to.
 ]]
 function Requests.url_request_with_retry(req_options)
     local ok, res = pcall(function() return HttpService:RequestAsync(req_options) end)
@@ -51,6 +51,10 @@ function Requests.url_request_with_retry(req_options)
             fuck ass code should work first try, but no
             you decided to be a bitch today. SAVE THE FUCKING CREDENTIALS
             pls uwu
+
+            OKAY NVM
+            turns out roblox siltently fails if you include '.' or '/' inside of the damn thing
+            probably json escape code issue? anyways idk. lets NOT use that.
             ]]
             local plugin_ref = Auth.ACTIVE_PLUGIN or _G.ACTIVE_PLUGIN
             if plugin_ref then

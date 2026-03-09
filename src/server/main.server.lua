@@ -8,7 +8,7 @@ local pluginModule = require(script.Parent.plugin)
 pluginModule.initializePlugin(plugin)
 
 --[[
-Example custom execution
+Example custom execution via say an API?
 ]]
 -- arguments.executeArgument("git", "init", ".")
 -- arguments.executeArgument("git", "add", ".")

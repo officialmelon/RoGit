@@ -11,6 +11,7 @@ local git = require(script.Parent.git)
 local remote = require(script.Parent.libs.git_remote)
 local Auth = require(script.Parent.libs.localstore)
 local gui = require(script.Parent.gui)
+local cmdle = require(script.Parent.libs.cmdle)
 
 local bash = require(script.Parent.bash)
 
@@ -1004,6 +1005,10 @@ function plugins.initializePlugin(plugin)
     --// GUI Mode (User-Friendly)
     local userFriendlyGui = nil
     
+    task.spawn(function()
+        cmdle:setupPlugin()
+    end)
+
     buttons.BashMode.Click:Connect(function()
         if not bashTerminalGui then
             bashTerminalGui = plugins.createBashTerminal(plugin)

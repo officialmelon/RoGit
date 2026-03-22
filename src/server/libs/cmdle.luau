@@ -1,12 +1,11 @@
 local commandle_plugin = {}
 
 --// Services
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StudioService = game:GetService("StudioService")
 
 --// This is the root of our API
 local commandle_api_root = StudioService:WaitForChild("commandle_api", 5)
-local arguments = require(ReplicatedStorage.RoGit.server.arguments)
+local arguments = require(script.Parent.Parent.arguments)
 local argumentsModule = require(script.Parent.Parent.arguments)
 local gitHandlers = require(script.Parent.git_handlers)
 

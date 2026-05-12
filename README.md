@@ -32,6 +32,8 @@ We have implemented a console to give the user a native git feel if they are adv
 
 ## Features to implement
 
+- [ ] Union/Combined-Instance support
+
 - [ ] Implement MInstance instead of custom solution! (better support)
 
 - [ ] Make branching much better

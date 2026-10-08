@@ -82,7 +82,7 @@ function Utilities.parse_path(path)
     end
     cleaned = cleaned:gsub("^Workspace[./]", "Workspace/")
     local segments = string.split(cleaned, "/")
-    local currObj = game
+    local currObj = require(script.Parent.Parent.bash).getWorkRoot()
 
     for _, segment in ipairs(segments) do
         if not currObj then return nil, segments[#segments], segments end

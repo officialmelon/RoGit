@@ -466,7 +466,19 @@ function merge.merge_indexes(base, ours, theirs, opts)
             local reason = "both modified"
 
             local worktree = oe or te
-            if oe and te then
+            if (oe and oe.mode == "160000") or (te and te.mode == "160000") then
+                --// submodules: take the newer commit when one contains the other, like git
+                reason = "submodule: both changed"
+                if oe and te and opts.is_ancestor then
+                    if opts.is_ancestor(oe.sha, te.sha) then
+                        result[key] = te
+                        resolved = true
+                    elseif opts.is_ancestor(te.sha, oe.sha) then
+                        result[key] = oe
+                        resolved = true
+                    end
+                end
+            elseif oe and te then
                 local json, bad, worktreeJson = merge.merge_properties(
                     be and opts.read_blob(be.sha) or nil,
                     opts.read_blob(oe.sha),

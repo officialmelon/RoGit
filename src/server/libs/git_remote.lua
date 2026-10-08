@@ -243,12 +243,29 @@ function Remote.peekPropertiesBlob(objectsBySha, treeSha)
             local blobObj = objectsBySha[entrySha]
             if blobObj then
                 local ok, props = pcall(function() return HttpService:JSONDecode(blobObj.content) end)
-                if ok then return props end
+                if ok then return props, entrySha end
             end
             return nil
         end
     end
     return nil
+end
+
+--[[
+Makes the folder for a submodule (a "gitlink" tree entry). Its contents come from `git submodule update`.
+]]
+function Remote.writeGitlink(parent, name, sha)
+    local folder = parent:FindFirstChild(name)
+    if not folder then
+        folder = Instance.new("Folder")
+        folder.Name = name
+        folder.Parent = parent
+    end
+    if type(folder:GetAttribute(_Handlers.SUBMODULE_ATTRIBUTE)) ~= "string" then
+        folder:SetAttribute(_Handlers.SUBMODULE_ATTRIBUTE, Remote.submoduleNameFor and Remote.submoduleNameFor(folder) or name)
+    end
+    folder:SetAttribute(_Handlers.SUBMODULE_COMMIT_ATTRIBUTE, sha)
+    return folder
 end
 
 --[[
@@ -271,7 +288,7 @@ function Remote.resolve_instance_refs()
     
     local guid_map = {}
     local function map_guids(node)
-        if node ~= bash.getGitFolderRoot() and not node:IsDescendantOf(bash.getGitFolderRoot()) then
+        if not bash.isInternal(node) then
             Utilities.roYield()
             local guid = node:GetAttribute(ROGIT_ID)
             if guid then
@@ -283,7 +300,7 @@ function Remote.resolve_instance_refs()
         end
     end
     
-    for _, service in ipairs(bash.trackingRoot) do
+    for _, service in ipairs(bash.getTrackedRoots()) do
         map_guids(service)
     end
     
@@ -567,6 +584,8 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
             if isNew then
                 target.Parent = parent
             end
+        elseif mode == "160000" then
+            Remote.writeGitlink(parent, name, sha)
         else
             local blobObj = objectsBySha[sha]
             if not blobObj then
@@ -730,6 +749,57 @@ function Remote.fetch(remote_name, quiet, opts)
 end
 
 --[[
+Writes a root tree into the work tree: each top level entry is a service (or a folder standing in for one).
+]]
+function Remote.writeRoot(objectsBySha, treeSha)
+    local treeObj = objectsBySha[treeSha]
+    local content = treeObj.content
+    local pos = 1
+    while pos <= #content do
+        Utilities.roYield()
+        local spacePos = content:find(" ", pos, true)
+        if not spacePos then break end
+        local mode = content:sub(pos, spacePos - 1)
+        local nullPos = content:find("\0", spacePos, true)
+        if not nullPos then break end
+        local name = content:sub(spacePos + 1, nullPos - 1)
+        local rawSha = content:sub(nullPos + 1, nullPos + 20)
+        local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
+        pos = nullPos + 21
+
+        if mode == "40000" then
+            local inPlace = bash.getWorkRoot() == game
+            local serviceParent = bash.getServiceRoot(Utilities.unescape_name(name), not inPlace)
+            if serviceParent then
+                local childProps, propsSha = Remote.peekPropertiesBlob(objectsBySha, sha)
+                if inPlace and childProps then
+                    Remote.applyProperties(serviceParent, childProps)
+                end
+                Remote.writeTree(objectsBySha, sha, serviceParent, name)
+                if not inPlace then
+                    --// a worktree/submodule folder stands in for the service and keeps its properties as they are
+                    serviceParent:SetAttribute(instances.SERVICE_BLOB_ATTRIBUTE, propsSha)
+                end
+            end
+        elseif mode ~= "160000" then
+            --// a service without children is a single blob
+            local inPlace = bash.getWorkRoot() == game
+            local serviceParent = bash.getServiceRoot(Utilities.unescape_name(name), not inPlace)
+            local blob = serviceParent and objectsBySha[sha]
+            if blob then
+                if inPlace then
+                    local ok, props = pcall(function() return HttpService:JSONDecode(blob.content) end)
+                    if ok then Remote.applyProperties(serviceParent, props) end
+                else
+                    serviceParent:SetAttribute(instances.SERVICE_BLOB_ATTRIBUTE, sha)
+                end
+            end
+        end
+    end
+
+end
+
+--[[
 Checkout at a certain tree SHA.
 ]]
 function Remote.checkout(treeSha)
@@ -746,35 +816,8 @@ function Remote.checkout(treeSha)
 
     local treeObj = objectsByShaFallback[treeSha]
     if not treeObj then return false, "Tree " .. treeSha .. " not found" end
-    
-    local content = treeObj.content
-    local pos = 1
-    while pos <= #content do
-        Utilities.roYield()
-        local spacePos = content:find(" ", pos, true)
-        if not spacePos then break end
-        local mode = content:sub(pos, spacePos - 1)
-        local nullPos = content:find("\0", spacePos, true)
-        if not nullPos then break end
-        local name = content:sub(spacePos + 1, nullPos - 1)
-        local rawSha = content:sub(nullPos + 1, nullPos + 20)
-        local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-        pos = nullPos + 21
 
-        if mode == "40000" then
-            local serviceParent = game:FindFirstChild(name)
-            if not serviceParent then
-                pcall(function() serviceParent = game:GetService(name) end)
-            end
-            if serviceParent then
-                local childProps = Remote.peekPropertiesBlob(objectsByShaFallback, sha)
-                if childProps then
-                    Remote.applyProperties(serviceParent, childProps)
-                end
-                Remote.writeTree(objectsByShaFallback, sha, serviceParent, name)
-            end
-        end
-    end
+    Remote.writeRoot(objectsByShaFallback, treeSha)
 
     Remote.resolve_instance_refs()
 
@@ -786,7 +829,7 @@ function Remote.checkout(treeSha)
         if not new_index[path] then
             local clean_path = path:match("^(.-)/%.properties$") or path
             local currObj = Utilities.parse_path(clean_path)
-            if currObj and currObj ~= game and currObj.Parent ~= game then
+            if currObj and not bash.isProtected(currObj) then
                 table.insert(to_destroy, currObj)
             end
         end

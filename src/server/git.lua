@@ -130,6 +130,43 @@ arguments.createArgument("git", "--version", function ()
 end)
 
 --[[
+Global options:
+  git -C <worktree | submodule path | game> <command>   run the command in another worktree or a submodule
+  git -c <name>=<value> <command>                       a config value just for this command
+]]
+arguments.createArgument("git", "-C", function(path, ...)
+    if not path then
+        error("error: switch `C' requires a value", 0)
+    end
+    local context = repo.context_for_path(path)
+    if context == nil then
+        error("fatal: cannot change to '" .. path .. "': not a worktree or submodule", 0)
+    end
+    return bash.withContext(context or nil, arguments.execute, "git", ...)
+end)
+arguments.createArgument("git", "-c", function(pair, ...)
+    local key, value = (pair or ""):match("^([^=]+)=?(.*)$")
+    if not key then
+        error("error: switch `c' requires a value", 0)
+    end
+    if not pair:find("=", 1, true) then
+        value = "true"
+    end
+    local previous = Auth.overrides[key]
+    Auth.overrides[key] = value
+    local results = table.pack(pcall(arguments.execute, "git", ...))
+    Auth.overrides[key] = previous
+    if not results[1] then
+        error(results[2], 0)
+    end
+end)
+for _, flag in ipairs({"--no-pager", "-P", "--paginate", "--no-replace-objects", "--no-optional-locks"}) do
+    arguments.createArgument("git", flag, function(...)
+        return arguments.execute("git", ...)
+    end)
+end
+
+--[[
 Commands:
 help
 h
@@ -277,11 +314,6 @@ end
 --[[
 What the place currently holds for an index path (serialized), nil when the instance is gone.
 ]]
-local function live_blob(path)
-    local currObj = Utilities.parse_path(repo.entity_of(path))
-    return currObj and instances.serialize_instance(currObj) or nil
-end
-
 --[[
 Compares two indexes. `new` may be the string "worktree" (the live place, for the paths in `tracked`).
 Returns a sorted list of {path, status = A/M/D, old_sha, new_sha, new_content}.
@@ -295,8 +327,17 @@ local function compare_indexes(old, new, tracked, filters)
         for _, path in ipairs(paths) do
             if matches_filters(path, filters) then
                 Utilities.roYield()
-                local content = live_blob(path)
                 local old_entry = old[path]
+                local live = Utilities.parse_path(repo.entity_of(path))
+                if live and Handlers.is_submodule(live) then
+                    --// a submodule is compared by the commit it is at
+                    local head = Handlers.submodule_head(live)
+                    if head and (not old_entry or old_entry.sha ~= head) then
+                        table.insert(entries, {path = path, status = old_entry and "M" or "A", old_sha = old_entry and old_entry.sha, new_sha = head, gitlink = true})
+                    end
+                    continue
+                end
+                local content = live and instances.serialize_instance(live) or nil
                 if not content then
                     if old_entry then table.insert(entries, {path = path, status = "D", old_sha = old_entry.sha}) end
                 else
@@ -313,15 +354,15 @@ local function compare_indexes(old, new, tracked, filters)
         for path, data in pairs(new) do
             if matches_filters(path, filters) then
                 if not old[path] then
-                    table.insert(entries, {path = path, status = "A", new_sha = data.sha})
+                    table.insert(entries, {path = path, status = "A", new_sha = data.sha, gitlink = data.mode == "160000"})
                 elseif old[path].sha ~= data.sha then
-                    table.insert(entries, {path = path, status = "M", old_sha = old[path].sha, new_sha = data.sha})
+                    table.insert(entries, {path = path, status = "M", old_sha = old[path].sha, new_sha = data.sha, gitlink = data.mode == "160000"})
                 end
             end
         end
         for path, data in pairs(old) do
             if matches_filters(path, filters) and not new[path] then
-                table.insert(entries, {path = path, status = "D", old_sha = data.sha})
+                table.insert(entries, {path = path, status = "D", old_sha = data.sha, gitlink = data.mode == "160000"})
             end
         end
     end
@@ -350,6 +391,11 @@ local function print_changes(entries, format)
             print(entry.status .. "\t" .. entry.path)
         else
             print(colors[entry.status] .. entry.status .. "\27[0m  " .. entry.path)
+            if entry.gitlink then
+                if entry.old_sha then print("\27[31m-Subproject commit " .. entry.old_sha .. "\27[0m") end
+                if entry.new_sha then print("\27[32m+Subproject commit " .. entry.new_sha .. "\27[0m") end
+                continue
+            end
             local old = entry.old_sha and read_blob_content(entry.old_sha) or nil
             local new = entry.new_content or (entry.new_sha and read_blob_content(entry.new_sha)) or nil
             if entry.status ~= "D" then
@@ -933,7 +979,7 @@ arguments.createArgument("git", "add", "a", function (...)
 
     if has_dot then
         for path, _ in pairs(index) do
-            for _, service in ipairs(bash.trackingRoot) do
+            for _, service in ipairs(bash.getTrackedRoots()) do
                 if path == service.Name or path:sub(1, #service.Name + 1) == service.Name .. "/" then
                     index[path] = nil
                     break
@@ -941,8 +987,8 @@ arguments.createArgument("git", "add", "a", function (...)
             end
         end
 
-        for _, service in ipairs(bash.trackingRoot) do
-            if not Handlers.is_ignored(service:GetFullName()) then
+        for _, service in ipairs(bash.getTrackedRoots()) do
+            if not Handlers.is_ignored_instance(service) then
                 instances.stage_recursive(service, index, seen_ids)
             end
         end
@@ -1164,7 +1210,7 @@ arguments.createArgument("git", "rm", "", function (...)
     if not is_cached then
         for _, filter in ipairs(filters) do
             local currObj = Utilities.parse_path(filter)
-            if currObj and currObj.Parent ~= game then
+            if currObj and not bash.isProtected(currObj) then
                 pcall(function() currObj:Destroy() end)
             end
         end
@@ -1532,6 +1578,10 @@ arguments.createArgument("git", "init", "", function (...)
     ]])
 
     bash.createFile(bash.getGitFolderRoot(), "index", "")
+    if bash.getWorkRoot() ~= game then
+        --// a submodule gets its files from the repository it is cloned from
+        return
+    end
     bash.createFile(bash.getGitFolderRoot().Parent, ".rogit_project", "This repository is recognized as a valid roGit project.")
     bash.createFile(bash.getGitFolderRoot().Parent, ".rogitignore", [[
     # Instances to ignore in ro-git
@@ -1552,6 +1602,7 @@ arguments.createArgument("git", "clone", "", function(...)
     local single_branch = false
     local url = nil
     local repo_dir = nil
+    local recurse_submodules, quiet = false, false
 
     local i = 1
     while i <= #tuple do
@@ -1561,6 +1612,10 @@ arguments.createArgument("git", "clone", "", function(...)
             i += 1
         elseif arg == "--single-branch" then
             single_branch = true
+        elseif arg == "--recurse-submodules" or arg == "--recursive" then
+            recurse_submodules = true
+        elseif arg == "-q" or arg == "--quiet" then
+            quiet = true
         elseif arg == "--depth" or arg == "--origin" or arg == "-o" then
             i += 1 --// accepted for compatibility, roGit always clones full history
         elseif arg:sub(1, 1) ~= "-" then -- Positional argument
@@ -1588,7 +1643,7 @@ arguments.createArgument("git", "clone", "", function(...)
 
     local repoName = repo_dir or url:match("/([^/]+)$") or "repository"
     repoName = repoName:gsub("%.git$", "")
-    print("Cloning into '" .. repoName .. "'...")
+    if not quiet then print("Cloning into '" .. repoName .. "'...") end
 
     local created_here = false
     if not existing_root then
@@ -1740,32 +1795,19 @@ arguments.createArgument("git", "clone", "", function(...)
         return
     end
 
-    for _, entry in ipairs(Handlers.parse_tree(treeObj.content)) do
-        Utilities.roYield()
-        if entry.mode == "40000" then
-            local serviceParent = game:FindFirstChild(entry.name)
-            if not serviceParent then
-                pcall(function()
-                    serviceParent = game:GetService(entry.name)
-                end)
-            end
-            if serviceParent then
-                local childProps = Remote.peekPropertiesBlob(objectsBySha, entry.sha)
-                if childProps then
-                    Remote.applyProperties(serviceParent, childProps)
-                end
-                Remote.writeTree(objectsBySha, entry.sha, serviceParent, entry.name)
-            end
-        end
-    end
-
+    Remote.writeRoot(objectsBySha, treeSha)
     Remote.resolve_instance_refs()
 
     local new_index = Remote.buildIndexFromTree(objectsBySha, treeSha)
     Handlers.write_index(new_index)
     bash.writeFile(gitRoot, "last_commit_index", HttpService:JSONEncode(new_index))
 
-    print("Done. '" .. repoName .. "' cloned.")
+    if not quiet then
+        print("Done. '" .. repoName .. "' cloned.")
+    end
+    if recurse_submodules then
+        arguments.execute("git", "submodule", "update", "--init", "--recursive")
+    end
 end)
 
 --[[
@@ -3181,8 +3223,10 @@ arguments.createArgument("git", "branch", "br", function(...)
     if mode == "delete" then
         assert(#positional > 0, "fatal: branch name required")
         for _, branch in ipairs(positional) do
-            if current_branch == branch then
-                print("error: Cannot delete branch '" .. branch .. "' checked out at '" .. bash.getGitFolderRoot().Parent:GetFullName() .. "'")
+            local checked_out = current_branch == branch and (bash.getWorkRoot() == game and "game" or bash.getWorkRoot():GetFullName())
+                or repo.branch_worktree(branch)
+            if checked_out then
+                print("error: Cannot delete branch '" .. branch .. "' checked out at '" .. checked_out .. "'")
             else
                 local sha = Handlers.get_ref("refs/heads/" .. branch)
                 if not sha then
@@ -3369,6 +3413,10 @@ local function switch_to(target_sha, branch, create)
 
     if #repo.read_conflicts() > 0 then
         error("error: you need to resolve your current index first", 0)
+    end
+    local elsewhere = branch and repo.branch_worktree(branch)
+    if elsewhere then
+        error("fatal: '" .. branch .. "' is already used by worktree at '" .. elsewhere .. "'", 0)
     end
 
     local current_sha = Handlers.get_ref("HEAD")
@@ -3764,7 +3812,7 @@ arguments.createArgument("git", "doctor", "", function(...)
 
     local function visit(instance)
         Utilities.roYield()
-        if instance == git_root or Handlers.is_ignored(instance:GetFullName()) then return end
+        if instance == git_root or Handlers.is_ignored_instance(instance) then return end
 
         total += 1
         class_counts[instance.ClassName] = (class_counts[instance.ClassName] or 0) + 1
@@ -3779,7 +3827,7 @@ arguments.createArgument("git", "doctor", "", function(...)
     end
 
     print("Scanning tracked instances...")
-    for _, service in ipairs(bash.trackingRoot) do
+    for _, service in ipairs(bash.getTrackedRoots()) do
         visit(service)
     end
 
@@ -4007,5 +4055,7 @@ require(script.Parent.commands.inspect)
 require(script.Parent.commands.signing)
 require(script.Parent.commands.hooks)
 require(script.Parent.commands.stash)
+require(script.Parent.commands.worktree)
+require(script.Parent.commands.submodule)
 
 return git

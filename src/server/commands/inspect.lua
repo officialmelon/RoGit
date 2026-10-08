@@ -39,7 +39,7 @@ function inspect.tree_entry(tree_sha, path)
         local found = nil
         for _, entry in ipairs(Handlers.parse_tree(obj.content)) do
             if entry.name == segment then
-                found = {sha = entry.sha, mode = entry.mode, type = entry.mode == "40000" and "tree" or "blob"}
+                found = {sha = entry.sha, mode = entry.mode, type = entry.mode == "40000" and "tree" or (entry.mode == "160000" and "commit" or "blob")}
                 break
             end
         end
@@ -135,7 +135,7 @@ arguments.createArgument("git", "cat-file", "", function(...)
     elseif obj.type == "tree" then
         for _, entry in ipairs(Handlers.parse_tree(obj.content)) do
             local mode_text = entry.mode == "40000" and "040000" or entry.mode
-            print(string.format("%s %s %s\t%s", mode_text, entry.mode == "40000" and "tree" or "blob", entry.sha, entry.name))
+            print(string.format("%s %s %s\t%s", mode_text, entry.mode == "40000" and "tree" or (entry.mode == "160000" and "commit" or "blob"), entry.sha, entry.name))
         end
     elseif obj.type == "blob" and mode == "-p" then
         print(inspect.pretty_blob(obj.content))
@@ -233,7 +233,7 @@ arguments.createArgument("git", "ls-tree", "", function(...)
             elseif name_only then
                 print(path)
             else
-                print(string.format("%s %s %s\t%s", entry.mode == "40000" and "040000" or entry.mode, entry.mode == "40000" and "tree" or "blob", entry.sha, path))
+                print(string.format("%s %s %s\t%s", entry.mode == "40000" and "040000" or entry.mode, entry.mode == "40000" and "tree" or (entry.mode == "160000" and "commit" or "blob"), entry.sha, path))
             end
         end
     end

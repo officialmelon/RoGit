@@ -29,6 +29,8 @@ end)
 local name = game.Name
 
 local commandHistory = {}
+--// `cd <worktree | submodule>` in the terminal: git commands then run there (like git -C)
+local terminalDirectory = nil
 
 --// In-Game check
 if not RunService:IsStudio() then 
@@ -696,7 +698,7 @@ function createCommandEntry(parent)
     start.BackgroundTransparency = 1.000
     start.BorderSizePixel = 0
 
-    local promptText = user .. "@" .. name .. ">"
+    local promptText = user .. "@" .. name .. (terminalDirectory and (":" .. terminalDirectory) or "") .. ">"
     local textWidth = game:GetService("TextService"):GetTextSize(promptText, 14, Enum.Font.Ubuntu, Vector2.new(10000, 100)).X + 4
 
     start.Size = UDim2.new(0, textWidth, 1, 0)
@@ -811,8 +813,28 @@ function handleCommandCallback(TextBox:TextBox, parent)
             
             if #toProcess == 0 then return end
             local cmdName = string.lower(toProcess[1])
-            
-            if arguments.existingCommands[cmdName] then
+
+            if cmdName == "cd" then
+                local target = toProcess[2]
+                if not target or target == "~" or target == "/" or target == ".." or target == "game" then
+                    terminalDirectory = nil
+                else
+                    local ok, context = pcall(require(script.Parent.libs.repo).context_for_path, target)
+                    if ok and context then
+                        terminalDirectory = target
+                    elseif ok and context == false then
+                        terminalDirectory = nil
+                    else
+                        createCommandOutput(parent, "cd: " .. target .. ": not a worktree or submodule (see git worktree list, git submodule)", Color3.fromRGB(255, 90, 90))
+                    end
+                end
+            elseif cmdName == "pwd" then
+                createCommandOutput(parent, terminalDirectory or "game")
+            elseif arguments.existingCommands[cmdName] then
+                if cmdName == "git" and terminalDirectory then
+                    table.insert(toProcess, 2, "-C")
+                    table.insert(toProcess, 3, terminalDirectory)
+                end
                 table.remove(toProcess, 1)
                                 
                 local status, err = pcall(function()

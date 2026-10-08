@@ -41,16 +41,23 @@ function ini_parser.serializeIni(ini_table)
     
     local out_lines = {}
 
-    for sect_name, sect_tbl in pairs(ini_table) do 
-        table.insert(out_lines, "[" .. sect_name .. "]")
-        for key, val in pairs(sect_tbl) do 
-            table.insert(out_lines, key .. " = " .. tostring(val))
-        end
+    --// sorted, so the same settings always give the same text (.gitmodules is tracked)
+    local sections = {}
+    for sect_name in pairs(ini_table) do table.insert(sections, sect_name) end
+    table.sort(sections)
 
-        table.insert(out_lines, "")
+    for _, sect_name in ipairs(sections) do
+        local sect_tbl = ini_table[sect_name]
+        table.insert(out_lines, "[" .. sect_name .. "]")
+        local keys = {}
+        for key in pairs(sect_tbl) do table.insert(keys, key) end
+        table.sort(keys)
+        for _, key in ipairs(keys) do
+            table.insert(out_lines, "\t" .. key .. " = " .. tostring(sect_tbl[key]))
+        end
     end
 
-    return table.concat(out_lines, "\n")
+    return table.concat(out_lines, "\n") .. (#out_lines > 0 and "\n" or "")
 end
 
 return ini_parser

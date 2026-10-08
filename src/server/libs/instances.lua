@@ -943,11 +943,22 @@ function instances.apply_pseudo_property(instance, propData)
     return ok
 end
 
+instances.SERVICE_BLOB_ATTRIBUTE = "RoGitServiceBlob"
+
 --[[
 Serializes instance & instance properties
 ]]
 function instances.serialize_instance(instance, report)
     assert(typeof(instance) == "Instance", "no instance passed or instance is not a Instance")
+
+    --// a service checked out into a worktree folder keeps the service's own properties
+    local stored = instance:GetAttribute(instances.SERVICE_BLOB_ATTRIBUTE)
+    if type(stored) == "string" and instance.Parent == bash.getWorkRoot() then
+        local obj = Handlers.read_object(stored)
+        if obj and obj.type == "blob" then
+            return obj.content
+        end
+    end
 
     active_report = report
     local className = instance.ClassName
@@ -1098,7 +1109,7 @@ function instances.stage_instance(instance, index, seen_ids, assignedVirtualPath
 
     local hasValidChildren = false
     for _, child in ipairs(instance:GetChildren()) do
-        if child ~= bash.getGitFolderRoot() and not Handlers.is_ignored(child:GetFullName()) and not child:IsDescendantOf(bash.getGitFolderRoot()) then
+        if not Handlers.is_ignored_instance(child) then
             hasValidChildren = true
             break
         end
@@ -1134,7 +1145,7 @@ end
 Stage instances into the index recursively.
 ]]
 function instances.stage_recursive(instance, index, seen_ids, perf, parentVirtualPath)
-    if Handlers.is_ignored(instance:GetFullName()) then return end
+    if Handlers.is_ignored_instance(instance) then return end
     seen_ids = seen_ids or {}
     perf = perf or { last_yield = os.clock() }
 
@@ -1148,7 +1159,7 @@ function instances.stage_recursive(instance, index, seen_ids, perf, parentVirtua
         myVirtualPath = instance.Name
         -- Ensure root services and certain singletons have stable IDs
         local forcedID = nil
-        if instance.Parent == game then
+        if instance.Parent == bash.getWorkRoot() then
             forcedID = "SERVICE_" .. instance.Name
         elseif instance.Name == "Camera" and instance:IsA("Camera") and instance.Parent and instance.Parent:IsA("Workspace") then
             forcedID = "SERVICE_Camera"
@@ -1167,12 +1178,21 @@ function instances.stage_recursive(instance, index, seen_ids, perf, parentVirtua
         myVirtualPath = parentVirtualPath
     end
 
+    --// a submodule is recorded as the commit it is at (a "gitlink"), its contents belong to its own repository
+    if parentVirtualPath and Handlers.is_submodule(instance) then
+        local head = Handlers.submodule_head(instance)
+        if head then
+            index[myVirtualPath] = {mode = "160000", sha = head}
+        end
+        return
+    end
+
     instances.stage_instance(instance, index, seen_ids, myVirtualPath)
     Utilities.roYield()
 
     local valid_children = {}
     for _, child in ipairs(instance:GetChildren()) do
-        if child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
+        if not bash.isInternal(child) then
             -- Ensure child has an ID for stable sorting tie-breaking
             local id = child:GetAttribute(ROGIT_ID)
             if not id then

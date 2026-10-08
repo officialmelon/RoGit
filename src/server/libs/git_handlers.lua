@@ -81,7 +81,7 @@ function Handlers.write_object(typeName, content)
     local dir = objects_dir_cache[prefix]
     if not dir or not dir.Parent then
         dir = bash.createFolder(
-            bash.getGitFolderRoot(),
+            bash.getObjectsRoot(),
             "objects/" .. prefix
         )
         objects_dir_cache[prefix] = dir
@@ -112,7 +112,7 @@ function Handlers.write_object_with_sha(typeName, content, sha)
     local dir = objects_dir_cache[prefix]
     if not dir or not dir.Parent then
         dir = bash.createFolder(
-            bash.getGitFolderRoot(),
+            bash.getObjectsRoot(),
             "objects/" .. prefix
         )
         objects_dir_cache[prefix] = dir
@@ -149,7 +149,7 @@ function Handlers.read_object(sha)
     local cached = object_cache[sha]
     if cached then return cached end
 
-    local gitRoot = bash.getGitFolderRoot()
+    local gitRoot = bash.getObjectsRoot()
     if not gitRoot then return nil end
     local objsFolder = gitRoot:FindFirstChild("objects")
     if not objsFolder then return nil end
@@ -280,10 +280,10 @@ The file is re-read whenever its content changed, so edits apply without restart
 local ignore_source = nil
 
 function Handlers.load_ignore_patterns()
-    local gitRoot = bash.getGitFolderRoot()
     local content = ""
-    if gitRoot and gitRoot.Parent then
-        content = bash.getFileContents(gitRoot.Parent, ".rogitignore") or ""
+    local storage = bash.getServiceRoot("ServerStorage")
+    if storage then
+        content = bash.getFileContents(storage, ".rogitignore") or ""
     end
 
     if ignore_patterns ~= nil and content == ignore_source then
@@ -311,6 +311,19 @@ function Handlers.load_ignore_patterns()
             end
         end
     end
+end
+
+--// another repository (worktree/submodule) can have its own .rogitignore
+bash.onContextChanged(function()
+    ignore_patterns = nil
+    table.clear(ignore_cache)
+end)
+
+--[[
+Whether an instance is outside the work tree: the .git folder, other worktrees, or matched by .rogitignore.
+]]
+function Handlers.is_ignored_instance(instance)
+    return bash.isInternal(instance) or Handlers.is_ignored(bash.relativeName(instance))
 end
 
 --[[
@@ -375,7 +388,10 @@ function Handlers.collectObjects(localSha, remoteSha)
                         if target then table.insert(stack, target) end
                     elseif obj.type == "tree" then
                         for _, entry in ipairs(Handlers.parse_tree(obj.content)) do
-                            table.insert(stack, entry.sha)
+                            --// a gitlink names a commit of another repository (a submodule), never sent along
+                            if entry.mode ~= "160000" then
+                                table.insert(stack, entry.sha)
+                            end
                         end
                     end
                     Utilities.roYield()
@@ -462,7 +478,7 @@ local function write_git_file(full_path, content)
     local segments = string.split(full_path, "/")
     local filename = table.remove(segments)
 
-    local parent_folder = bash.getGitFolderRoot()
+    local parent_folder = bash.resolveGitParent(bash.getGitFolderRoot(), full_path)
     if #segments > 0 then
         parent_folder = bash.createFolder(parent_folder, table.concat(segments, "/"))
     end
@@ -753,7 +769,7 @@ function Handlers.resolve_revision(rev)
     end
 
     if #rev >= 4 and #rev <= 40 and rev:match("^%x+$") then
-        local gitRoot = bash.getGitFolderRoot()
+        local gitRoot = bash.getObjectsRoot()
         local objects = gitRoot and gitRoot:FindFirstChild("objects")
         local dir = objects and objects:FindFirstChild(rev:sub(1, 2):lower())
         if dir then
@@ -795,6 +811,46 @@ function Handlers.list_refs()
     end
     scan(refsFolder, "refs/")
     return refs
+end
+
+--// ------------------------------------------------------------------ submodules
+
+--[[
+Submodules are folders with this attribute (the submodule's name). Their repository is .git/modules/<name>.
+]]
+Handlers.SUBMODULE_ATTRIBUTE = "RoGitSubmodule"
+--// the commit a submodule folder should be at, for submodules that were not cloned yet
+Handlers.SUBMODULE_COMMIT_ATTRIBUTE = "RoGitSubmoduleCommit"
+
+function Handlers.is_submodule(instance)
+    return instance ~= bash.getWorkRoot() and type(instance:GetAttribute(Handlers.SUBMODULE_ATTRIBUTE)) == "string"
+end
+
+function Handlers.submodule_git_folder(name)
+    local main = bash.getMainGitFolder()
+    local modules = main and main:FindFirstChild("modules")
+    return modules and name and modules:FindFirstChild(name) or nil
+end
+
+--[[
+The commit checked out in a submodule folder (what the superproject records for it).
+]]
+function Handlers.submodule_head(instance)
+    local folder = Handlers.submodule_git_folder(instance:GetAttribute(Handlers.SUBMODULE_ATTRIBUTE))
+    if not folder then
+        return instance:GetAttribute(Handlers.SUBMODULE_COMMIT_ATTRIBUTE)
+    end
+    local head = bash.getFileContents(folder, "HEAD")
+    local guard = 0
+    while head and head:sub(1, 5) == "ref: " and guard < 5 do
+        local file = bash.getDirectoryOrFile(folder, head:sub(6))
+        head = file and bash.getFileContents(file.Parent, file.Name)
+        guard += 1
+    end
+    if head and #head == 40 then
+        return head
+    end
+    return instance:GetAttribute(Handlers.SUBMODULE_COMMIT_ATTRIBUTE)
 end
 
 --[[

@@ -50,7 +50,7 @@ function repo.read_file(path)
 end
 
 function repo.write_file(path, content)
-    local root = repo.require_root()
+    local root = bash.resolveGitParent(repo.require_root(), path)
     local segments = string.split(path, "/")
     local name = table.remove(segments)
     local folder = #segments > 0 and bash.createFolder(root, table.concat(segments, "/")) or root
@@ -91,6 +91,9 @@ end
 Reads a config value: the repository's config first, then the plugin (global) settings.
 ]]
 function repo.get_config(key)
+    if Auth.overrides[key] ~= nil then
+        return Auth.overrides[key]
+    end
     local root = bash.getGitFolderRoot()
     if root then
         local section, name = repo.config_section(key)
@@ -386,6 +389,11 @@ function repo.collect_worktree_changes(index)
 
         if not currObj then
             table.insert(deleted, path)
+        elseif data.mode == "160000" then
+            local head = Handlers.submodule_head(currObj)
+            if head and head ~= data.sha then
+                table.insert(modified, path)
+            end
         else
             local serialized = instances.serialize_instance(currObj)
             if Handlers.blob_sha(serialized) ~= data.sha then
@@ -404,11 +412,10 @@ Returns the children of an instance that roGit tracks (ignores .rogitignore'd in
 in the same deterministic order used when staging. Duplicate names get a stable id so they can be told apart.
 ]]
 function repo.tracked_children(parent, seen_ids)
-    local gitRoot = bash.getGitFolderRoot()
     local children = {}
     local counts = {}
     for _, child in ipairs(parent:GetChildren()) do
-        if child ~= gitRoot and not (gitRoot and child:IsDescendantOf(gitRoot)) and not Handlers.is_ignored(child:GetFullName()) then
+        if not Handlers.is_ignored_instance(child) then
             table.insert(children, child)
             counts[child.Name] = (counts[child.Name] or 0) + 1
         end
@@ -454,6 +461,12 @@ function repo.collect_untracked(index)
             end
 
             local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
+            if Handlers.is_submodule(child) then
+                if not index[my_path] then
+                    untracked[my_path] = child
+                end
+                continue
+            end
             local grandchildren, grandCounts = repo.tracked_children(child, seen_ids)
 
             local index_path = #grandchildren > 0 and (my_path .. "/.properties") or my_path
@@ -465,9 +478,11 @@ function repo.collect_untracked(index)
         end
     end
 
-    for _, service in ipairs(bash.trackingRoot) do
-        local children, counts = repo.tracked_children(service, seen_ids)
-        traverse(children, counts, service.Name)
+    for _, service in ipairs(bash.getTrackedRoots()) do
+        if not Handlers.is_ignored_instance(service) then
+            local children, counts = repo.tracked_children(service, seen_ids)
+            traverse(children, counts, service.Name)
+        end
     end
 
     return untracked
@@ -480,8 +495,8 @@ function repo.snapshot_worktree()
     Handlers.load_ignore_patterns()
     local index = {}
     local seen_ids = {}
-    for _, service in ipairs(bash.trackingRoot) do
-        if not Handlers.is_ignored(service:GetFullName()) then
+    for _, service in ipairs(bash.getTrackedRoots()) do
+        if not Handlers.is_ignored_instance(service) then
             instances.stage_recursive(service, index, seen_ids)
         end
     end
@@ -645,6 +660,14 @@ function repo.restore_worktree(source, known, filters)
 
     for _, entity in ipairs(ordered) do
         Utilities.roYield()
+        if entities[entity].mode == "160000" then
+            local parentPath, name = entity:match("^(.*)/([^/]+)$")
+            local parent = parentPath and Utilities.parse_path(parentPath)
+            if parent then
+                Remote.writeGitlink(parent, Utilities.unescape_name(name), entities[entity].sha)
+            end
+            continue
+        end
         local content = repo.read_blob_content(entities[entity].sha)
         local ok, props = pcall(function() return HttpService:JSONDecode(content) end)
         if ok and type(props) == "table" then
@@ -674,7 +697,7 @@ function repo.restore_worktree(source, known, filters)
     table.sort(doomed, function(a, b) return #a > #b end)
     for _, entity in ipairs(doomed) do
         local target = Utilities.parse_path(entity)
-        if target and target.Parent ~= game then
+        if target and not bash.isProtected(target) then
             pcall(function() target:Destroy() end)
         end
         matched += 1
@@ -682,6 +705,114 @@ function repo.restore_worktree(source, known, filters)
 
     Remote.resolve_instance_refs()
     return matched
+end
+
+--// ------------------------------------------------------------------ worktrees
+
+local function raw_file(folder, name)
+    local file = folder and folder:FindFirstChild(name)
+    if file and file:IsA("StringValue") then
+        return file.Value
+    end
+    return nil
+end
+repo.raw_file = raw_file
+
+--[[
+Every worktree of the main repository: {name (nil for the main one), path, root, state, head, locked}.
+]]
+function repo.list_worktrees()
+    local main = bash.getMainGitFolder()
+    if not main then return {} end
+    local list = {{name = nil, path = "game", root = game, state = main, head = raw_file(main, "HEAD")}}
+    local states = main:FindFirstChild("worktrees")
+    local holder = game:GetService("ServerStorage"):FindFirstChild(bash.WORKTREES_FOLDER)
+    local extra = {}
+    for _, state in ipairs(states and states:GetChildren() or {}) do
+        local root = holder and holder:FindFirstChild(state.Name)
+        table.insert(extra, {
+            name = state.Name,
+            path = root and root:GetFullName() or ("ServerStorage." .. bash.WORKTREES_FOLDER .. "." .. state.Name),
+            root = root,
+            state = state,
+            head = raw_file(state, "HEAD"),
+            locked = raw_file(state, "locked"),
+        })
+    end
+    table.sort(extra, function(a, b) return a.name < b.name end)
+    for _, entry in ipairs(extra) do
+        table.insert(list, entry)
+    end
+    return list
+end
+
+--[[
+The worktree (other than the current one) that has `branch` checked out, as its path. nil if none.
+]]
+function repo.branch_worktree(branch)
+    local context = bash.context
+    if context and context.kind == "submodule" then return nil end
+    local current = context and context.kind == "worktree" and context.name or nil
+    for _, worktree in ipairs(repo.list_worktrees()) do
+        if worktree.name ~= current and worktree.head == "ref: refs/heads/" .. branch then
+            return worktree.path
+        end
+    end
+    return nil
+end
+
+--[[
+The context for a worktree name. nil when there's no such worktree.
+]]
+function repo.worktree_context(name)
+    local main = bash.getMainGitFolder()
+    local states = main and main:FindFirstChild("worktrees")
+    local holder = game:GetService("ServerStorage"):FindFirstChild(bash.WORKTREES_FOLDER)
+    local root = holder and holder:FindFirstChild(name)
+    if not (states and states:FindFirstChild(name)) or not root then
+        return nil
+    end
+    return {kind = "worktree", name = name, root = root}
+end
+
+--[[
+The context for a submodule folder.
+]]
+function repo.submodule_context(folder)
+    return {kind = "submodule", name = folder:GetAttribute(Handlers.SUBMODULE_ATTRIBUTE), root = folder}
+end
+
+--[[
+What `git -C <path>` means: a worktree (its name or folder), a submodule folder, or the place ("game", "/").
+Returns the context (false for the place) or nil.
+]]
+function repo.context_for_path(path)
+    if path == "." or path == "" then
+        return bash.context or false
+    end
+    if path == "/" or path == "game" or path == "~" then
+        return false
+    end
+    local name = path:match("^worktrees/(.+)$") or path
+    local worktree = repo.worktree_context(name)
+    if worktree then return worktree end
+
+    local cleaned = path:gsub("^game[./]", "")
+    local target = Utilities.parse_path(cleaned)
+    if not target then
+        --// the full name of a worktree folder, or a path from the place's root while inside another context
+        target = bash.withContext(nil, Utilities.parse_path, cleaned)
+    end
+    if not target then return nil end
+    local holder = game:GetService("ServerStorage"):FindFirstChild(bash.WORKTREES_FOLDER)
+    if holder and target.Parent == holder then
+        return repo.worktree_context(target.Name)
+    end
+    if Handlers.is_submodule(target) or (target ~= bash.getWorkRoot() and type(target:GetAttribute(Handlers.SUBMODULE_ATTRIBUTE)) == "string") then
+        return repo.submodule_context(target)
+    end
+    if target == game then return false end
+    return nil
 end
 
 --// ------------------------------------------------------------------ conflicts
@@ -767,6 +898,7 @@ function repo.three_way(base_tree, theirs_tree, opts)
             labels = {ours = opts.ours_label or "HEAD", theirs = opts.theirs_label or "theirs"},
             read_blob = repo.read_blob_content,
             write_blob = function(content) return Handlers.write_blob(content) end,
+            is_ancestor = repo.is_ancestor,
         }
     )
 

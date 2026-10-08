@@ -7,6 +7,8 @@ local ini_parser = require(script.Parent.ini_parser)
 --// Creds & temp variables
 Auth.memory_credentials = {}
 Auth.ACTIVE_PLUGIN = nil
+--// values from `git -c key=value`, for the command being run (keys as written: "user.name")
+Auth.overrides = {}
 
 --[[
 Encodes the auth in base64 followed by an 'x' and returns the header
@@ -32,6 +34,10 @@ Gets authorization from the plugin settings
 (Old did get from the config. However if in team create that leaks your key blah blah)
 ]]
 function Auth.getConfigValue(key)
+    local override = Auth.overrides[key] or Auth.overrides[(key:gsub("_", "."))]
+    if override ~= nil then
+        return override
+    end
     local plugin_ref = Auth.ACTIVE_PLUGIN
     if plugin_ref then
         local val

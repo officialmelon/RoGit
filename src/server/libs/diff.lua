@@ -12,6 +12,8 @@ local function short_value(value)
     local text
     if type(value) == "string" then
         text = string.format("%q", value)
+    elseif type(value) == "table" and type(value.Data) == "string" then
+        text = string.format("<binary data, %d bytes>", #value.Data)
     elseif type(value) == "table" then
         local ok, encoded = pcall(function() return HttpService:JSONEncode(value) end)
         text = ok and encoded or tostring(value)

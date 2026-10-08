@@ -32,7 +32,7 @@ We have implemented a console to give the user a native git feel if they are adv
 
 ## Features to implement
 
-- [ ] Union/Combined-Instance support *(in progress: binary properties such as `ChildData`/`MeshData` are now stored (base64) instead of breaking the commit, but this still needs testing in Studio)*
+- [ ] Union/Combined-Instance support *(binary properties such as `ChildData`/`MeshData` are stored (base64) instead of breaking the commit, but whether Studio lets a plugin read/write them still needs testing. `git doctor` tells you what is and isn't saved in your place)*
 
 - [ ] Implement MInstance instead of custom solution! (better support)
 
@@ -54,7 +54,19 @@ We have implemented a console to give the user a native git feel if they are adv
 - `git branch` (`-a`, `-r`, `-v`, `-d/-D`, `-m`) / `git switch` / `git checkout` - Work with branches, tags, commits (detached HEAD) and files.
 - `git merge <branch>` - Fast-forwards when possible, otherwise does a real three-way merge (see below).
 - `git tag` - Lightweight and annotated (`-a -m`) tags.
+- `git doctor` - Scans your place and lists everything roGit can't store (unknown property types, known limits such as terrain voxels).
 - `git remote`, `git config` and more! Run `git help` to see everything.
+
+### What gets saved
+
+Every property Studio reports as serialized, attributes, tags and scripts are stored. On top of that:
+
+- **`EditableImage`** (pixels) and **`EditableMesh`** (vertices, normals, UVs, colors, triangles) are stored with their data, and `Content` properties that point at them (e.g. `ImageLabel.ImageContent`) are re-linked on checkout. `MeshPart.MeshContent` too.
+- **`Path2D`** control points, `Model.WorldPivot`, `buffer` and binary-string properties.
+- Awkward instance names (`A/B`, empty names, `.git`, ...) are escaped so they can live in a git tree.
+- Properties of a type roGit doesn't understand are skipped rather than saved as junk; `git doctor` lists them.
+
+Not stored: terrain voxels, and properties that were set back to `nil`.
 
 ### How merging works
 
@@ -111,4 +123,5 @@ The plugin is plain Luau and builds with [Rojo](https://rojo.space) (`rojo build
 ```
 python3 tests/build.py tests/merge_test.lua && luau tests/_run.lua
 python3 tests/build.py tests/workflow_test.lua && luau tests/_run.lua
+python3 tests/build.py tests/serialize_test.lua && luau tests/_run.lua
 ```

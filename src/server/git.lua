@@ -217,10 +217,10 @@ local function collect_untracked(index)
 
         for _, child in ipairs(children) do
             Utilities.roYield()
-            local virtualName = child.Name
+            local virtualName = Utilities.escape_name(child.Name)
             if counts[child.Name] > 1 then
                 seen_local[child.Name] = (seen_local[child.Name] or 0) + 1
-                virtualName = child.Name .. " [" .. tostring(seen_local[child.Name]) .. "]"
+                virtualName = virtualName .. " [" .. tostring(seen_local[child.Name]) .. "]"
             end
 
             local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
@@ -347,6 +347,7 @@ arguments.createArgument("git", "help", "h", function (...)
             remote = "git-remote - Manage set of tracked repositories.\n\nUsage: git remote [-v | --verbose]\n       git remote add [-f] <name> <url>\n       git remote remove <name>\n       git remote set-url <name> <newurl>",
             init = "git-init - Create an empty Git repository or reinitialize an existing one.\n\nUsage: git init [-q | --quiet] [-b <branch-name>]",
             log = "git-log - Show commit logs.\n\nUsage: git log [--oneline] [-n <number>] [<revision>]",
+            doctor = "git-doctor - Check what roGit cannot store.\n\nUsage: git doctor [-v]\n\nScans every tracked instance and lists property types, instances and data roGit can't save.",
             tag = "git-tag - Create, list, delete tags.\n\nUsage: git tag [-l [<pattern>]]\n       git tag [-a -m <msg>] <tagname> [<commit>]\n       git tag -d <tagname>",
             config = "git-config - Get and set repository or global options.\n\nUsage: git config [--global] <name> [<value>]",
             version = "git-version - Show the RoGit version information.\n\nUsage: git version",
@@ -416,6 +417,7 @@ collaborate (see also: git help workflows)
 Other commands:
    init      Create an empty Git repository or reinitialize an existing one
    config    Get and set repository or global options
+   doctor    Check what roGit cannot store in this place
 
 'git help -a' and 'git help -g' list available subcommands and some
 concept guides. See 'git help <command>' or 'git help <concept>'
@@ -787,10 +789,10 @@ arguments.createArgument("git", "restore", "", function(...)
             local seen = {}
             for _, child in ipairs(parent:GetChildren()) do
                 if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() then
-                    local virtualName = child.Name
+                    local virtualName = Utilities.escape_name(child.Name)
                     if child_counts[child.Name] > 1 then
                         seen[child.Name] = (seen[child.Name] or 0) + 1
-                        virtualName = child.Name .. " [" .. tostring(seen[child.Name]) .. "]"
+                        virtualName = virtualName .. " [" .. tostring(seen[child.Name]) .. "]"
                     end
                     local my_path = prefix == "" and virtualName or (prefix .. "/" .. virtualName)
                     
@@ -832,9 +834,10 @@ arguments.createArgument("git", "restore", "", function(...)
                         if ok then
                             local className = "Folder"
                             for _, p in ipairs(props) do if p.name == "ClassName" then className = p.value; break end end
-                            local ok2, inst = pcall(Instance.new, className)
+                            local inst = instances.create_instance(className, props)
+                            local ok2 = inst ~= nil
                             if ok2 then
-                                inst.Name = name
+                                inst.Name = Utilities.unescape_name((name:gsub(" %[%d+%]$", "")))
                                 Remote.applyProperties(inst, props)
                                 inst.Parent = parentObj
                             end
@@ -966,9 +969,25 @@ arguments.createArgument("git", "add", "a", function (...)
         if dry_run then
             print("add '" .. currObj:GetFullName() .. "'")
         else
-            local parentPath = table.concat(segments, "/", 1, #segments - 1)
-            if parentPath == "" then parentPath = nil end
-            instances.stage_recursive(currObj, index, seen_ids, nil, parentPath)
+            --// Restage the whole subtree: drop what the index knew about it (deleted children included)
+            local ownPath = table.concat(segments, "/")
+            for path in pairs(index) do
+                if path == ownPath or path:sub(1, #ownPath + 1) == ownPath .. "/" then
+                    index[path] = nil
+                end
+            end
+
+            instances.stage_recursive(currObj, index, seen_ids, nil, #segments > 1 and ownPath or nil)
+
+            --// The parents need an entry too (and one in the "has children" form), otherwise the tree would lose their class/properties
+            for depth = 1, #segments - 1 do
+                local ancestorPath = table.concat(segments, "/", 1, depth)
+                local ancestor = Utilities.parse_path(ancestorPath)
+                if ancestor and not index[ancestorPath .. "/.properties"] then
+                    index[ancestorPath] = nil
+                    instances.stage_instance(ancestor, index, seen_ids, ancestorPath)
+                end
+            end
         end
     end
 
@@ -3135,6 +3154,108 @@ arguments.createArgument("git", "reset", "", function(...)
             print("Unstaged changes after reset:")
             for _, line in ipairs(unstaged) do print(line) end
         end
+    end
+end)
+
+--[[
+commands:
+doctor
+
+Scans every tracked instance and reports what roGit can't store (property types it doesn't understand,
+instances with data outside of properties, known limits).
+]]
+arguments.createArgument("git", "doctor", "", function(...)
+    local verbose = false
+    for _, arg in ipairs({...}) do
+        if arg == "-v" or arg == "--verbose" then verbose = true end
+    end
+
+    Handlers.load_ignore_patterns()
+    local report = {unsupported = {}, unreadable = {}, special = {}, failed = {}, limits = {}}
+    local class_counts = {}
+    local total = 0
+    local git_root = bash.getGitFolderRoot()
+
+    local function visit(instance)
+        Utilities.roYield()
+        if instance == git_root or Handlers.is_ignored(instance:GetFullName()) then return end
+
+        total += 1
+        class_counts[instance.ClassName] = (class_counts[instance.ClassName] or 0) + 1
+        local ok, err = pcall(instances.serialize_instance, instance, report)
+        if not ok then
+            report.failed[instance.ClassName .. ".(serialize)"] = {count = 1, detail = tostring(err)}
+        end
+
+        for _, child in ipairs(instance:GetChildren()) do
+            visit(child)
+        end
+    end
+
+    print("Scanning tracked instances...")
+    for _, service in ipairs(bash.trackingRoot) do
+        visit(service)
+    end
+
+    local class_total = 0
+    for _ in pairs(class_counts) do class_total += 1 end
+    print(string.format("Checked %d instances of %d classes.", total, class_total))
+
+    local function sorted_keys(map)
+        local keys = {}
+        for key in pairs(map) do table.insert(keys, key) end
+        table.sort(keys)
+        return keys
+    end
+
+    local problems = 0
+
+    local special_classes = sorted_keys(report.special)
+    if #special_classes > 0 then
+        print("\nStored through special handling:")
+        for _, key in ipairs(special_classes) do
+            print(string.format("  %s x%d", key:gsub("%.$", ""), report.special[key].count))
+        end
+    end
+
+    local unsupported = sorted_keys(report.unsupported)
+    if #unsupported > 0 then
+        problems += #unsupported
+        print("\n\27[33mNot stored (roGit doesn't know this property type):\27[0m")
+        for _, key in ipairs(unsupported) do
+            local entry = report.unsupported[key]
+            print(string.format("  %s  [%s] on %d instance%s", key, tostring(entry.detail), entry.count, entry.count == 1 and "" or "s"))
+        end
+    end
+
+    local failed = sorted_keys(report.failed)
+    if #failed > 0 then
+        problems += #failed
+        print("\n\27[31mFailed to read:\27[0m")
+        for _, key in ipairs(failed) do
+            print(string.format("  %s: %s", key, tostring(report.failed[key].detail)))
+        end
+    end
+
+    local limits = sorted_keys(report.limits)
+    if #limits > 0 then
+        problems += #limits
+        print("\n\27[33mKnown limits:\27[0m")
+        for _, key in ipairs(limits) do
+            print(string.format("  %s: %s", key:gsub("%.$", ""), tostring(report.limits[key].detail)))
+        end
+    end
+
+    if verbose then
+        local unreadable = sorted_keys(report.unreadable)
+        print(string.format("\n%d reflected properties could not be read (usually internal or protected, harmless):", #unreadable))
+        for _, key in ipairs(unreadable) do
+            print("  " .. key)
+        end
+    end
+
+    if problems == 0 then
+        print("\nEverything in this place can be stored.")
     end
 end)
 

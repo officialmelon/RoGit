@@ -15,7 +15,7 @@ local objects_dir_cache = {}
 
 --// Objects are immutable (addressed by their hash), so both of these caches are always safe.
 --// The sha cache avoids re-hashing identical content, which is by far the most expensive part of `status`.
-local SHA_CACHE_BYTES = 32 * 1024 * 1024
+local SHA_CACHE_BYTES = 64 * 1024 * 1024
 local sha_cache = {}
 local sha_cache_bytes = 0
 
@@ -39,7 +39,7 @@ function Handlers.hash_object(typeName, content)
     sha = hashlib.sha1(typeName .. " " .. tostring(#content) .. "\0" .. content)
 
     local size = #content
-    if size <= SHA_CACHE_BYTES / 16 then
+    if size <= SHA_CACHE_BYTES / 8 then
         if sha_cache_bytes + size > SHA_CACHE_BYTES then
             table.clear(sha_cache)
             sha_cache_bytes = 0

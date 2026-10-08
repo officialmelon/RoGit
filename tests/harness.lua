@@ -103,6 +103,7 @@ end
 ---------------------------------------------------------------- Instances
 local Services = {}
 local classParents = {
+	EditableImage = "Instance", EditableMesh = "Instance", ImageLabel = "Instance", Path2D = "Instance",
 	Folder = "Instance", StringValue = "Instance", Part = "Instance",
 	Script = "LuaSourceContainer", LocalScript = "LuaSourceContainer", ModuleScript = "LuaSourceContainer",
 	LuaSourceContainer = "Instance", Workspace = "Instance",
@@ -131,23 +132,23 @@ function methods.FindFirstChild(self, name)
 	for _, c in ipairs(rawget(self, "_children")) do if rawget(c, "Name") == name then return c end end
 end
 function methods.Destroy(self)
-	local p = rawget(self, "Parent")
+	local p = rawget(self, "_parent")
 	if p then
 		local ch = rawget(p, "_children")
 		table.remove(ch, table.find(ch, self))
 	end
-	rawset(self, "Parent", nil)
+	rawset(self, "_parent", nil)
 	for _, c in ipairs(table.clone(rawget(self, "_children"))) do methods.Destroy(c) end
 end
 function methods.ClearAllChildren(self) for _, c in ipairs(table.clone(rawget(self, "_children"))) do methods.Destroy(c) end end
 function methods.GetFullName(self)
-	local p = rawget(self, "Parent")
+	local p = rawget(self, "_parent")
 	if p and p ~= game then return methods.GetFullName(p) .. "." .. rawget(self, "Name") end
 	return rawget(self, "Name")
 end
 function methods.IsDescendantOf(self, anc)
-	local p = rawget(self, "Parent")
-	while p do if p == anc then return true end p = rawget(p, "Parent") end
+	local p = rawget(self, "_parent")
+	while p do if p == anc then return true end p = rawget(p, "_parent") end
 	return false
 end
 function methods.GetAttribute(self, k) return rawget(self, "_attrs")[k] end
@@ -156,9 +157,16 @@ function methods.GetAttributes(self) return table.clone(rawget(self, "_attrs")) 
 function methods.GetTags(self) return table.clone(rawget(self, "_tags")) end
 function methods.AddTag(self, t) table.insert(rawget(self, "_tags"), t) end
 
+-- class specific methods, filled in by tests (e.g. EditableImage:ReadPixelsBuffer)
+classMethods = {}
+extraProps = {} -- class -> list of reflected property names
+
 InstMT.__index = function(self, k)
 	local m = methods[k]
 	if m then return m end
+	if k == "Parent" then return rawget(self, "_parent") end
+	local cm = classMethods[rawget(self, "ClassName")]
+	if cm and cm[k] then return cm[k] end
 	local v = rawget(self, k)
 	if v ~= nil then return v end
 	local f = methods.FindFirstChild(self, k)
@@ -167,9 +175,9 @@ InstMT.__index = function(self, k)
 end
 InstMT.__newindex = function(self, k, v)
 	if k == "Parent" then
-		local old = rawget(self, "Parent")
+		local old = rawget(self, "_parent")
 		if old then local ch = rawget(old, "_children"); table.remove(ch, table.find(ch, self)) end
-		rawset(self, "Parent", v)
+		rawset(self, "_parent", v)
 		if v then table.insert(rawget(v, "_children"), self) end
 	else
 		rawset(self, k, v)
@@ -188,6 +196,12 @@ local function newInstance(className)
 	return inst
 end
 
+reflection = { GetPropertiesOfClass = function(_, cls)
+	local list = { {Name = "Name", Serialized = true}, {Name = "Value", Serialized = (cls == "StringValue")}, {Name = "Parent", Serialized = true} }
+	for _, name in ipairs(extraProps[cls] or {}) do table.insert(list, {Name = name, Serialized = true}) end
+	return list
+end }
+
 game = newInstance("DataModel")
 rawset(game, "Name", "Game")
 function game.GetService(self, name)
@@ -195,9 +209,7 @@ function game.GetService(self, name)
 	if s then return s end
 	if name == "HttpService" then return HttpServiceMock end
 	if name == "ReflectionService" then
-		return { GetPropertiesOfClass = function(_, cls)
-			return { {Name = "Name", Serialized = true}, {Name = "Value", Serialized = (cls == "StringValue")}, {Name = "Parent", Serialized = true} }
-		end }
+		return reflection
 	end
 	if name == "RunService" then return { IsStudio = function() return true end } end
 	local svc = newInstance(name)
@@ -220,16 +232,17 @@ local rawGetService = methods.GetService
 methods.GetService = function(self, name)
 	if name == "HttpService" then return HttpServiceMock end
 	if name == "ReflectionService" then
-		return { GetPropertiesOfClass = function(_, cls)
-			return { {Name = "Name", Serialized = true}, {Name = "Value", Serialized = (cls == "StringValue")} }
-		end }
+		return reflection
 	end
 	return rawGetService(self, name)
 end
 
 Instance = { new = function(c) return newInstance(c) end }
 typeof = function(v)
-	if type(v) == "table" and getmetatable(v) == InstMT then return "Instance" end
+	if type(v) == "table" then
+		if getmetatable(v) == InstMT then return "Instance" end
+		if rawget(v, "__typeof") then return v.__typeof end
+	end
 	return type(v)
 end
 warn = function(...) print("WARN:", ...) end

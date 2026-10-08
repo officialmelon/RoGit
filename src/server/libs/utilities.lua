@@ -21,6 +21,48 @@ function Utilities.roYield()
 end
 
 --[[
+Turns an instance name into a safe path segment. Names can hold characters that can't be part of a git tree entry:
+"/" (the path separator), nothing at all, "." / ".." and ".git".
+They are written as %2F, %00 and %2E, and a "%" that could be mistaken for one of those becomes %25.
+Ordinary names are left alone, so existing repositories keep working.
+]]
+function Utilities.escape_name(name: string): string
+    if name == "" then return "%00" end
+
+    name = name:gsub("%%(%x%x)", function(hex)
+        local upper = hex:upper()
+        if upper == "2F" or upper == "25" or upper == "00" or upper == "2E" then
+            return "%25" .. hex
+        end
+        return nil
+    end)
+    name = name:gsub("/", "%%2F")
+
+    local lower = name:lower()
+    if name == "." or name == ".." or lower == ".git" or lower == ".properties" then
+        name = "%2E" .. name:sub(2)
+    end
+    return name
+end
+
+--[[
+Reverse of escape_name.
+]]
+function Utilities.unescape_name(segment: string): string
+    if segment == "%00" then return "" end
+    if not segment:find("%", 1, true) then return segment end
+
+    local result = segment:gsub("%%(%x%x)", function(hex)
+        local upper = hex:upper()
+        if upper == "2F" then return "/" end
+        if upper == "25" then return "%" end
+        if upper == "2E" then return "." end
+        return nil
+    end)
+    return result
+end
+
+--[[
 Parses a path into a Roblox Instance.
 Returns the instance, the last segment, and the segments.
 ]]
@@ -48,9 +90,10 @@ function Utilities.parse_path(path)
         local baseName, indexStr = segment:match("^(.*) %[(%d+)%]$")
         if indexStr then
             local targetIndex = tonumber(indexStr)
+            local unescapedBase = Utilities.unescape_name(baseName)
             local children = {}
             for _, child in ipairs(currObj:GetChildren()) do
-                if child.Name == baseName then
+                if child.Name == unescapedBase then
                     table.insert(children, child)
                 end
             end
@@ -64,7 +107,7 @@ function Utilities.parse_path(path)
             
             currObj = children[targetIndex]
         else
-            currObj = currObj:FindFirstChild(segment)
+            currObj = currObj:FindFirstChild(Utilities.unescape_name(segment))
         end
         
         if not currObj then

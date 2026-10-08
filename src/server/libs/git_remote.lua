@@ -279,7 +279,12 @@ function Remote.resolve_instance_refs()
         local target = guid_map[refPending.targetGuid]
         if target then
             pcall(function()
-                refPending.inst[refPending.prop] = target
+                --// Content properties (e.g. an ImageLabel showing an EditableImage) wrap the object
+                if refPending.asMesh then
+                    applyMeshContent(refPending.inst, Content.fromObject(target))
+                else
+                    refPending.inst[refPending.prop] = refPending.asContent and Content.fromObject(target) or target
+                end
             end)
         end
     end
@@ -290,8 +295,26 @@ end
 --[[
 applies properties to an instance.
 ]]
+--[[
+Gives a MeshPart the mesh behind `content` (a Content value). MeshParts can't simply be assigned a new mesh.
+]]
+local function applyMeshContent(meshPart, content)
+    local AssetService = game:GetService("AssetService")
+    local loaded = AssetService:CreateMeshPartAsync(content, {
+        CollisionFidelity = meshPart.CollisionFidelity,
+        RenderFidelity = meshPart.RenderFidelity,
+    })
+    meshPart:ApplyMesh(loaded)
+end
+
 function Remote.applyProperties(instance, props)
     Utilities.roYield()
+
+    local hasMeshId = false
+    for _, propData in ipairs(props) do
+        if propData.name == "MeshId" then hasMeshId = true break end
+    end
+
     for _, propData in ipairs(props) do
         if propData.name == "_attributes" and propData.valueType == "_attributes" then
             if type(propData.value) == "table" and propData.value[1] and type(propData.value[1]) == "table" and propData.value[1].name then
@@ -320,8 +343,21 @@ function Remote.applyProperties(instance, props)
             for _, tag in ipairs(propData.value) do
                 pcall(function() instance:AddTag(tag) end)
             end
+        elseif instances.is_pseudo_property(propData) then
+            instances.apply_pseudo_property(instance, propData)
         elseif propData.name ~= "ClassName" and propData.name ~= "Parent" then
-            if propData.valueType == "Instance" then
+            if propData.valueType == "Content" and type(propData.value) == "table" and type(propData.value.Object) == "table" then
+                --// points at another instance, link it once everything exists
+                if propData.value.Object.Guid then
+                    table.insert(pending_instance_refs, {
+                        inst = instance,
+                        prop = propData.name,
+                        targetGuid = propData.value.Object.Guid,
+                        asContent = true,
+                        asMesh = propData.name == "MeshContent" and instance:IsA("MeshPart"),
+                    })
+                end
+            elseif propData.valueType == "Instance" then
                 if type(propData.value) == "table" and propData.value.Guid then
                     table.insert(pending_instance_refs, {
                         inst = instance,
@@ -333,11 +369,22 @@ function Remote.applyProperties(instance, props)
                 local val = instances.deserialize_property(propData.value, propData.valueType)
                 if val ~= nil then
                     if propData.name == "MeshId" and instance:IsA("MeshPart") then
-                        pcall(function()
-                            local InsertService = game:GetService("InsertService")
-                            local loadedMesh = InsertService:CreateMeshPartAsync(val, instance.CollisionFidelity, instance.RenderFidelity)
-                            instance:ApplyMesh(loadedMesh)
-                        end)
+                        --// downloading a mesh is slow, don't do it when it's already the right one
+                        if instance.MeshId ~= val then
+                            pcall(function()
+                                local InsertService = game:GetService("InsertService")
+                                local loadedMesh = InsertService:CreateMeshPartAsync(val, instance.CollisionFidelity, instance.RenderFidelity)
+                                instance:ApplyMesh(loadedMesh)
+                            end)
+                        end
+                    elseif propData.name == "MeshContent" and instance:IsA("MeshPart") then
+                        if not hasMeshId then
+                            pcall(function()
+                                local current = instance.MeshContent
+                                if current.SourceType == Enum.ContentSourceType.Uri and current.Uri == val.Uri then return end
+                                applyMeshContent(instance, val)
+                            end)
+                        end
                     elseif propData.name == "Source" and instance:IsA("LuaSourceContainer") then
                         pcall(function()
                             (instance :: any).Source = val
@@ -423,13 +470,15 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
         local mode = content:sub(pos, spacePos - 1)
 
         local nullPos = content:find("\0", spacePos, true)
-        local name = content:sub(spacePos + 1, nullPos - 1)
+        local entryName = content:sub(spacePos + 1, nullPos - 1)
+        --// tree entries use escaped names (see Utilities.escape_name), the instance gets its real name back
+        local name = Utilities.unescape_name(entryName)
 
         local rawSha = content:sub(nullPos + 1, nullPos + 20)
         local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
         pos = nullPos + 21
 
-        local entryPath = treePath and (treePath .. "/" .. name) or name
+        local entryPath = treePath and (treePath .. "/" .. entryName) or entryName
 
         if mode == "40000" then
             local childProps = Remote.peekPropertiesBlob(objectsBySha, sha)
@@ -449,8 +498,8 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
             if not target then
                 isNew = true
                 if className then
-                    local ok, inst = pcall(Instance.new, className)
-                    if ok then
+                    local inst = instances.create_instance(className, childProps)
+                    if inst then
                         target = inst
                         target.Name = name
                     else
@@ -480,7 +529,7 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
             local blobObj = objectsBySha[sha]
             if not blobObj then
                 continue
-            elseif name == ".properties" then
+            elseif entryName == ".properties" then
                 local ok, props = pcall(function() return HttpService:JSONDecode(blobObj.content) end)
                 if ok then
                     Remote.applyProperties(parent, props)
@@ -505,8 +554,8 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
                 local isNew = false
                 if not newInstance then
                     isNew = true
-                    local ok2, inst = pcall(Instance.new, className)
-                    if not ok2 then
+                    local inst = instances.create_instance(className, props)
+                    if not inst then
                         continue
                     end
                     newInstance = inst

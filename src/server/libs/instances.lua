@@ -10,6 +10,21 @@ local bash = require(script.Parent.Parent.bash)
 
 local ROGIT_ID = "_rogit_id"
 
+--// While `git doctor` runs this collects everything the serializer could not handle (see serialize_instance).
+local active_report = nil
+
+local function note(kind, className, propName, detail)
+    if not active_report then return end
+    local bucket = active_report[kind]
+    local key = className .. "." .. propName
+    local entry = bucket[key]
+    if not entry then
+        entry = {count = 0, detail = detail}
+        bucket[key] = entry
+    end
+    entry.count += 1
+end
+
 --[[
 Helper to round numbers to avoid floating point jitter in Git.
 ]]
@@ -102,12 +117,24 @@ function instances.serialize_property(prop)
         end
         r = {Guid = guid}
     elseif type == "Content" then
-        r = tostring(prop)
+        --// Content is either nothing, a uri (rbxassetid://..) or a reference to an EditableImage/EditableMesh
+        local ok, result = pcall(function()
+            local sourceType = prop.SourceType
+            if sourceType == Enum.ContentSourceType.Uri then
+                return {Uri = prop.Uri}
+            elseif sourceType == Enum.ContentSourceType.Object and typeof(prop.Object) == "Instance" then
+                return {Object = instances.serialize_property(prop.Object)}
+            end
+            return {}
+        end)
+        if not ok then return nil, type end
+        r = result
+    elseif type == "buffer" then
+        r = {__b64 = hashlib.bin_to_base64(buffer.tostring(prop))}
     else
-        --// Anything JSON can't encode falls back to its string form so one odd property can't break a whole instance.
-        local luaType = rawTypeOf(prop)
-        if luaType ~= "string" and luaType ~= "number" and luaType ~= "boolean" and luaType ~= "table" then
-            r = tostring(prop)
+        if type ~= "boolean" and type ~= "table" then
+            --// A datatype we don't know how to store. Storing its tostring() would only save something we can never load back.
+            return nil, type
         end
     end
 
@@ -119,7 +146,19 @@ end
 ]]
 function instances.deserialize_property(prop, propType)
     if type(prop) == "table" and prop.__b64 ~= nil then
-        return hashlib.base64_to_bin(prop.__b64)
+        local bin = hashlib.base64_to_bin(prop.__b64)
+        return propType == "buffer" and buffer.fromstring(bin) or bin
+    end
+
+    if propType == "Content" then
+        if type(prop) == "string" then
+            --// older commits stored content as a plain string
+            return prop ~= "" and Content.fromUri(prop) or Content.none
+        elseif type(prop) == "table" and prop.Uri then
+            return Content.fromUri(prop.Uri)
+        end
+        --// object references are linked later, once every instance exists (see resolve_instance_refs)
+        return Content.none
     end
 
     if propType == "BrickColor" then
@@ -233,51 +272,362 @@ local function get_class_properties(className)
 end
 
 --[[
+Some instances keep their data outside of properties (pixels, vertices...), it is only reachable through methods.
+Each handler stores that data in one extra pseudo property (`_editableImage`, ...) of the instance's blob:
+  read(instance)         -> value (JSON friendly table)
+  write(instance, value) -> restores it
+  create(value)          -> optional, builds the instance when Instance.new can't
+]]
+local SPECIAL = {}
+local NONE = 0xFFFFFFFF
+
+--// A 16 MB image is 2048x2048, anything bigger would make commits unusably slow.
+local MAX_IMAGE_BYTES = 16 * 1024 * 1024
+
+local function id_list(...)
+    local first = ...
+    if type(first) == "table" then return first end
+    return {...}
+end
+
+local function sorted_ids(list)
+    local ids = table.clone(list)
+    table.sort(ids)
+    return ids
+end
+
+--// ---------------------------------------------------------------- EditableImage
+--// The pixels (RGBA, 4 bytes each) are expensive to base64, so the result is reused while the pixels are unchanged.
+local image_cache = setmetatable({}, {__mode = "k"})
+
+local function fingerprint(buf)
+    local len = buffer.len(buf)
+    local hash = len
+    for offset = 0, len - 4, 4 do
+        hash = (hash * 31 + buffer.readu32(buf, offset)) % 4294967296
+    end
+    return hash
+end
+
+SPECIAL.EditableImage = {
+    key = "_editableImage",
+
+    read = function(image)
+        local size = image.Size
+        local width, height = math.floor(size.X), math.floor(size.Y)
+        if width <= 0 or height <= 0 then
+            return {Width = math.max(width, 0), Height = math.max(height, 0)}
+        end
+        assert(width * height * 4 <= MAX_IMAGE_BYTES, string.format("image is too large to store (%dx%d, the limit is 2048x2048)", width, height))
+
+        local pixels = image:ReadPixelsBuffer(Vector2.new(0, 0), Vector2.new(width, height))
+        local hash = fingerprint(pixels)
+
+        local cached = image_cache[image]
+        if cached and cached.hash == hash and cached.width == width and cached.height == height then
+            return cached.value
+        end
+
+        local value = {Width = width, Height = height, Data = hashlib.bin_to_base64(buffer.tostring(pixels))}
+        image_cache[image] = {hash = hash, width = width, height = height, value = value}
+        return value
+    end,
+
+    write = function(image, value)
+        local width, height = value.Width, value.Height
+        pcall(function() image.Size = Vector2.new(width, height) end)
+        if not value.Data or width <= 0 or height <= 0 then return end
+
+        --// don't touch an image that already matches (checking out is a lot cheaper then)
+        local ok, current = pcall(SPECIAL.EditableImage.read, image)
+        if ok and current.Data == value.Data then return end
+
+        image:WritePixelsBuffer(Vector2.new(0, 0), Vector2.new(width, height), buffer.fromstring(hashlib.base64_to_bin(value.Data)))
+    end,
+
+    create = function(value)
+        local width, height = value and value.Width or 1, value and value.Height or 1
+        return game:GetService("AssetService"):CreateEditableImage({Size = Vector2.new(math.max(width, 1), math.max(height, 1))})
+    end,
+}
+
+--// ---------------------------------------------------------------- EditableMesh
+--// Layout of the packed data (all little endian 32 bit):
+--//   positions (3 floats) | normals (3 floats) | uvs (2 floats) | colors (3 floats + alpha) | faces (12 uints)
+--// A face holds 3 vertex, 3 normal, 3 uv and 3 color indexes into those lists (0xFFFFFFFF = not set).
+SPECIAL.EditableMesh = {
+    key = "_editableMesh",
+
+    read = function(mesh)
+        local vertexIds = sorted_ids(id_list(mesh:GetVertices()))
+        local normalIds = sorted_ids(id_list(mesh:GetNormals()))
+        local uvIds = sorted_ids(id_list(mesh:GetUVs()))
+        local colorIds = sorted_ids(id_list(mesh:GetColors()))
+        local faceIds = sorted_ids(id_list(mesh:GetFaces()))
+
+        local function index_of(ids)
+            local map = {}
+            for i, id in ipairs(ids) do map[id] = i - 1 end
+            return map
+        end
+        local vertexIndex, normalIndex, uvIndex, colorIndex = index_of(vertexIds), index_of(normalIds), index_of(uvIds), index_of(colorIds)
+
+        local counts = {V = #vertexIds, N = #normalIds, U = #uvIds, C = #colorIds, F = #faceIds}
+        local floats = counts.V * 3 + counts.N * 3 + counts.U * 2 + counts.C * 4
+        local buf = buffer.create((floats + counts.F * 12) * 4)
+        local cursor = 0
+
+        local function writeFloat(n)
+            buffer.writef32(buf, cursor, n)
+            cursor += 4
+        end
+        local function writeUint(n)
+            buffer.writeu32(buf, cursor, n)
+            cursor += 4
+        end
+
+        for _, id in ipairs(vertexIds) do
+            local p = mesh:GetPosition(id)
+            writeFloat(p.X); writeFloat(p.Y); writeFloat(p.Z)
+        end
+        for _, id in ipairs(normalIds) do
+            local n = mesh:GetNormal(id)
+            writeFloat(n.X); writeFloat(n.Y); writeFloat(n.Z)
+        end
+        for _, id in ipairs(uvIds) do
+            local uv = mesh:GetUV(id)
+            writeFloat(uv.X); writeFloat(uv.Y)
+        end
+        for _, id in ipairs(colorIds) do
+            local c = mesh:GetColor(id)
+            writeFloat(c.R); writeFloat(c.G); writeFloat(c.B)
+            writeFloat(mesh:GetColorAlpha(id))
+        end
+
+        local function writeCorners(ids, map)
+            for corner = 1, 3 do
+                local id = ids and ids[corner]
+                writeUint(id ~= nil and map[id] or NONE)
+            end
+        end
+        for _, face in ipairs(faceIds) do
+            writeCorners(id_list(mesh:GetFaceVertices(face)), vertexIndex)
+            writeCorners(select(2, pcall(function() return id_list(mesh:GetFaceNormals(face)) end)), normalIndex)
+            writeCorners(select(2, pcall(function() return id_list(mesh:GetFaceUVs(face)) end)), uvIndex)
+            writeCorners(select(2, pcall(function() return id_list(mesh:GetFaceColors(face)) end)), colorIndex)
+        end
+
+        counts.Data = hashlib.bin_to_base64(buffer.tostring(buf))
+        return counts
+    end,
+
+    write = function(mesh, value)
+        local ok, current = pcall(SPECIAL.EditableMesh.read, mesh)
+        if ok and current.Data == value.Data then return end
+
+        --// start from an empty mesh
+        for _, id in ipairs(id_list(mesh:GetVertices())) do pcall(mesh.RemoveVertex, mesh, id) end
+        for _, id in ipairs(id_list(mesh:GetNormals())) do pcall(mesh.RemoveNormal, mesh, id) end
+        for _, id in ipairs(id_list(mesh:GetUVs())) do pcall(mesh.RemoveUV, mesh, id) end
+        for _, id in ipairs(id_list(mesh:GetColors())) do pcall(mesh.RemoveColor, mesh, id) end
+
+        local buf = buffer.fromstring(hashlib.base64_to_bin(value.Data))
+        local cursor = 0
+        local function readFloat()
+            local n = buffer.readf32(buf, cursor)
+            cursor += 4
+            return n
+        end
+        local function readUint()
+            local n = buffer.readu32(buf, cursor)
+            cursor += 4
+            return n
+        end
+
+        local vertexIds, normalIds, uvIds, colorIds = {}, {}, {}, {}
+        for i = 1, value.V do vertexIds[i] = mesh:AddVertex(Vector3.new(readFloat(), readFloat(), readFloat())) end
+        for i = 1, value.N do normalIds[i] = mesh:AddNormal(Vector3.new(readFloat(), readFloat(), readFloat())) end
+        for i = 1, value.U do uvIds[i] = mesh:AddUV(Vector2.new(readFloat(), readFloat())) end
+        for i = 1, value.C do
+            local color = Color3.new(readFloat(), readFloat(), readFloat())
+            colorIds[i] = mesh:AddColor(color, readFloat())
+        end
+
+        local function readCorners(map)
+            local ids, complete = {}, true
+            for corner = 1, 3 do
+                local index = readUint()
+                if index == NONE then
+                    complete = false
+                else
+                    ids[corner] = map[index + 1]
+                end
+            end
+            return complete and ids or nil
+        end
+
+        for _ = 1, value.F do
+            local vertices = readCorners(vertexIds)
+            local normals = readCorners(normalIds)
+            local uvs = readCorners(uvIds)
+            local colors = readCorners(colorIds)
+            if vertices then
+                local face = mesh:AddTriangle(vertices[1], vertices[2], vertices[3])
+                if normals then pcall(mesh.SetFaceNormals, mesh, face, normals) end
+                if uvs then pcall(mesh.SetFaceUVs, mesh, face, uvs) end
+                if colors then pcall(mesh.SetFaceColors, mesh, face, colors) end
+            end
+        end
+    end,
+
+    create = function()
+        return game:GetService("AssetService"):CreateEditableMesh()
+    end,
+}
+
+--// ---------------------------------------------------------------- Path2D
+SPECIAL.Path2D = {
+    key = "_controlPoints",
+
+    read = function(path)
+        local points = {}
+        for _, point in ipairs(path:GetControlPoints()) do
+            table.insert(points, {
+                Position = instances.serialize_property(point.Position),
+                LeftTangent = instances.serialize_property(point.LeftTangent),
+                RightTangent = instances.serialize_property(point.RightTangent),
+            })
+        end
+        return {Points = points}
+    end,
+
+    write = function(path, value)
+        local points = {}
+        for _, point in ipairs(value.Points or {}) do
+            table.insert(points, Path2DControlPoint.new(
+                instances.deserialize_property(point.Position, "UDim2"),
+                instances.deserialize_property(point.LeftTangent, "UDim2"),
+                instances.deserialize_property(point.RightTangent, "UDim2")
+            ))
+        end
+        path:SetControlPoints(points)
+    end,
+}
+
+--// Classes where roGit knows it can't store everything. `git doctor` lists these.
+instances.KNOWN_LIMITS = {
+    Terrain = "terrain voxels (the actual landscape) are not stored, only the terrain's settings",
+}
+
+--// Properties that are real and settable but missing from the reflected "serialized" list.
+local EXTRA_PROPERTIES = {
+    {class = "Model", names = {"WorldPivot"}},
+    {class = "BasePart", names = {"PivotOffset"}},
+}
+
+local PSEUDO_KEYS = {}
+for _, handler in pairs(SPECIAL) do
+    PSEUDO_KEYS[handler.key] = handler
+end
+
+--[[
+Creates an instance of a class. Most come from Instance.new, a few (EditableImage/EditableMesh) only exist through AssetService.
+`props` is the decoded property list the instance is about to receive. Returns nil if the class can't be created.
+]]
+function instances.create_instance(className, props)
+    local ok, inst = pcall(Instance.new, className)
+    if ok then return inst end
+
+    local handler = SPECIAL[className]
+    if handler and handler.create then
+        local value = nil
+        for _, prop in ipairs(props or {}) do
+            if prop.name == handler.key then value = prop.value end
+        end
+        local created, result = pcall(handler.create, value)
+        if created and typeof(result) == "Instance" then return result end
+    end
+    return nil
+end
+
+--[[
+Is this property entry one of the pseudo properties above (and not something to assign with `instance[name] = value`)?
+]]
+function instances.is_pseudo_property(propData)
+    return PSEUDO_KEYS[propData.name] ~= nil and propData.valueType == propData.name
+end
+
+--[[
+Restores the data of a pseudo property. Returns true on success.
+]]
+function instances.apply_pseudo_property(instance, propData)
+    local handler = PSEUDO_KEYS[propData.name]
+    if not handler or type(propData.value) ~= "table" then return false end
+    local ok, err = pcall(handler.write, instance, propData.value)
+    if not ok then
+        warn("roGit: couldn't restore " .. instance.ClassName .. " '" .. instance.Name .. "': " .. tostring(err))
+    end
+    return ok
+end
+
+--[[
 Serializes instance & instance properties
 ]]
-function instances.serialize_instance(instance)
+function instances.serialize_instance(instance, report)
     assert(typeof(instance) == "Instance", "no instance passed or instance is not a Instance")
 
+    active_report = report
+    local className = instance.ClassName
     local instanceProperties = {}
 
     table.insert(instanceProperties, {
         name = "ClassName",
-        value = instance.ClassName,
+        value = className,
         valueType = "string"
     })
 
     local added = {}
-    for _, entry in ipairs(get_class_properties(instance.ClassName)) do
-        local publicName = entry.publicName
-        if not added[publicName] then
-            pcall(function()
-                local val = instance[publicName]
-                if val == nil and publicName ~= entry.internalName then
-                    val = instance[entry.internalName]
-                end
+    local function add_property(publicName, internalName)
+        if added[publicName] then return end
+        local ok, err = pcall(function()
+            local val = instance[publicName]
+            if val == nil and internalName and publicName ~= internalName then
+                val = instance[internalName]
+            end
 
-                if val ~= nil then
-                    added[publicName] = true
-                    table.insert(instanceProperties, {
-                        name = publicName,
-                        value = instances.serialize_property(val),
-                        valueType = typeof(val)
-                    })
+            if val ~= nil then
+                local serialized, unsupportedType = instances.serialize_property(val)
+                if serialized == nil then
+                    note("unsupported", className, publicName, unsupportedType)
+                    return
                 end
-            end)
+                added[publicName] = true
+                table.insert(instanceProperties, {
+                    name = publicName,
+                    value = serialized,
+                    valueType = typeof(val)
+                })
+            end
+        end)
+        if not ok then
+            note("unreadable", className, publicName, tostring(err))
+        end
+    end
+
+    for _, entry in ipairs(get_class_properties(className)) do
+        add_property(entry.publicName, entry.internalName)
+    end
+    for _, extra in ipairs(EXTRA_PROPERTIES) do
+        if instance:IsA(extra.class) then
+            for _, name in ipairs(extra.names) do
+                add_property(name)
+            end
         end
     end
 
     if instance:IsA("LuaSourceContainer") then
         pcall(function()
-            local found = false
-            for _, prop in ipairs(instanceProperties) do
-                if prop.name == "Source" then
-                    found = true
-                    break
-                end
-            end
-            if not found then
+            if not added.Source then
                 local val = (instance :: any).Source
                 if val ~= nil then
                     table.insert(instanceProperties, {
@@ -289,8 +639,22 @@ function instances.serialize_instance(instance)
             end
         end)
     end
-    
-    --// Serialization is now handled inside the loop for standard props
+
+    --// Data that only exists behind methods (pixels, meshes, ...)
+    local handler = SPECIAL[className]
+    if handler then
+        local ok, value = pcall(handler.read, instance)
+        if ok then
+            table.insert(instanceProperties, {name = handler.key, value = value, valueType = handler.key})
+            note("special", className, "", handler.key)
+        else
+            note("failed", className, handler.key, tostring(value))
+            warn("roGit: couldn't read the data of " .. className .. " '" .. instance.Name .. "': " .. tostring(value))
+        end
+    end
+    if instances.KNOWN_LIMITS[className] then
+        note("limits", className, "", instances.KNOWN_LIMITS[className])
+    end
 
     local attributes = instance:GetAttributes()
     local attrKeys = {}
@@ -300,11 +664,16 @@ function instances.serialize_instance(instance)
     local attrData = {}
     for _, k in ipairs(attrKeys) do
         local v = attributes[k]
-        table.insert(attrData, {
-            name = k,
-            value = instances.serialize_property(v),
-            valueType = typeof(v)
-        })
+        local serialized, unsupportedType = instances.serialize_property(v)
+        if serialized == nil then
+            note("unsupported", className, "@" .. k, unsupportedType)
+        else
+            table.insert(attrData, {
+                name = k,
+                value = serialized,
+                valueType = typeof(v)
+            })
+        end
     end
 
     if #attrData > 0 then
@@ -330,6 +699,7 @@ function instances.serialize_instance(instance)
         return a.name < b.name
     end)
 
+    active_report = nil
     return HttpService:JSONEncode(instanceProperties)
 end
 
@@ -384,7 +754,7 @@ function instances.stage_recursive(instance, index, seen_ids, perf, parentVirtua
 
     local myVirtualPath = instance.Name
     if parentVirtualPath then
-        myVirtualPath = parentVirtualPath .. "/" .. instance.Name
+        myVirtualPath = parentVirtualPath .. "/" .. Utilities.escape_name(instance.Name)
     end
     
     -- Root services passed to stage_recursive initially get their own name as path
@@ -445,9 +815,9 @@ function instances.stage_recursive(instance, index, seen_ids, perf, parentVirtua
         local n = child.Name
         current_indices[n] = (current_indices[n] or 0) + 1
         
-        local childVirtualName = n
+        local childVirtualName = Utilities.escape_name(n)
         if sibling_counts[n] > 1 then
-            childVirtualName = n .. " [" .. tostring(current_indices[n]) .. "]"
+            childVirtualName = childVirtualName .. " [" .. tostring(current_indices[n]) .. "]"
         end
         
         local childVirtualPath = myVirtualPath .. "/" .. childVirtualName

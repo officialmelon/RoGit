@@ -12,8 +12,6 @@ local config = require(script.Parent.config)
 local arguments = require(script.Parent.arguments)
 local git_remote = require(script.Parent.libs.git_remote)
 
-local hashlib = require(script.Parent.libs.hashlib)
-local _zlib = require(script.Parent.libs.zlib)
 local bash = require(script.Parent.bash)
 local git_proto = require(script.Parent.libs.git_proto)
 local ini_parser = require(script.Parent.libs.ini_parser)
@@ -23,9 +21,9 @@ local Utilities = require(script.Parent.libs.utilities)
 local Auth = require(script.Parent.libs.localstore)
 local Requests = require(script.Parent.libs.requests)
 local Remote = require(script.Parent.libs.git_remote)
+local merge = require(script.Parent.libs.merge)
+local diff = require(script.Parent.libs.diff)
 
-local _ignore_patterns = nil
-local terminal_prompt_callback = nil
 
 local ROGIT_ID = "_rogit_id"
 local ACTIVE_PLUGIN = nil
@@ -42,7 +40,6 @@ end
 Replace callback for the prompt
 ]]
 function git.replacePromptCallback(prompt_cb)
-    terminal_prompt_callback = prompt_cb
     Requests.setPromptCallback(prompt_cb)
 end
 
@@ -67,7 +64,44 @@ local function is_valid_branch_name(name)
 end
 
 local function compute_blob_sha(content)
-    return hashlib.sha1("blob " .. tostring(#content) .. "\0" .. content)
+    return Handlers.blob_sha(content)
+end
+
+--[[
+Reads the index as of the last commit (used to tell staged changes apart).
+]]
+local function read_last_index()
+    local raw = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
+    if raw and raw ~= "" then
+        return HttpService:JSONDecode(raw)
+    end
+    return {}
+end
+
+--[[
+Builds the "Name <email>" signature used for commits and tags.
+]]
+local function make_signature()
+    local user_name = Auth.getConfigValue("user_name") or Auth.getConfigValue("user.name") or "roGit"
+    local user_email = Auth.getConfigValue("user_email") or Auth.getConfigValue("user.email") or "ro-git@example.com"
+    return string.format("%s <%s> %d +0000", user_name, user_email, os.time())
+end
+
+--[[
+Writes a commit object and moves HEAD (and the branch it points at) to it.
+]]
+local function create_commit(tree_sha, parents, message)
+    local lines = {"tree " .. tree_sha}
+    for _, parent in ipairs(parents) do
+        table.insert(lines, "parent " .. parent)
+    end
+    local signature = make_signature()
+    table.insert(lines, "author " .. signature)
+    table.insert(lines, "committer " .. signature)
+
+    local sha = Handlers.write_object("commit", table.concat(lines, "\n") .. "\n\n" .. message)
+    Handlers.update_ref("HEAD", sha)
+    return sha
 end
 
 --[[
@@ -136,16 +170,86 @@ local function is_ancestor_commit(ancestor_sha, descendant_sha)
 end
 
 --[[
+Returns the children of an instance that roGit tracks (ignores .rogitignore'd instances and the .git folder),
+in the same deterministic order used when staging. Duplicate names get a stable id so they can be told apart.
+]]
+local function tracked_children(parent, seen_ids)
+    local gitRoot = bash.getGitFolderRoot()
+    local children = {}
+    local counts = {}
+    for _, child in ipairs(parent:GetChildren()) do
+        if child ~= gitRoot and not (gitRoot and child:IsDescendantOf(gitRoot)) and not Handlers.is_ignored(child:GetFullName()) then
+            table.insert(children, child)
+            counts[child.Name] = (counts[child.Name] or 0) + 1
+        end
+    end
+
+    for _, child in ipairs(children) do
+        if counts[child.Name] > 1 then
+            local id = child:GetAttribute(ROGIT_ID)
+            if not id or id == "" or seen_ids[id] then
+                id = HttpService:GenerateGUID(false)
+                child:SetAttribute(ROGIT_ID, id)
+            end
+            seen_ids[id] = true
+        end
+    end
+
+    table.sort(children, function(a, b)
+        if a.Name ~= b.Name then
+            return a.Name < b.Name
+        end
+        return (a:GetAttribute(ROGIT_ID) or "") < (b:GetAttribute(ROGIT_ID) or "")
+    end)
+
+    return children, counts
+end
+
+--[[
+Finds every tracked instance that is not part of the index yet. Returns a set of virtual paths.
+]]
+local function collect_untracked(index)
+    local untracked = {}
+    local seen_ids = {}
+
+    local function traverse(children, counts, path_prefix)
+        local seen_local = {}
+
+        for _, child in ipairs(children) do
+            Utilities.roYield()
+            local virtualName = child.Name
+            if counts[child.Name] > 1 then
+                seen_local[child.Name] = (seen_local[child.Name] or 0) + 1
+                virtualName = child.Name .. " [" .. tostring(seen_local[child.Name]) .. "]"
+            end
+
+            local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
+            local grandchildren, grandCounts = tracked_children(child, seen_ids)
+
+            local index_path = #grandchildren > 0 and (my_path .. "/.properties") or my_path
+            if not index[index_path] and not index[my_path] then
+                untracked[my_path] = true
+            end
+
+            traverse(grandchildren, grandCounts, my_path)
+        end
+    end
+
+    for _, service in ipairs(bash.trackingRoot) do
+        local children, counts = tracked_children(service, seen_ids)
+        traverse(children, counts, service.Name)
+    end
+
+    return untracked
+end
+
+--[[
 Returns a combined table of all active working tree/index changes for the UI.
 ]]
 function git.get_changes()
+    Handlers.load_ignore_patterns()
     local index = Handlers.read_index()
-
-    local last_index = {}
-    local last_index_str = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
-    if last_index_str and last_index_str ~= "" then
-        last_index = HttpService:JSONDecode(last_index_str)
-    end
+    local last_index = read_last_index()
 
     local changes = {}
     local seen_paths = {}
@@ -183,62 +287,7 @@ function git.get_changes()
     end
 
     --// UNTRACKED (Files not in index at all)
-    local untracked = {}
-    local function traverse_untracked_for_changes(parent, path_prefix, seen_ids)
-        local child_counts = {}
-        for _, child in ipairs(parent:GetChildren()) do
-            if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
-                child_counts[child.Name] = (child_counts[child.Name] or 0) + 1
-            end
-        end
-
-        local seen_local = {}
-        for _, child in ipairs(parent:GetChildren()) do
-            Utilities.roYield()
-            if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
-                local rogit_id = child:GetAttribute(ROGIT_ID)
-                local collisionBase = child.Name
-                local virtualName = child.Name
-                
-                if child_counts[child.Name] > 1 then
-                    local id_to_use = rogit_id
-                    if not id_to_use or id_to_use == "" or seen_ids[id_to_use] then
-                        id_to_use = HttpService:GenerateGUID(false)
-                        child:SetAttribute(ROGIT_ID, id_to_use)
-                    end
-                    seen_ids[id_to_use] = true
-                    
-                    seen_local[child.Name] = (seen_local[child.Name] or 0) + 1
-                    virtualName = collisionBase .. " [" .. tostring(seen_local[child.Name]) .. "]"
-                end
-                
-                local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
-                
-                local hasValidChildren = false
-                for _, sub in ipairs(child:GetChildren()) do
-                    if sub ~= bash.getGitFolderRoot() and not Handlers.is_ignored(sub:GetFullName()) and not sub:IsDescendantOf(bash.getGitFolderRoot()) then
-                        hasValidChildren = true
-                        break
-                    end
-                end
-                
-                local index_path = hasValidChildren and (my_path .. "/.properties") or my_path
-                if not index[index_path] and not index[my_path] then
-                    untracked[my_path] = true
-                end
-                
-                traverse_untracked_for_changes(child, my_path, seen_ids)
-            end
-        end
-    end
-
-    local global_seen = {}
-    for _, child in ipairs(bash.trackingRoot) do
-        local child_path = child.Name
-        traverse_untracked_for_changes(child, child_path, global_seen)
-    end
-    
-    for path, _ in pairs(untracked) do
+    for path in pairs(collect_untracked(index)) do
         if not seen_paths[path] then
             table.insert(changes, {path = path, status = "U"})
         end
@@ -280,27 +329,29 @@ arguments.createArgument("git", "help", "h", function (...)
         local cmd = args[1]
         local help_messages = {
             add = "git-add - Add file contents to the index.\n\nUsage: git add [options] [--] <pathspec>...\n\n    -n, --dry-run     dry run\n    -f, --force       allow adding otherwise ignored files",
-            commit = "git-commit - Record changes to the repository.\n\nUsage: git commit [-m <msg>]\n\n    -m, --message <msg>   commit message",
-            push = "git-push - Update remote refs along with associated objects.\n\nUsage: git push [<options>] [<repository> [<refspec>...]]\n\n    -u, --set-upstream    set upstream for git pull/status",
-            pull = "git-pull - Fetch from and integrate with another repository or a local branch.\n\nUsage: git pull [<options>] [<repository> [<refspec>...]]",
+            commit = "git-commit - Record changes to the repository.\n\nUsage: git commit [-a] [-m <msg>] [--amend] [--allow-empty]\n\n    -m, --message <msg>   commit message\n    -a, --all             stage all changes first\n    --amend               replace the last commit",
+            push = "git-push - Update remote refs along with associated objects.\n\nUsage: git push [<options>] [<repository> [<refspec>...]]\n\n    -u, --set-upstream    set upstream for git pull/status\n    -f, --force           allow non-fast-forward updates\n    --all                 push all branches\n    --tags                push all tags\n    -d, --delete          delete the given remote refs",
+            pull = "git-pull - Fetch from and integrate with another repository or a local branch.\n\nUsage: git pull [<options>] [<repository> [<branch>]]\n\n    --ff-only             refuse to merge, only fast-forward\n    -X ours|theirs        settle merge conflicts in favour of one side",
             status = "git-status - Show the working tree status.\n\nUsage: git status",
-            -- branch = "git-branch - List, create, or delete branches.\n\nUsage: git branch [<branchname>]\n       git branch -d <branchname>\n       git branch -m <oldbranch> <newbranch>",
-            -- switch = "git-switch - Switch branches.\n\nUsage: git switch [<options>] <branch>\n\n    -c, --create <branch>  create and switch to a new branch",
-            clone = "git-clone - Clone a repository into a new directory.\n\nUsage: git clone <repository>",
-            fetch = "git-fetch - Download objects and refs from another repository.\n\nUsage: git fetch [<options>] [<repository>]",
+            branch = "git-branch - List, create, or delete branches.\n\nUsage: git branch [-a | -r] [-v]\n       git branch <branchname> [<start-point>]\n       git branch -d | -D <branchname>\n       git branch -m [<oldbranch>] <newbranch>",
+            switch = "git-switch - Switch branches.\n\nUsage: git switch [<options>] <branch>\n\n    -c, --create <branch>  create and switch to a new branch\n    -d, --detach <commit>  switch to a commit in detached HEAD mode",
+            clone = "git-clone - Clone a repository into a new directory.\n\nUsage: git clone [<options>] <repository>\n\n    -b, --branch <branch>  checkout <branch> instead of the remote's HEAD\n    --single-branch        only download the history of one branch",
+            fetch = "git-fetch - Download objects and refs from another repository.\n\nUsage: git fetch [<repository>]",
             reset = "git-reset - Reset current HEAD to the specified state.\n\nUsage: git reset [--soft | --mixed | --hard] [<commit>]\n\n    --hard       reset HEAD, index and working tree",
             rm = "git-rm - Remove files from the working tree and from the index.\n\nUsage: git rm [-r] <file>...",
-            diff = "git-diff - Show changes between commits, commit and working tree, etc.\n\nUsage: git diff",
-            merge = "git-merge - Join two or more development histories together.\n\nUsage: git merge <commit-or-branch>",
+            diff = "git-diff - Show what changed in the working tree.\n\nUsage: git diff [--cached] [--name-only] [<path>...]\n\nShows property changes of every modified instance, and a line diff for scripts.",
+            show = "git-show - Show a commit and the instances it changed.\n\nUsage: git show [<commit>] [--name-only]",
+            merge = "git-merge - Join two or more development histories together.\n\nUsage: git merge [--no-ff] [-m <msg>] [-X ours|theirs] <commit-or-branch>\n\nInstances changed on both sides are merged property by property, scripts line by line.\nIf something can't be merged the merge stops without changing anything.",
             mv = "git-mv - Move or rename a file, a directory, or a symlink.\n\nUsage: git mv <source> <destination>",
             restore = "git-restore - Restore working tree files.\n\nUsage: git restore <pathspec>",
             remote = "git-remote - Manage set of tracked repositories.\n\nUsage: git remote [-v | --verbose]\n       git remote add [-f] <name> <url>\n       git remote remove <name>\n       git remote set-url <name> <newurl>",
             init = "git-init - Create an empty Git repository or reinitialize an existing one.\n\nUsage: git init [-q | --quiet] [-b <branch-name>]",
-            log = "git-log - Show commit logs.\n\nUsage: git log [<options>]",
+            log = "git-log - Show commit logs.\n\nUsage: git log [--oneline] [-n <number>] [<revision>]",
+            tag = "git-tag - Create, list, delete tags.\n\nUsage: git tag [-l [<pattern>]]\n       git tag [-a -m <msg>] <tagname> [<commit>]\n       git tag -d <tagname>",
             config = "git-config - Get and set repository or global options.\n\nUsage: git config [--global] <name> [<value>]",
             version = "git-version - Show the RoGit version information.\n\nUsage: git version",
             credential = "git-credential - Prompt for and cache user credentials.\n\nUsage: git credential (fill|approve|reject)",
-            checkout = "git-checkout - Switch branches or restore working tree files.\n\nUsage: git checkout [-b] <branchname>\n       git checkout <pathspec>..."
+            checkout = "git-checkout - Switch branches or restore working tree files.\n\nUsage: git checkout [-b] <branchname>\n       git checkout <commit-or-tag>   (detached HEAD)\n       git checkout -- <pathspec>..."
         }
 
         if cmd == "-a" or cmd == "--all" then
@@ -343,6 +394,7 @@ work on the current change (see also: git help everyday)
 examine the history and state (see also: git help revisions)
    diff      Show changes between commits, commit and working tree, etc
    log       Show commit logs
+   show      Show a commit and the instances it changed
    status    Show the working tree status
 
 grow, mark and tweak your common history
@@ -351,6 +403,7 @@ grow, mark and tweak your common history
    commit    Record changes to the repository
    switch    Switch branches
    merge     Join two or more development histories together
+   tag       Create, list, delete tags
    rebase    Reapply commits on top of another base tip (NOT IMPLEMENTED YET)
    reset     Reset current HEAD to the specified state
 
@@ -371,99 +424,120 @@ See 'git help git' for an overview of the system.]=])
 end)
 
 --[[
+Turns a user supplied path (Workspace/Part, game.Workspace.Part) into an index style path.
+]]
+local function normalize_user_path(path)
+    path = path:gsub("^game[./]", "")
+    if not path:find("/", 1, true) then
+        path = path:gsub("%.", "/")
+    end
+    return (path:gsub("/+$", ""))
+end
+
+local function matches_filters(path, filters)
+    if #filters == 0 then return true end
+    local entity = path:match("^(.-)/%.properties$") or path
+    for _, filter in ipairs(filters) do
+        if entity == filter or entity:sub(1, #filter + 1) == filter .. "/" then
+            return true
+        end
+    end
+    return false
+end
+
+local function read_blob_content(sha)
+    local obj = sha and Handlers.read_object(sha)
+    return obj and obj.type == "blob" and obj.content or nil
+end
+
+--[[
 commands:
 diff
 
-View diff throughout commits.
+View what changed in the working tree (or, with --cached, in the staged changes).
+Shows property level changes, and a line diff for scripts.
 ]]
-arguments.createArgument("git", "diff", "", function()
+arguments.createArgument("git", "diff", "", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository")
+    Handlers.load_ignore_patterns()
+
+    local cached = false
+    local names_only = false
+    local filters = {}
+    for _, arg in ipairs({...}) do
+        if arg == "--cached" or arg == "--staged" then
+            cached = true
+        elseif arg == "--name-only" or arg == "--stat" or arg == "--name-status" then
+            names_only = true
+        elseif arg ~= "--" and arg:sub(1, 1) ~= "-" then
+            table.insert(filters, normalize_user_path(arg))
+        end
+    end
+
     local index = Handlers.read_index()
-    
-    local has_diff = false
-    for path, data in pairs(index) do
-        local target_path = path:match("^(.-)/%.properties$") or path
-        local currObj = Utilities.parse_path(target_path)
+    local entries = {}
 
-        if not currObj then
-            print("\27[31mD\27[0m  " .. path)
-            has_diff = true
-        else
-            local serialized = instances.serialize_instance(currObj)
-            local current_sha = compute_blob_sha(serialized)
-            if current_sha ~= data.sha then
-                print("\27[33mM\27[0m  " .. path)
-                print("--- a/" .. path)
-                print("+++ b/" .. path)
-                print("@@ -1 +1 @@")
-                print("- " .. data.sha:sub(1,7) .. " (Index state)")
-                print("+ " .. current_sha:sub(1,7) .. " (Workspace state)")
-                has_diff = true
+    if cached then
+        local last_index = read_last_index()
+        for path, data in pairs(index) do
+            if not last_index[path] then
+                table.insert(entries, {path = path, status = "A", new = data.sha})
+            elseif last_index[path].sha ~= data.sha then
+                table.insert(entries, {path = path, status = "M", old = last_index[path].sha, new = data.sha})
             end
         end
-    end
-
-    local untracked = {}
-    local function traverse_untracked_for_diff(parent, path_prefix, seen_ids)
-        local child_counts = {}
-        for _, child in ipairs(parent:GetChildren()) do
-            if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
-                child_counts[child.Name] = (child_counts[child.Name] or 0) + 1
+        for path, data in pairs(last_index) do
+            if not index[path] then
+                table.insert(entries, {path = path, status = "D", old = data.sha})
             end
         end
-
-        local seen_local = {}
-        for _, child in ipairs(parent:GetChildren()) do
+    else
+        for path, data in pairs(index) do
             Utilities.roYield()
-            if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() and not child:IsDescendantOf(bash.getGitFolderRoot()) then
-                local rogit_id = child:GetAttribute(ROGIT_ID)
-                local collisionBase = child.Name
-                local virtualName = child.Name
-                
-                if child_counts[child.Name] > 1 then
-                    local id_to_use = rogit_id
-                    if not id_to_use or id_to_use == "" or seen_ids[id_to_use] then
-                        id_to_use = HttpService:GenerateGUID(false)
-                        child:SetAttribute(ROGIT_ID, id_to_use)
-                    end
-                    seen_ids[id_to_use] = true
-                    
-                    seen_local[child.Name] = (seen_local[child.Name] or 0) + 1
-                    virtualName = collisionBase .. " [" .. tostring(seen_local[child.Name]) .. "]"
+            local currObj = Utilities.parse_path(path:match("^(.-)/%.properties$") or path)
+            if not currObj then
+                table.insert(entries, {path = path, status = "D", old = data.sha})
+            else
+                local serialized = instances.serialize_instance(currObj)
+                if compute_blob_sha(serialized) ~= data.sha then
+                    table.insert(entries, {path = path, status = "M", old = data.sha, live = serialized})
                 end
-                
-                local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
-                
-                local hasValidChildren = false
-                for _, sub in ipairs(child:GetChildren()) do
-                    if sub ~= bash.getGitFolderRoot() and not Handlers.is_ignored(sub:GetFullName()) and not sub:IsDescendantOf(bash.getGitFolderRoot()) then
-                        hasValidChildren = true
-                        break
-                    end
-                end
-                
-                local index_path = hasValidChildren and (my_path .. "/.properties") or my_path
-                if not index[index_path] and not index[my_path] then
-                    untracked[my_path] = true
-                end
-                
-                traverse_untracked_for_diff(child, my_path, seen_ids)
             end
         end
     end
 
-    local global_seen = {}
-    for _, child in ipairs(bash.trackingRoot) do
-        local child_path = child.Name
-        traverse_untracked_for_diff(child, child_path, global_seen)
+    table.sort(entries, function(x, y) return x.path < y.path end)
+
+    local colors = {A = "\27[32m", M = "\27[33m", D = "\27[31m"}
+    local shown = 0
+    for _, entry in ipairs(entries) do
+        if matches_filters(entry.path, filters) then
+            shown += 1
+            print(colors[entry.status] .. entry.status .. "\27[0m  " .. entry.path)
+            if not names_only and entry.status == "M" then
+                for _, line in ipairs(diff.describe(read_blob_content(entry.old), entry.live or read_blob_content(entry.new))) do
+                    print(line)
+                end
+            end
+        end
     end
-    
-    for path, _ in pairs(untracked) do
-        print("\27[31m??\27[0m " .. path)
-        has_diff = true
+
+    if not cached then
+        local untracked = {}
+        for path in pairs(collect_untracked(index)) do
+            if matches_filters(path, filters) then
+                table.insert(untracked, path)
+            end
+        end
+        table.sort(untracked)
+        for _, path in ipairs(untracked) do
+            shown += 1
+            print("\27[31m??\27[0m " .. path)
+        end
     end
-    if not has_diff then
-        print("Everything up-to-date with index.")
+
+    if shown == 0 then
+        print(cached and "No staged changes." or "Everything up-to-date with index.")
     end
 end)
 
@@ -477,35 +551,158 @@ arguments.createArgument("git", "rebase", "", function()
     error("fatal: 'rebase' requires interactive graph rewrites which are complex in Luau. Please use 'git merge' instead.")
 end)
 
-arguments.createArgument("git", "merge", "", function(...)
-    local tuple = {...}
-    local branch = tuple[1]
+--[[
+Lists staged/unstaged changes to tracked instances (untracked ones are ignored, they can't be overwritten).
+]]
+local function dirty_changes()
+    local dirty = {}
+    for _, change in ipairs(git.get_changes()) do
+        if change.status ~= "U" then
+            table.insert(dirty, change.path)
+        end
+    end
+    return dirty
+end
 
-    if not branch then
+local function print_dirty_abort(dirty, action)
+    local lines = {"error: Your local changes to the following files would be overwritten by " .. action .. ":"}
+    for _, path in ipairs(dirty) do
+        table.insert(lines, "\t" .. path)
+    end
+    table.insert(lines, "Please commit your changes or restore them before you " .. (action == "merge" and "merge" or "switch branches") .. ".")
+    table.insert(lines, "Aborting")
+    error(table.concat(lines, "\n"))
+end
+
+--[[
+Merges the commit `target_sha` into the current branch.
+Fast-forwards when possible, otherwise performs a three-way merge of the instances and creates a merge commit.
+Returns true on success; on conflicts nothing is changed and false is returned.
+
+opts: prefer ("ours" | "theirs"), no_ff, message
+]]
+local function perform_merge(target_sha, label, opts)
+    opts = opts or {}
+    local head_sha = Handlers.get_ref("HEAD")
+    if head_sha == "" then head_sha = nil end
+
+    local target_commit = Handlers.read_commit(target_sha)
+    assert(target_commit and target_commit.tree, "fatal: " .. tostring(target_sha) .. " is not a commit we have locally")
+
+    if head_sha and (head_sha == target_sha or is_ancestor_commit(target_sha, head_sha)) then
+        print("Already up to date.")
+        return true
+    end
+
+    local dirty = dirty_changes()
+    if #dirty > 0 then
+        print_dirty_abort(dirty, "merge")
+        return false
+    end
+
+    if not head_sha or (is_ancestor_commit(head_sha, target_sha) and not opts.no_ff) then
+        print(string.format("Updating %s..%s", string.sub(head_sha or "0000000", 1, 7), string.sub(target_sha, 1, 7)))
+        Handlers.update_ref("HEAD", target_sha)
+        local ok, err = Remote.checkout(target_commit.tree)
+        assert(ok, err)
+        print("Fast-forward")
+        return true
+    end
+
+    local head_commit = Handlers.read_commit(head_sha)
+    local base_sha = Handlers.merge_base(head_sha, target_sha)
+    local base_commit = base_sha and Handlers.read_commit(base_sha)
+
+    print("Merging " .. label .. " into " .. (Handlers.get_current_branch() or "HEAD") .. "...")
+    local merged_index, conflicts, combined = merge.merge_indexes(
+        base_commit and Handlers.tree_to_index(base_commit.tree) or {},
+        Handlers.tree_to_index(head_commit.tree),
+        Handlers.tree_to_index(target_commit.tree),
+        {
+            prefer = opts.prefer,
+            read_blob = read_blob_content,
+            write_blob = function(content) return Handlers.write_blob(content) end,
+        }
+    )
+
+    if #conflicts > 0 then
+        local lines = {}
+        for _, conflict in ipairs(conflicts) do
+            table.insert(lines, "CONFLICT (" .. conflict.reason .. "): " .. conflict.path)
+        end
+        table.insert(lines, "Automatic merge failed; nothing was changed.")
+        table.insert(lines, "hint: re-run with '-X ours' or '-X theirs' to settle the conflicts in favour of one side.")
+        error(table.concat(lines, "\n"))
+        return false
+    end
+
+    local tree_sha = Handlers.write_tree(merged_index)
+    local commit_sha = create_commit(tree_sha, {head_sha, target_sha}, opts.message or ("Merge " .. label))
+    local ok, err = Remote.checkout(tree_sha)
+    assert(ok, err)
+
+    table.sort(combined)
+    for _, path in ipairs(combined) do
+        print("Auto-merging " .. path)
+    end
+    print(string.format("Merge made by the 'roGit' strategy. [%s]", string.sub(commit_sha, 1, 7)))
+    return true
+end
+
+--[[
+commands:
+merge
+
+Joins another branch (or commit) into the current branch.
+Instances changed on both sides are merged property by property, scripts line by line.
+]]
+arguments.createArgument("git", "merge", "", function(...)
+    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+
+    local tuple = {...}
+    local rev = nil
+    local opts = {}
+
+    local i = 1
+    while i <= #tuple do
+        local arg = tuple[i]
+        if arg == "--no-ff" then
+            opts.no_ff = true
+        elseif arg == "-m" and tuple[i + 1] then
+            opts.message = tuple[i + 1]
+            i += 1
+        elseif arg == "-X" and tuple[i + 1] then
+            opts.prefer = tuple[i + 1]
+            i += 1
+        elseif arg:match("^%-X(%a+)$") then
+            opts.prefer = arg:match("^%-X(%a+)$")
+        elseif arg:match("^%-%-strategy%-option=(%a+)$") then
+            opts.prefer = arg:match("^%-%-strategy%-option=(%a+)$")
+        elseif arg:sub(1, 1) ~= "-" then
+            rev = arg
+        end
+        i += 1
+    end
+
+    if opts.prefer and opts.prefer ~= "ours" and opts.prefer ~= "theirs" then
+        error("fatal: unknown strategy option '" .. opts.prefer .. "' (use ours or theirs)")
+        return
+    end
+
+    if not rev then
         error("fatal: No commit specified and merge.defaultToUpstream not set.")
         return
     end
 
-    local root = bash.getGitFolderRoot()
-    if not root then
-        error("fatal: not a git repository (or any of the parent directories): .git")
+    local target_sha = Handlers.resolve_revision(rev)
+    if not target_sha then
+        print("merge: " .. rev .. " - not something we can merge")
         return
     end
-    
-    local target_sha = Handlers.get_ref("refs/heads/" .. branch) or Handlers.get_ref("refs/remotes/origin/" .. branch)
-    if not target_sha or target_sha == "" then
-        print("merge: " .. branch .. " - not something we can merge")
-        return
-    end
-    
-    local head_sha = Handlers.get_ref("HEAD")
-    if head_sha == target_sha then
-        print("Already up to date.")
-        return
-    end
-    
-    warn("roGit does not fully support automatic branch merging yet.")
-    print("If you want to overwrite your current branch with '" .. branch .. "', run: git reset --hard " .. branch)
+
+    local label = (rev:find("/", 1, true) and Handlers.get_ref("refs/remotes/" .. rev)) and ("remote-tracking branch '" .. rev .. "'")
+        or ("branch '" .. rev .. "'")
+    perform_merge(target_sha, label, opts)
 end)
 
 --[[
@@ -689,6 +886,7 @@ Adds files to be commited
 arguments.createArgument("git", "add", "a", function (...)
     assert(bash.getGitFolderRoot(),
         "fatal: not a git repository (or any of the parent directories): .git")
+    Handlers.load_ignore_patterns()
 
     local args = {...}
     local force = false
@@ -784,103 +982,99 @@ end)
 commands:
 pull
 
-pulls latest commit.
+Fetches the latest commits and integrates them: fast-forwards when it can, merges when the branches have diverged.
 ]]
 arguments.createArgument("git", "pull", "", function (...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
 
+    local positional = {}
+    local ff_only = false
+    local opts = {}
     local tuple = {...}
-    local remote_name = tuple[1] or "origin"
-    local branch_name = tuple[2] or Handlers.get_current_branch() or "master"
+    local i = 1
+    while i <= #tuple do
+        local arg = tuple[i]
+        if arg == "--ff-only" then
+            ff_only = true
+        elseif arg == "--no-ff" then
+            opts.no_ff = true
+        elseif arg == "-X" and tuple[i + 1] then
+            opts.prefer = tuple[i + 1]
+            i += 1
+        elseif arg:match("^%-X(%a+)$") then
+            opts.prefer = arg:match("^%-X(%a+)$")
+        elseif arg:sub(1, 1) ~= "-" then
+            table.insert(positional, arg)
+        end
+        i += 1
+    end
 
-    local config_content = bash.getFileContents(bash.getGitFolderRoot(), "config")
-    local loaded_conf = ini_parser.parseIni(config_content)
-    local section_name = 'remote "' .. remote_name .. '"'
-    local remote_section = loaded_conf[section_name]
-    assert(remote_section and remote_section.url, "fatal: '" .. remote_name .. "' does not appear to be a git repository")
-    local url = remote_section.url
+    local remote_name = positional[1] or "origin"
+    local current_branch = Handlers.get_current_branch()
+    local branch_name = positional[2] or current_branch or "master"
 
-    local refs = Remote.discoverRefs(url)
-    local remoteSha = refs["refs/heads/" .. branch_name] or refs["HEAD"]
+    local refs = Remote.fetch(remote_name)
+    local remoteSha = refs["refs/heads/" .. branch_name]
     assert(remoteSha, "fatal: couldn't find remote ref 'refs/heads/" .. branch_name .. "'")
 
-    local current_branch = Handlers.get_current_branch()
+    Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, remoteSha)
+
     local head_sha = Handlers.get_ref("HEAD")
     local local_branch_sha = Handlers.get_ref("refs/heads/" .. branch_name)
     if not local_branch_sha and current_branch == branch_name then
         local_branch_sha = head_sha
     end
 
-    local index = Handlers.read_index()
-    
-    --// If we are already up to date, check if our local parts match the tree
-    if local_branch_sha == remoteSha then
-        local current_tree_matches = true
-        for path, _ in pairs(index) do
-            local clean = path:match("^(.-)/%.properties$") or path
-            if not Utilities.parse_path(clean) then
-                current_tree_matches = false; break
+    local remote_commit = Handlers.read_commit(remoteSha)
+    assert(remote_commit and remote_commit.tree, "fatal: the remote commit " .. remoteSha .. " was not downloaded")
+
+    if current_branch == branch_name then
+        --// If we are already up to date, make sure the instances still match the tree
+        if local_branch_sha == remoteSha then
+            local index = Handlers.read_index()
+            for path, _ in pairs(index) do
+                local clean = path:match("^(.-)/%.properties$") or path
+                if not Utilities.parse_path(clean) then
+                    local dirty = dirty_changes()
+                    if #dirty > 0 then
+                        print_dirty_abort(dirty, "merge")
+                        return
+                    end
+                    print("Restoring missing instances...")
+                    local ok, err = Remote.checkout(remote_commit.tree)
+                    assert(ok, err)
+                    return
+                end
             end
-        end
-
-        if current_tree_matches then
-            print("Already up to date.")
-            return
-        end
-    end
-
-    if local_branch_sha and remoteSha and local_branch_sha ~= remoteSha then
-        if is_ancestor_commit(remoteSha, local_branch_sha) then
             print("Already up to date.")
             return
         end
 
-        if not is_ancestor_commit(local_branch_sha, remoteSha) then
+        if ff_only and local_branch_sha and not is_ancestor_commit(local_branch_sha, remoteSha) then
             error("fatal: Not possible to fast-forward, aborting.")
-            print("hint: Local and remote branches have diverged.")
-            print("hint: Use 'git merge', or manually move refs if you intend to overwrite history.")
             return
         end
+
+        local label = "branch '" .. branch_name .. "' of " .. remote_name
+        if perform_merge(remoteSha, label, opts) then
+            print("Successfully pulled from " .. branch_name)
+        end
+        return
     end
 
-    if current_branch == branch_name and local_branch_sha and local_branch_sha ~= remoteSha then
-        local modified, deleted = collect_worktree_changes(index)
-        if #modified + #deleted > 0 then
-            print("error: Your local changes to the following files would be overwritten by merge:")
-            for _, path in ipairs(modified) do
-                print("\t" .. path)
-            end
-            for _, path in ipairs(deleted) do
-                print("\t" .. path)
-            end
-            print("Please commit your changes or restore them before you merge.")
-            print("Aborting")
-            return
-        end
+    --// Pulling a branch that is not checked out: only fast-forwards are possible
+    if local_branch_sha == remoteSha or (local_branch_sha and is_ancestor_commit(remoteSha, local_branch_sha)) then
+        print("Already up to date.")
+        return
+    end
+    if local_branch_sha and not is_ancestor_commit(local_branch_sha, remoteSha) then
+        error("fatal: Not possible to fast-forward, aborting.")
+        print("hint: Switch to '" .. branch_name .. "' and run 'git pull' to merge the remote changes.")
+        return
     end
 
     print("Updating " .. string.sub(local_branch_sha or "0000000", 1, 7) .. ".." .. string.sub(remoteSha, 1, 7))
-    local fullPack = Remote.fetchPackfile(url, remoteSha)
-    local _, objectsBySha = Remote.unpackObjects(fullPack)
-    
-    for oSha, obj in pairs(objectsBySha) do
-        local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
-        if typeName then
-            Handlers.write_object_with_sha(typeName, obj.content, oSha)
-        end
-    end
-
     Handlers.update_ref("refs/heads/" .. branch_name, remoteSha)
-    Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, remoteSha)
-    
-    if current_branch == branch_name then
-        local remote_commit_obj = Handlers.read_object(remoteSha)
-        local treeSha = remote_commit_obj and remote_commit_obj.content:match("^tree (%x+)")
-        if treeSha then
-            print("Syncing workspace...")
-            Remote.checkout(treeSha)
-        end
-    end
     print("Successfully pulled from " .. branch_name)
 end)
 
@@ -973,34 +1167,44 @@ arguments.createArgument("git", "commit", "", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
 
     local tuple = { ... }
-    local message = ""
+    local messages = {}
     local allow_empty = false
     local amend = false
+    local stage_all = false
 
     local i = 1
     while i <= #tuple do
-        if tuple[i] == "-m" and tuple[i + 1] then
-            message = tuple[i + 1]
+        local arg = tuple[i]
+        if (arg == "-m" or arg == "--message") and tuple[i + 1] then
+            table.insert(messages, tuple[i + 1])
             i += 1
-        elseif tuple[i] == "--allow-empty" then
+        elseif arg:match("^%-%-message=") then
+            table.insert(messages, arg:match("^%-%-message=(.*)$"))
+        elseif (arg == "-am" or arg == "-ma") and tuple[i + 1] then
+            stage_all = true
+            table.insert(messages, tuple[i + 1])
+            i += 1
+        elseif arg == "-a" or arg == "--all" then
+            stage_all = true
+        elseif arg == "--allow-empty" then
             allow_empty = true
-        elseif tuple[i] == "--amend" then
+        elseif arg == "--amend" then
             amend = true
         end
         i += 1
     end
 
+    local message = table.concat(messages, "\n\n")
     if message == "" and not amend then
         message = "default commit message"
     end
 
-    local index = Handlers.read_index()
-
-    local last_index = {}
-    local last_index_str = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
-    if last_index_str and last_index_str ~= "" then
-        last_index = HttpService:JSONDecode(last_index_str)
+    if stage_all then
+        arguments.execute("git", "add", ".")
     end
+
+    local index = Handlers.read_index()
+    local last_index = read_last_index()
 
     local old_paths = {}
     local new_paths = {}
@@ -1066,41 +1270,25 @@ arguments.createArgument("git", "commit", "", function(...)
     end
 
     local parent_sha = Handlers.get_ref("HEAD")
-    local tree_sha = Handlers.write_tree(index)
-    local commit_content = "tree " .. tree_sha .. "\n"
+    if parent_sha == "" then parent_sha = nil end
 
+    local parents = {}
     if amend then
-        if parent_sha and parent_sha ~= "" then
-            local old_commit = Handlers.read_object(parent_sha)
-            if old_commit then
-                for old_parent in old_commit.content:gmatch("\nparent (%x+)") do
-                    commit_content = commit_content .. "parent " .. old_parent .. "\n"
-                end
-                if message == "" then
-                    message = old_commit.content:match("\n\n(.+)$") or "default commit message"
-                end
+        local old_commit = Handlers.read_commit(parent_sha)
+        if old_commit then
+            parents = old_commit.parents
+            if message == "" then
+                message = old_commit.message ~= "" and old_commit.message or "default commit message"
             end
         end
-    else
-        if parent_sha and parent_sha ~= "" then
-            commit_content = commit_content .. "parent " .. parent_sha .. "\n"
-        end
+    elseif parent_sha then
+        parents = {parent_sha}
     end
 
-    local timestamp = os.time()
-    local user_name = Auth.getConfigValue("user_name") or Auth.getConfigValue("user.name") or "roGit"
-    local user_email = Auth.getConfigValue("user_email") or Auth.getConfigValue("user.email") or "ro-git@example.com"
-    commit_content = commit_content .. string.format("author %s <%s> %d +0000\n", user_name, user_email, timestamp)
-    commit_content = commit_content .. string.format("committer %s <%s> %d +0000\n", user_name, user_email, timestamp)
-    commit_content = commit_content .. "\n" .. message
-    local commit_sha = Handlers.write_object("commit", commit_content)
-    Handlers.update_ref("HEAD", commit_sha)
+    local tree_sha = Handlers.write_tree(index)
+    local commit_sha = create_commit(tree_sha, parents, message)
 
-    if bash.getGitFolderRoot():FindFirstChild("last_commit_index") then
-        bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(index))
-    else
-        bash.createFile(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(index))
-    end
+    bash.writeFile(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(index))
 
     local output_details = {}
     for _, entry in ipairs(files_renamed) do
@@ -1112,21 +1300,30 @@ arguments.createArgument("git", "commit", "", function(...)
     for _, entry in ipairs(files_deleted) do
         table.insert(output_details, string.format(" delete mode %s %s", entry.mode, entry.path))
     end
+    table.sort(output_details)
 
     local stats_line = ""
     if num_files_changed > 0 then
-        stats_line = string.format(" %d files changed, %d insertions(+), %d deletions(-)", num_files_changed, total_insertions, total_deletions)
+        stats_line = string.format(" %d file%s changed, %d insertion%s(+), %d deletion%s(-)",
+            num_files_changed, num_files_changed == 1 and "" or "s",
+            total_insertions, total_insertions == 1 and "" or "s",
+            total_deletions, total_deletions == 1 and "" or "s")
     end
 
-    local short_sha = string.sub(commit_sha, 1, 7)
-    local final_output = string.format("[master %s] %s", short_sha, message)
+    local branch = Handlers.get_current_branch()
+    local label = branch or "detached HEAD"
+    if #parents == 0 then
+        label = label .. " (root-commit)"
+    end
+
+    local final_output = string.format("[%s %s] %s", label, string.sub(commit_sha, 1, 7), message:match("^[^\n]*"))
     if num_files_changed > 0 then
         final_output = final_output .. "\n" .. stats_line
     end
     if #output_details > 0 then
         if #output_details > 20 then
             local new_details = {}
-            for i = 1, 20 do table.insert(new_details, output_details[i]) end
+            for n = 1, 20 do table.insert(new_details, output_details[n]) end
             table.insert(new_details, string.format(" ... and %d more files", #output_details - 20))
             output_details = new_details
         end
@@ -1142,8 +1339,6 @@ init
 initializes new repository
 ]]
 arguments.createArgument("git", "init", "", function (...)
-    _ignore_patterns = nil
-
     local tuple = {...}
     local quiet = false
     local initial_branch = "master"
@@ -1220,19 +1415,25 @@ clones a git repository
 arguments.createArgument("git", "clone", "", function(...)
     local tuple = {...}
     local branch_override = nil
+    local single_branch = false
     local url = nil
     local repo_dir = nil
 
     local i = 1
     while i <= #tuple do
-        if (tuple[i] == "-b" or tuple[i] == "--branch") and tuple[i + 1] then
+        local arg = tuple[i]
+        if (arg == "-b" or arg == "--branch") and tuple[i + 1] then
             branch_override = tuple[i + 1]
             i += 1
-        elseif tuple[i]:sub(1,1) ~= "-" then -- Positional argument
+        elseif arg == "--single-branch" then
+            single_branch = true
+        elseif arg == "--depth" or arg == "--origin" or arg == "-o" then
+            i += 1 --// accepted for compatibility, roGit always clones full history
+        elseif arg:sub(1, 1) ~= "-" then -- Positional argument
             if not url then
-                url = tuple[i]
+                url = arg
             elseif not repo_dir then
-                repo_dir = tuple[i]
+                repo_dir = arg
             end
         end
         i += 1
@@ -1240,117 +1441,139 @@ arguments.createArgument("git", "clone", "", function(...)
 
     if not url or url == "" then
         error("fatal: You must specify a repository to clone.")
-        print("\nusage: git clone [<options>] [--] <repo> [<dir>]\n\n    -v, --verbose         be more verbose\n    -q, --quiet           be more quiet\n    --progress            force progress reporting\n    -n, --no-checkout     don't create a checkout")
+        print("\nusage: git clone [<options>] [--] <repo> [<dir>]\n\n    -b, --branch <branch>  checkout <branch> instead of the remote's HEAD\n    --single-branch        only download the history of one branch")
+        return
+    end
+    url = Utilities.normalize_url(url)
+
+    local existing_root = bash.getGitFolderRoot()
+    if existing_root and Handlers.get_ref("HEAD") then
+        error("fatal: this place already contains a repository with commits. Clone into a fresh place instead.")
         return
     end
 
-    local repoName = url:match("/([^/]+)$") or "repository"
-    if repo_dir then
-        repoName = repo_dir
-    end
+    local repoName = repo_dir or url:match("/([^/]+)$") or "repository"
+    repoName = repoName:gsub("%.git$", "")
     print("Cloning into '" .. repoName .. "'...")
 
-    if not bash.getGitFolderRoot() then
+    local created_here = false
+    if not existing_root then
         arguments.execute("git", "init", "-q")
+        created_here = true
     end
-    arguments.execute("git", "remote", "add", "origin", url)
+    local existing_config = ini_parser.parseIni(bash.getFileContents(bash.getGitFolderRoot(), "config") or "")
+    arguments.execute("git", "remote", existing_config['remote "origin"'] and "set-url" or "add", "origin", url)
 
-    local refs = Remote.discoverRefs(url)
-    local headSha
-    if branch_override then 
-        headSha = refs["refs/heads/" .. branch_override]
-        assert(headSha, "fatal: Remote branch '" .. branch_override .. "' not found in upstream origin")
-    else
-       headSha = refs["HEAD"] or refs["refs/heads/master"] or refs["refs/heads/main"]
+    local function abort_clone()
+        if created_here then
+            local root = bash.getGitFolderRoot()
+            if root then root:Destroy() end
+        end
     end
-    
+
+    local ok_discover, refs, info = pcall(Remote.discoverRefs, url)
+    if not ok_discover then
+        abort_clone()
+        error(refs, 0)
+    end
+
+    --// Work out which branch gets checked out
+    local activeBranch = branch_override
+    local headSha
+    if branch_override then
+        headSha = refs["refs/heads/" .. branch_override] or refs["refs/tags/" .. branch_override]
+        if not headSha then
+            abort_clone()
+            error("fatal: Remote branch '" .. branch_override .. "' not found in upstream origin")
+            return
+        end
+    else
+        local symref = info.symrefs and info.symrefs["HEAD"]
+        activeBranch = symref and symref:match("^refs/heads/(.+)$")
+        headSha = activeBranch and refs[symref] or refs["HEAD"]
+        if not activeBranch then
+            for _, candidate in ipairs({"master", "main"}) do
+                if refs["refs/heads/" .. candidate] and (not headSha or refs["refs/heads/" .. candidate] == headSha) then
+                    activeBranch = candidate
+                    break
+                end
+            end
+            headSha = headSha or (activeBranch and refs["refs/heads/" .. activeBranch])
+            if not activeBranch then
+                for refName, sha in pairs(refs) do
+                    if sha == headSha and refName:match("^refs/heads/") then
+                        activeBranch = refName:sub(12)
+                        break
+                    end
+                end
+            end
+        end
+    end
+
     if not headSha or headSha == "" then
         print("warning: You appear to have cloned an empty repository.")
         return
     end
+    activeBranch = activeBranch or "master"
 
-    local _t0 = os.clock()
-
-    local _t1 = os.clock()
-    local packFile = Remote.fetchPackfile(url, headSha)
-
-    _t1 = os.clock()
-    local _, objectsBySha = Remote.unpackObjects(packFile)
-    local _objCount = 0
-    for _ in pairs(objectsBySha) do _objCount += 1 end
-
-    _t1 = os.clock()
-    local _needed = {}
-    local function _collectNeeded(sha)
-        if not sha or _needed[sha] then return end
-        local obj = objectsBySha[sha]
-        if not obj then return end
-        _needed[sha] = true
-        if obj.objType == 1 then
-            local treeSha = obj.content:match("^tree (%x+)")
-            if treeSha then _collectNeeded(treeSha) end
-        elseif obj.objType == 2 then
-            local c = obj.content
-            local p = 1
-            while p <= #c do
-                local sp = c:find(" ", p, true)
-                local np = c:find("\0", sp, true)
-                local rs = c:sub(np + 1, np + 20)
-                local es = ("%02x"):rep(20):format(rs:byte(1, 20))
-                p = np + 21
-                _collectNeeded(es)
-            end
+    --// Download everything in one go
+    local wants, wantSet = {}, {}
+    local function want(sha)
+        if not wantSet[sha] then
+            wantSet[sha] = true
+            table.insert(wants, sha)
         end
     end
-
-    for _, branchSha in pairs(refs) do
-        _collectNeeded(branchSha)
-    end
-
-    local _writeCount = 0
-    for sha, obj in pairs(objectsBySha) do
-        if _needed[sha] then
-            Utilities.roYield()
-            local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
-            if typeName then
-                Handlers.write_object_with_sha(typeName, obj.content, sha)
-                _writeCount += 1
-            end
-        end
-    end
-
-    local activeBranch = branch_override
-    if not activeBranch then
+    want(headSha)
+    if not single_branch then
         for refName, sha in pairs(refs) do
-            if sha == headSha and refName:match("^refs/heads/") then
-                activeBranch = refName:sub(12)
-                break
+            if refName:match("^refs/heads/") or (refName:match("^refs/tags/") and not refName:match("%^{}$")) then
+                want(sha)
             end
         end
-        activeBranch = activeBranch or "master"
     end
-    
+    table.sort(wants, function(x, y)
+        if x == headSha then return y ~= headSha end
+        if y == headSha then return false end
+        return x < y
+    end)
+
+    local packFile = Remote.fetchPackfile(url, wants)
+    local _, objectsBySha = Remote.unpackObjects(packFile)
+    Remote.storeObjects(objectsBySha)
+
     local gitRoot = bash.getGitFolderRoot()
     bash.modifyFileContents(gitRoot, "HEAD", "ref: refs/heads/" .. activeBranch)
     for refName, sha in pairs(refs) do
         if refName:match("^refs/heads/") then
             local bName = refName:sub(12)
-            Handlers.update_ref("refs/remotes/origin/" .. bName, sha)
+            if not single_branch or bName == activeBranch then
+                Handlers.update_ref("refs/remotes/origin/" .. bName, sha)
+            end
             if bName == activeBranch then
                 Handlers.update_ref("refs/heads/" .. bName, sha)
             end
-        elseif refName:match("^refs/tags/") then
-            Handlers.update_ref(refName, sha)
+        elseif refName:match("^refs/tags/") and not refName:match("%^{}$") then
+            if wantSet[sha] then
+                Handlers.update_ref(refName, sha)
+            end
         end
     end
+    if branch_override and not refs["refs/heads/" .. branch_override] then
+        --// cloned a tag: detach HEAD at it
+        bash.modifyFileContents(gitRoot, "HEAD", headSha)
+        activeBranch = nil
+    end
 
-    local config_content = bash.getFileContents(gitRoot, "config")
-    local loaded_conf = ini_parser.parseIni(config_content)
-    loaded_conf['branch "' .. activeBranch .. '"'] = {
-        remote = "origin",
-        merge = "refs/heads/" .. activeBranch
-    }
-    bash.modifyFileContents(gitRoot, "config", ini_parser.serializeIni(loaded_conf))
+    if activeBranch then
+        local config_content = bash.getFileContents(gitRoot, "config")
+        local loaded_conf = ini_parser.parseIni(config_content)
+        loaded_conf['branch "' .. activeBranch .. '"'] = {
+            remote = "origin",
+            merge = "refs/heads/" .. activeBranch
+        }
+        bash.modifyFileContents(gitRoot, "config", ini_parser.serializeIni(loaded_conf))
+    end
 
     local headCommit = objectsBySha[headSha]
     assert(headCommit, "HEAD commit not found in packfile")
@@ -1361,87 +1584,51 @@ arguments.createArgument("git", "clone", "", function(...)
     local treeObj = objectsBySha[treeSha]
     assert(treeObj, "Missing root tree: " .. treeSha)
 
-    local content = treeObj.content
-    
-    _t1 = os.clock()
     local function find_rogit_project(current_tree_sha)
         local obj = objectsBySha[current_tree_sha]
         if not obj then return false end
-        
-        local c_content = obj.content
-        local c_pos = 1
-        while c_pos <= #c_content do
+
+        for _, entry in ipairs(Handlers.parse_tree(obj.content)) do
             Utilities.roYield()
-            local spacePos = c_content:find(" ", c_pos, true)
-            local mode = c_content:sub(c_pos, spacePos - 1)
-            local nullPos = c_content:find("\0", spacePos, true)
-            local name = c_content:sub(spacePos + 1, nullPos - 1)
-            local rawSha = c_content:sub(nullPos + 1, nullPos + 20)
-            local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-            c_pos = nullPos + 21
-            
-            if name == ".rogit_project" then
+            if entry.name == ".rogit_project" then
                 return true
-            elseif mode == "40000" then
-                if find_rogit_project(child_sha) then
-                    return true
-                end
+            elseif entry.mode == "40000" and find_rogit_project(entry.sha) then
+                return true
             end
         end
         return false
     end
-    
-    local is_rogit_project = find_rogit_project(treeSha)
-    
-    if not is_rogit_project then
+
+    if not find_rogit_project(treeSha) then
+        abort_clone()
         error("fatal: repository does not appear to be a rogit project (missing .rogit_project file).")
-        local gitRoot_to_destroy = bash.getGitFolderRoot()
-        if gitRoot_to_destroy then gitRoot_to_destroy:Destroy() end
         return
     end
 
-    _t1 = os.clock()
-    local _instanceCount = 0
-    local pos = 1
-    while pos <= #content do
+    for _, entry in ipairs(Handlers.parse_tree(treeObj.content)) do
         Utilities.roYield()
-        local spacePos = content:find(" ", pos, true)
-        local mode = content:sub(pos, spacePos - 1)
-        local nullPos = content:find("\0", spacePos, true)
-        local name = content:sub(spacePos + 1, nullPos - 1)
-        local rawSha = content:sub(nullPos + 1, nullPos + 20)
-        local sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-        pos = nullPos + 21
-
-        if mode == "40000" then
-            local serviceParent = game:FindFirstChild(name)
+        if entry.mode == "40000" then
+            local serviceParent = game:FindFirstChild(entry.name)
             if not serviceParent then
                 pcall(function()
-                    serviceParent = game:GetService(name)
+                    serviceParent = game:GetService(entry.name)
                 end)
             end
             if serviceParent then
-                local childProps = Remote.peekPropertiesBlob(objectsBySha, sha)
+                local childProps = Remote.peekPropertiesBlob(objectsBySha, entry.sha)
                 if childProps then
                     Remote.applyProperties(serviceParent, childProps)
                 end
-                Remote.writeTree(objectsBySha, sha, serviceParent, name)
-                _instanceCount += 1
+                Remote.writeTree(objectsBySha, entry.sha, serviceParent, entry.name)
             end
         end
     end
 
-    _t1 = os.clock()
     Remote.resolve_instance_refs()
 
-    _t1 = os.clock()
     local new_index = Remote.buildIndexFromTree(objectsBySha, treeSha)
-    local _indexCount = 0
-    for _ in pairs(new_index) do _indexCount += 1 end
-
-    _t1 = os.clock()
     Handlers.write_index(new_index)
-    bash.modifyFileContents(gitRoot, "last_commit_index", HttpService:JSONEncode(new_index))
+    bash.writeFile(gitRoot, "last_commit_index", HttpService:JSONEncode(new_index))
 
     print("Done. '" .. repoName .. "' cloned.")
 end)
@@ -1463,14 +1650,22 @@ arguments.createArgument("git", "remote", "", function(...)
         local config_content = bash.getFileContents(bash.getGitFolderRoot(), "config")
         local loaded_conf = ini_parser.parseIni(config_content)
         
-        for section_name, section_data in pairs(loaded_conf) do
+        local remote_names = {}
+        for section_name in pairs(loaded_conf) do
             local remote_name = section_name:match('^remote "(.+)"$')
             if remote_name then
-                if verbose then
-                    print(remote_name .. "\t" .. (section_data.url or "(no URL)"))
-                else
-                    print(remote_name)
-                end
+                table.insert(remote_names, remote_name)
+            end
+        end
+        table.sort(remote_names)
+
+        for _, remote_name in ipairs(remote_names) do
+            local section_data = loaded_conf['remote "' .. remote_name .. '"']
+            if verbose then
+                print(remote_name .. "\t" .. (section_data.url or "(no URL)") .. " (fetch)")
+                print(remote_name .. "\t" .. (section_data.pushurl or section_data.url or "(no URL)") .. " (push)")
+            else
+                print(remote_name)
             end
         end
         return
@@ -1511,11 +1706,19 @@ arguments.createArgument("git", "remote", "", function(...)
         name = args[1]
         url = args[2]
         assert(name and url, "usage: git remote add [-f] <name> <url>")
+        url = Utilities.normalize_url(url)
 
         local config_content = bash.getFileContents(bash.getGitFolderRoot(), "config")
         local loaded_conf = ini_parser.parseIni(config_content)
 
         local section_name = 'remote "' .. name .. '"'
+        if loaded_conf[section_name] and loaded_conf[section_name].url == url then
+            return
+        end
+        if loaded_conf[section_name] then
+            error("error: remote " .. name .. " already exists.")
+            return
+        end
         loaded_conf[section_name] = {
             url = url,
             fetch = "+refs/heads/*:refs/remotes/" .. name .. "/*"
@@ -1546,6 +1749,7 @@ arguments.createArgument("git", "remote", "", function(...)
         end
 
         assert(name and new_url, "usage: git remote set-url [--push] <name> <newurl>")
+        new_url = Utilities.normalize_url(new_url)
 
         local section_name = 'remote "' .. name .. '"'
         local remote_section = loaded_conf[section_name]
@@ -1649,17 +1853,49 @@ arguments.createArgument("git", "remote", "", function(...)
 end)
 
 --[[
+Splits the payload of a receive-pack status report ("000eunpack ok\n0019ok refs/heads/main\n0000") into lines.
+]]
+local function parse_report_lines(payload)
+    local lines = {}
+    local pos = 1
+    while pos <= #payload do
+        local len = tonumber(payload:sub(pos, pos + 3), 16)
+        if not len then
+            --// not framed, treat everything that's left as text
+            for line in payload:sub(pos):gmatch("[^\r\n]+") do
+                table.insert(lines, line)
+            end
+            break
+        end
+        if len == 0 then
+            pos += 4
+        elseif len < 4 then
+            break
+        else
+            local line = payload:sub(pos + 4, pos + len - 1):gsub("[\r\n]+$", "")
+            table.insert(lines, line)
+            pos += len
+        end
+    end
+    return lines
+end
+
+local ZERO_SHA = ("0"):rep(40)
+
+--[[
 commands:
 push
 
 pushes git repository commits to branch
+Usage: git push [-f] [-u] [--all] [--tags] [-d] <remote> <refspec>...
 ]]
 arguments.createArgument("git", "push", "", function(...)
     local tuple = {...}
-    local remote_name = "origin"
-    local branch_name = "master"
     local force_push = false
     local set_upstream = false
+    local push_all = false
+    local push_tags = false
+    local delete = false
     local positional = {}
 
     for _, arg in ipairs(tuple) do
@@ -1667,20 +1903,22 @@ arguments.createArgument("git", "push", "", function(...)
             force_push = true
         elseif arg == "-u" or arg == "--set-upstream" then
             set_upstream = true
-        else
+        elseif arg == "--all" then
+            push_all = true
+        elseif arg == "--tags" then
+            push_tags = true
+        elseif arg == "-d" or arg == "--delete" then
+            delete = true
+        elseif arg:sub(1, 1) ~= "-" or arg == "-" then
             table.insert(positional, arg)
         end
     end
 
-    if positional[1] then remote_name = positional[1] end
-    if positional[2] then 
-        branch_name = positional[2] 
-    else
-        branch_name = Handlers.get_current_branch() or "master"
-    end
-
     local root = bash.getGitFolderRoot()
     assert(root, "fatal: not a git repository")
+
+    local remote_name = table.remove(positional, 1) or "origin"
+    local current_branch = Handlers.get_current_branch()
 
     local config_content = bash.getFileContents(root, "config")
     local loaded_conf = ini_parser.parseIni(config_content)
@@ -1688,89 +1926,153 @@ arguments.createArgument("git", "push", "", function(...)
     local section_name = 'remote "' .. remote_name .. '"'
     local remote_section = loaded_conf[section_name]
     assert(remote_section and remote_section.url, "fatal: '" .. remote_name .. "' does not appear to be a git repository")
-    
-    local url = remote_section.url
+    local url = remote_section.pushurl or remote_section.url
+
+    --// Work out what to push: a list of {src (local sha), dst (full ref name), force}
+    local specs = {}
+    local function add_spec(src_name, dst_ref, plus)
+        local sha = nil
+        if not delete then
+            sha = Handlers.resolve_revision(src_name)
+            assert(sha, "error: src refspec '" .. tostring(src_name) .. "' does not match any")
+        end
+        table.insert(specs, {sha = sha, ref = dst_ref, force = plus or force_push, label = (src_name == "HEAD" and current_branch) or src_name})
+    end
+
+    local function qualified(name, source_is_tag)
+        if name:match("^refs/") then return name end
+        if source_is_tag then return "refs/tags/" .. name end
+        return "refs/heads/" .. name
+    end
+
+    if push_all then
+        for _, branch in ipairs(Handlers.get_branches()) do
+            add_spec(branch, "refs/heads/" .. branch)
+        end
+    end
+    if push_tags then
+        for refName, sha in pairs(Handlers.list_refs()) do
+            local tag = refName:match("^refs/tags/(.+)$")
+            if tag then
+                table.insert(specs, {sha = sha, ref = refName, force = force_push, label = tag})
+            end
+        end
+    end
+
+    if #positional == 0 and #specs == 0 then
+        assert(current_branch, "fatal: You are not currently on a branch.\nTo push the history leading to the current (detached HEAD) state, name a ref explicitly.")
+        add_spec("HEAD", "refs/heads/" .. current_branch)
+    end
+
+    for _, spec in ipairs(positional) do
+        local plus = spec:sub(1, 1) == "+"
+        spec = plus and spec:sub(2) or spec
+        local src, dst = spec:match("^(.-):(.+)$")
+        src = src or spec
+        dst = dst or spec
+
+        if src == "HEAD" and not spec:find(":", 1, true) then
+            assert(current_branch, "fatal: You are not currently on a branch.")
+            src, dst = "HEAD", current_branch
+        end
+
+        local is_tag = Handlers.get_ref("refs/tags/" .. src) ~= nil and Handlers.get_ref("refs/heads/" .. src) == nil
+        if delete then
+            add_spec(src, qualified(spec, Handlers.get_ref("refs/tags/" .. spec) ~= nil and Handlers.get_ref("refs/heads/" .. spec) == nil), plus)
+        elseif src == "HEAD" then
+            add_spec("HEAD", qualified(dst), plus)
+        else
+            add_spec(src, qualified(dst, is_tag), plus)
+        end
+    end
 
     local refs = Remote.discoverRefs(url, "git-receive-pack")
-    local remoteSha = refs["refs/heads/" .. branch_name]
 
-    local localSha = nil
-    if positional[2] then
-        localSha = Handlers.get_ref("refs/heads/" .. branch_name)
-        assert(localSha, "error: src refspec '" .. branch_name .. "' does not match any")
-    else
-        localSha = Handlers.get_ref("HEAD")
+    --// Decide which refs really need updating
+    local updates = {}
+    for _, spec in ipairs(specs) do
+        local remoteSha = refs[spec.ref]
+        local newSha = spec.sha or ZERO_SHA
+
+        if delete then
+            if remoteSha then
+                table.insert(updates, {ref = spec.ref, old = remoteSha, new = ZERO_SHA, label = spec.label, delete = true})
+            else
+                print("error: unable to delete '" .. spec.ref:gsub("^refs/%a+/", "") .. "': remote ref does not exist")
+            end
+        elseif remoteSha ~= newSha then
+            local rejected = false
+            if remoteSha and spec.ref:match("^refs/heads/") and not spec.force then
+                rejected = not is_ancestor_commit(remoteSha, newSha)
+            elseif remoteSha and spec.ref:match("^refs/tags/") and not spec.force then
+                rejected = true
+            end
+
+            if rejected then
+                local short = spec.ref:gsub("^refs/%a+/", "")
+                local lines = {
+                    "To " .. url,
+                    " ! [rejected]        " .. spec.label .. " -> " .. short .. (spec.ref:match("^refs/tags/") and " (already exists)" or " (non-fast-forward)"),
+                    "error: failed to push some refs to '" .. url .. "'",
+                }
+                if spec.ref:match("^refs/heads/") then
+                    table.insert(lines, "hint: Updates were rejected because the tip of your current branch is behind")
+                    table.insert(lines, "hint: its remote counterpart. Integrate the remote changes (e.g.")
+                    table.insert(lines, "hint: 'git pull') before pushing again, or use '--force' to overwrite.")
+                end
+                error(table.concat(lines, "\n"))
+                return
+            end
+            table.insert(updates, {ref = spec.ref, old = remoteSha or ZERO_SHA, new = newSha, label = spec.label})
+        end
     end
-    assert(localSha, "Nothing to push (no commits)")
 
-    if localSha == remoteSha then
+    if #updates == 0 then
         print("Everything up-to-date")
         return
     end
 
-    if remoteSha and not force_push then
-        local is_ff = false
-        local current = localSha
-        local q = {current}
-        local visited = {}
-        
-        while #q > 0 do
-            local sha = table.remove(q, 1)
-            if sha == remoteSha then
-                is_ff = true
-                break
-            end
-            if not visited[sha] then
-                visited[sha] = true
-                local obj = Handlers.read_object(sha)
-                if obj and obj.type == "commit" then
-                    for parent in obj.content:gmatch("\nparent (%x+)") do
-                        table.insert(q, parent)
-                    end
+    --// Everything the server already has doesn't need to be sent again
+    local known = {}
+    for name, sha in pairs(refs) do
+        if (name:match("^refs/heads/") or name:match("^refs/tags/")) and Handlers.read_object(sha) then
+            table.insert(known, sha)
+        end
+    end
+
+    local objects = {}
+    local objectCount = 0
+    local has_pack = false
+    for _, update in ipairs(updates) do
+        if not update.delete then
+            has_pack = true
+            for sha, obj in pairs(Handlers.collectObjects(update.new, known)) do
+                if not objects[sha] then
+                    objects[sha] = obj
+                    objectCount += 1
                 end
             end
         end
-        
-        if not is_ff then
-            print("To " .. url)
-            print(" ! [rejected]        " .. branch_name .. " -> " .. branch_name .. " (non-fast-forward)")
-            print("error: failed to push some refs to '" .. url .. "'")
-            print("hint: Updates were rejected because the tip of your current branch is behind")
-            print("hint: its remote counterpart. Integrate the remote changes (e.g.")
-            print("hint: 'git pull' before pushing again.")
-            return
+    end
+
+    local packFile = ""
+    if has_pack then
+        print(string.format("Enumerating objects: %d, done.", objectCount))
+        packFile = Handlers.buildPackfile(objects)
+        local packSize = #packFile
+        print(string.format("Writing objects: 100%% (%d/%d), %.2f KiB, done.", objectCount, objectCount, packSize / 1024))
+    end
+
+    local parts = {}
+    for i, update in ipairs(updates) do
+        local line = update.old .. " " .. update.new .. " " .. update.ref
+        if i == 1 then
+            line = line .. "\0report-status side-band-64k" .. (delete and " delete-refs" or "")
         end
+        table.insert(parts, buffer.tostring(git_proto.encodePkt(buffer.fromstring(line .. "\n"))))
     end
-
-    local local_tracking = Handlers.get_ref("refs/remotes/" .. remote_name .. "/" .. branch_name)
-    local common_ancestor = remoteSha
-    if remoteSha and not Handlers.read_object(remoteSha) then
-        common_ancestor = local_tracking
-    end
-
-    local objects = Handlers.collectObjects(localSha, common_ancestor)
-
-    local objectCount = 0
-    for _ in pairs(objects) do
-        objectCount = objectCount + 1
-    end
-
-    print(string.format("Enumerating objects: %d, done.", objectCount))
-    print(string.format("Counting objects: 100%% (%d/%d), done.", objectCount, objectCount))
-
-    local packFile = Handlers.buildPackfile(objects)
-    local packSize = #packFile
-
-    print(string.format("Compressing objects: 100%% (%d/%d), done.", objectCount, objectCount))
-    print(string.format("Writing objects: 100%% (%d/%d), %d bytes | %.2f KiB/s, done.", objectCount, objectCount, packSize, packSize / 1024))
-    print(string.format("Total %d (delta 0), reused 0 (delta 0), pack-reused 0", objectCount))
-
-    local oldSha = remoteSha or ("0"):rep(40)
-    local refLine = oldSha.." "..localSha.." refs/heads/"..branch_name.."\0report-status side-band-64k\n"
-    local refPkt = buffer.tostring(git_proto.encodePkt(buffer.fromstring(refLine)))
-    local flushStr = buffer.tostring(git_proto.flush())
-
-    local body = refPkt .. flushStr .. packFile
+    table.insert(parts, buffer.tostring(git_proto.flush()))
+    table.insert(parts, packFile)
 
     local req = {
         Url = Utilities.return_urls(url, "git-receive-pack")[2],
@@ -1780,108 +2082,154 @@ arguments.createArgument("git", "push", "", function(...)
             ["Accept"] = "application/x-git-receive-pack-result",
             ["Authorization"] = Auth.getAuthHeader(url:match("^(https?://[^/]+)") or url)
         },
-        Body = body,
+        Body = table.concat(parts),
     }
 
     local ok, res = Requests.url_request_with_retry(req)
-    assert(ok, "Push request error")
+    assert(ok, "Push request error: " .. tostring(res))
 
-    if res.StatusCode == 200 then
-        local remote_messages = {}
-        local success_message = "To " .. url .. "\n"
+    if res.StatusCode ~= 200 then
+        local lines = {"error: failed to push some refs to '" .. url .. "'", "remote: HTTP Status Code: " .. res.StatusCode}
+        if res.StatusCode == 401 or res.StatusCode == 403 then
+            table.insert(lines, "remote: authentication failed, check your username and token (git config --global user.token <token>)")
+        end
+        for line in string.gmatch(res.Body, "[^\n]+") do
+            table.insert(lines, "remote: " .. line)
+        end
+        error(table.concat(lines, "\n"))
+        return
+    end
 
-        local response_buffer = buffer.fromstring(res.Body)
-        local cursor = 0
-        while cursor < buffer.len(response_buffer) do
-            local data, next = git_proto.decodePkt(response_buffer, cursor)
-            cursor = next
-            Utilities.roYield()
-            if data then
-                local channel = buffer.readu8(data, 0)
-                local line = buffer.tostring(data)
-                line = line:sub(2)
-                
-                line = line:gsub("[\r\n]+", "")
+    local remote_messages = {}
+    local results = {}
+    local report_seen = false
 
-                if channel == 2 then 
-                    if line:find("^Resolving deltas") then
-                        table.insert(remote_messages, "remote: " .. line)
-                    else
-                        table.insert(remote_messages, line)
+    local response_buffer = buffer.fromstring(res.Body)
+    local cursor = 0
+    while cursor < buffer.len(response_buffer) do
+        local data, next = git_proto.decodePkt(response_buffer, cursor)
+        cursor = next
+        Utilities.roYield()
+        if data then
+            local channel = buffer.readu8(data, 0)
+            local text = buffer.tostring(data)
+            if channel == 1 then
+                for _, line in ipairs(parse_report_lines(text:sub(2))) do
+                    report_seen = true
+                    local okRef = line:match("^ok (.+)$")
+                    local ngRef, reason = line:match("^ng (%S+) (.+)$")
+                    if okRef then
+                        results[okRef] = {ok = true}
+                    elseif ngRef then
+                        results[ngRef] = {ok = false, reason = reason}
+                    elseif line:match("^unpack ") and line ~= "unpack ok" then
+                        table.insert(remote_messages, "error: " .. line)
                     end
-                elseif channel == 1 then
-                    if line:find("^unpack ") then
-                    elseif line:find("^ok ") then
-                        if not remoteSha or remoteSha == "" then
-                            success_message = success_message .. " * [new branch]      " .. branch_name .. " -> " .. branch_name .. "\n"
-                        else
-                            success_message = success_message .. "   " .. string.sub(oldSha, 1, 7) .. ".." .. string.sub(localSha, 1, 7) .. "  " .. branch_name .. " -> " .. branch_name .. "\n"
-                        end
-                    elseif line:find("^ng ") then
-                        local _ref, reason = line:match("^ng (.-) (.+)$")
-                        success_message = success_message .. " ! [rejected]        " .. branch_name .. " -> " .. branch_name .. " (" .. (reason or "unknown") .. ")\n"
-                    elseif line ~= "" and not line:find("0000") then
-                    end
-                else
-                    local full_line = buffer.tostring(data)
-                    full_line = full_line:gsub("[\r\n]+", "")
-                    if full_line:find("^unpack ") then
-                    elseif full_line:find("^ok ") then
-                        if not remoteSha or remoteSha == "" then
-                            success_message = success_message .. " * [new branch]      " .. branch_name .. " -> " .. branch_name .. "\n"
-                        else
-                            success_message = success_message .. "   " .. string.sub(oldSha, 1, 7) .. ".." .. string.sub(localSha, 1, 7) .. "  " .. branch_name .. " -> " .. branch_name .. "\n"
-                        end
-                    elseif full_line:find("^ng ") then
-                        local _ref, reason = full_line:match("^ng (.-) (.+)$")
-                        success_message = success_message .. " ! [rejected]        " .. branch_name .. " -> " .. branch_name .. " (" .. (reason or "unknown") .. ")\n"
+                end
+            elseif channel == 2 then
+                for line in text:sub(2):gmatch("[^\r\n]+") do
+                    table.insert(remote_messages, "remote: " .. line)
+                end
+            elseif channel == 3 then
+                table.insert(remote_messages, "remote error: " .. text:sub(2))
+            else
+                for _, line in ipairs(parse_report_lines(text)) do
+                    local okRef = line:match("^ok (.+)$")
+                    local ngRef, reason = line:match("^ng (%S+) (.+)$")
+                    if okRef then
+                        report_seen = true
+                        results[okRef] = {ok = true}
+                    elseif ngRef then
+                        report_seen = true
+                        results[ngRef] = {ok = false, reason = reason}
                     end
                 end
             end
         end
+    end
 
-        if #remote_messages > 0 then
-            print(table.concat(remote_messages, "\n"))
-        end
-        
-        print(success_message:gsub("\n$", ""))
+    if #remote_messages > 0 then
+        print(table.concat(remote_messages, "\n"))
+    end
 
-        if set_upstream then
-            local branch_section = 'branch "' .. branch_name .. '"'
-            loaded_conf[branch_section] = {
-                remote = remote_name,
-                merge = "refs/heads/" .. branch_name
-            }
-            bash.modifyFileContents(root, "config", ini_parser.serializeIni(loaded_conf))
-            print("Branch '" .. branch_name .. "' set up to track remote branch '" .. branch_name .. "' from '" .. remote_name .. "'.")
+    local summary = {"To " .. url}
+    local failed = false
+    for _, update in ipairs(updates) do
+        local short = update.ref:gsub("^refs/%a+/", "")
+        local result = results[update.ref]
+        local accepted = (result and result.ok) or (not result and not report_seen)
+
+        if accepted then
+            local isTag = update.ref:match("^refs/tags/") ~= nil
+            if update.delete then
+                table.insert(summary, " - [deleted]         " .. short)
+                Handlers.delete_ref("refs/remotes/" .. remote_name .. "/" .. short)
+            elseif update.old == ZERO_SHA then
+                table.insert(summary, string.format(" * [new %s]      %s -> %s", isTag and "tag" or "branch", update.label, short))
+            else
+                table.insert(summary, string.format("   %s..%s  %s -> %s", update.old:sub(1, 7), update.new:sub(1, 7), update.label, short))
+            end
+
+            if update.ref:match("^refs/heads/") and not update.delete then
+                Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. short, update.new)
+            end
+        else
+            failed = true
+            table.insert(summary, string.format(" ! [remote rejected] %s -> %s (%s)", update.label, short, result and result.reason or "no status reported"))
         end
-    else
-        print("error: failed to push some refs to '" .. url .. "'")
-        print("remote: HTTP Status Code: " .. res.StatusCode)
-        for line in string.gmatch(res.Body, "[^\n]+") do
-            print("remote: " .. line)
+    end
+    if failed then
+        table.insert(summary, "error: failed to push some refs to '" .. url .. "'")
+        error(table.concat(summary, "\n"))
+        return
+    end
+    print(table.concat(summary, "\n"))
+
+    if set_upstream then
+        for _, update in ipairs(updates) do
+            local branch = update.ref:match("^refs/heads/(.+)$")
+            if branch and not update.delete then
+                loaded_conf['branch "' .. branch .. '"'] = {
+                    remote = remote_name,
+                    merge = "refs/heads/" .. branch
+                }
+                bash.modifyFileContents(root, "config", ini_parser.serializeIni(loaded_conf))
+                print("Branch '" .. branch .. "' set up to track remote branch '" .. branch .. "' from '" .. remote_name .. "'.")
+            end
         end
     end
 end)
 
 --[[
+Counts how many commits `local_sha` is ahead of / behind `other_sha`.
+]]
+local function count_ahead_behind(local_sha, other_sha)
+    local mine, theirs = Handlers.ancestors(local_sha), Handlers.ancestors(other_sha)
+    local ahead, behind = 0, 0
+    for sha in pairs(mine) do
+        if not theirs[sha] then ahead += 1 end
+    end
+    for sha in pairs(theirs) do
+        if not mine[sha] then behind += 1 end
+    end
+    return ahead, behind
+end
+
+--[[
 commands:
 status
+st
 
 gets status of branch/changes
 ]]
 arguments.createArgument("git", "status", "st", function()
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    Handlers.load_ignore_patterns()
 
     local index = Handlers.read_index()
     local headSha = Handlers.get_ref("HEAD")
-    local current_branch = Handlers.get_current_branch() or "master"
-
-    local last_index = {}
-    local last_index_str = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
-    if last_index_str and last_index_str ~= "" then
-        last_index = HttpService:JSONDecode(last_index_str)
-    end
+    local current_branch = Handlers.get_current_branch()
+    local last_index = read_last_index()
 
     local staged_new = {}
     local staged_modified = {}
@@ -1900,12 +2248,33 @@ arguments.createArgument("git", "status", "st", function()
             table.insert(staged_deleted, path)
         end
     end
+    table.sort(staged_new)
+    table.sort(staged_modified)
+    table.sort(staged_deleted)
+
+    if current_branch then
+        print("On branch " .. current_branch)
+
+        local upstream = Handlers.get_ref("refs/remotes/origin/" .. current_branch)
+        if upstream and headSha and headSha ~= "" and Handlers.read_commit(upstream) then
+            local ahead, behind = count_ahead_behind(headSha, upstream)
+            local name = "origin/" .. current_branch
+            if ahead > 0 and behind > 0 then
+                print(string.format("Your branch and '%s' have diverged,\nand have %d and %d different commits each, respectively.", name, ahead, behind))
+            elseif ahead > 0 then
+                print(string.format("Your branch is ahead of '%s' by %d commit%s.", name, ahead, ahead == 1 and "" or "s"))
+            elseif behind > 0 then
+                print(string.format("Your branch is behind '%s' by %d commit%s, and can be fast-forwarded.", name, behind, behind == 1 and "" or "s"))
+            else
+                print(string.format("Your branch is up to date with '%s'.", name))
+            end
+        end
+    else
+        print("HEAD detached at " .. string.sub(headSha or "", 1, 7))
+    end
 
     if not headSha or headSha == "" then
-        print("On branch " .. current_branch)
         print("\nNo commits yet\n")
-    else
-        print("On branch " .. current_branch)
     end
 
     local unstaged_modified, unstaged_deleted = collect_worktree_changes(index)
@@ -1915,30 +2284,158 @@ arguments.createArgument("git", "status", "st", function()
     if has_staged then
         print("Changes to be committed:")
         for _, path in ipairs(staged_new) do
-            print("\tnew file:   " .. path)
+            print("\t\27[32mnew file:   " .. path .. "\27[0m")
         end
         for _, path in ipairs(staged_modified) do
-            print("\tmodified:   " .. path)
+            print("\t\27[32mmodified:   " .. path .. "\27[0m")
         end
         for _, path in ipairs(staged_deleted) do
-            print("\tdeleted:    " .. path)
+            print("\t\27[32mdeleted:    " .. path .. "\27[0m")
         end
     end
 
     if has_unstaged then
         print("Changes not staged for commit:")
         for _, path in ipairs(unstaged_modified) do
-            print("\tmodified:   " .. path)
+            print("\t\27[31mmodified:   " .. path .. "\27[0m")
         end
         for _, path in ipairs(unstaged_deleted) do
-            print("\tdeleted:    " .. path)
+            print("\t\27[31mdeleted:    " .. path .. "\27[0m")
         end
     end
 
+    local untracked = {}
+    for path in pairs(collect_untracked(index)) do
+        table.insert(untracked, path)
+    end
+    table.sort(untracked)
+    if #untracked > 0 then
+        print("Untracked files:")
+        local limit = 50
+        for i, path in ipairs(untracked) do
+            if i > limit then
+                print(string.format("\t... and %d more", #untracked - limit))
+                break
+            end
+            print("\t\27[31m" .. path .. "\27[0m")
+        end
+        print("(use \"git add .\" to track them)")
+    end
+
     if not has_staged and not has_unstaged then
-        print("nothing to commit, working tree clean")
+        print(#untracked > 0 and "nothing added to commit but untracked files present" or "nothing to commit, working tree clean")
     end
 end)
+
+--[[
+Parses the committer timestamp of a commit object.
+]]
+local function commit_time(commit)
+    local line = commit.committer or commit.author or ""
+    return tonumber(line:match("(%d+) [+-]%d+$")) or 0
+end
+
+--[[
+Builds a map of sha -> list of decorations ("HEAD -> main", "origin/main", "tag: v1") for log output.
+]]
+local function collect_decorations()
+    local decorations = {}
+    local head_sha = Handlers.get_ref("HEAD")
+    local current_branch = Handlers.get_current_branch()
+
+    local function add(sha, text)
+        decorations[sha] = decorations[sha] or {}
+        table.insert(decorations[sha], text)
+    end
+
+    if head_sha and head_sha ~= "" then
+        add(head_sha, current_branch and ("HEAD -> " .. current_branch) or "HEAD")
+    end
+
+    local names = {}
+    for refName, sha in pairs(Handlers.list_refs()) do
+        table.insert(names, {name = refName, sha = sha})
+    end
+    table.sort(names, function(x, y) return x.name < y.name end)
+
+    for _, ref in ipairs(names) do
+        local branch = ref.name:match("^refs/heads/(.+)$")
+        local remote = ref.name:match("^refs/remotes/(.+)$")
+        local tag = ref.name:match("^refs/tags/(.+)$")
+        if branch and branch ~= current_branch then
+            add(ref.sha, branch)
+        elseif remote and not remote:match("/HEAD$") then
+            add(ref.sha, remote)
+        elseif tag then
+            --// annotated tags point at the tag object, show them on the commit
+            local obj = Handlers.read_object(ref.sha)
+            local target = ref.sha
+            if obj and obj.type == "tag" then
+                target = obj.content:match("^object (%x+)") or ref.sha
+            end
+            add(target, "tag: " .. tag)
+        end
+    end
+
+    return decorations
+end
+
+--[[
+Walks the history reachable from `start_sha`, newest first (by commit time).
+Calls `visit(sha, commit)` for every commit, return false from it to stop.
+]]
+local function walk_history(start_sha, visit)
+    local frontier = {start_sha}
+    local seen = {[start_sha] = true}
+    local times = {}
+
+    while #frontier > 0 do
+        local best = 1
+        for i = 1, #frontier do
+            local sha = frontier[i]
+            if not times[sha] then
+                local commit = Handlers.read_commit(sha)
+                times[sha] = commit and commit_time(commit) or 0
+            end
+            if times[sha] > times[frontier[best]] then
+                best = i
+            end
+        end
+
+        local sha = table.remove(frontier, best)
+        local commit = Handlers.read_commit(sha)
+        if not commit then return end
+
+        if visit(sha, commit) == false then return end
+
+        for _, parent in ipairs(commit.parents) do
+            if not seen[parent] then
+                seen[parent] = true
+                table.insert(frontier, parent)
+            end
+        end
+        Utilities.roYield()
+    end
+end
+
+local function print_commit_header(sha, commit, decoration_list)
+    local decoration = (decoration_list and #decoration_list > 0) and (" (" .. table.concat(decoration_list, ", ") .. ")") or ""
+    print("\27[33mcommit " .. sha .. "\27[0m" .. decoration)
+    if #commit.parents > 1 then
+        local short = {}
+        for _, parent in ipairs(commit.parents) do table.insert(short, parent:sub(1, 7)) end
+        print("Merge: " .. table.concat(short, " "))
+    end
+
+    local author_line = commit.author or ""
+    local who, time, tz = author_line:match("^(.-) (%d+) ([+%-]%d+)$")
+    if who then
+        print("Author: " .. who)
+        print("Date:   " .. os.date("%a %b %d %H:%M:%S %Y", tonumber(time)) .. " " .. tz)
+    else
+        print("Author: " .. author_line)
+    end
+end
 
 --[[
 commands:
@@ -1952,105 +2449,119 @@ arguments.createArgument("git", "log", "", function(...)
     local tuple = {...}
     local max_count = nil
     local oneline = false
+    local rev = nil
 
     local i = 1
     while i <= #tuple do
-        if tuple[i] == "--oneline" then
+        local arg = tuple[i]
+        if arg == "--oneline" then
             oneline = true
-        elseif (tuple[i] == "-n" or tuple[i]:match("^%-%-max%-count")) and tuple[i + 1] then
+        elseif (arg == "-n" or arg == "--max-count") and tuple[i + 1] then
             max_count = tonumber(tuple[i + 1])
             i += 1
-        elseif tuple[i]:match("^%-(%d+)$") then
-            max_count = tonumber(tuple[i]:match("^%-(%d+)$"))
+        elseif arg:match("^%-%-max%-count=(%d+)$") then
+            max_count = tonumber(arg:match("^%-%-max%-count=(%d+)$"))
+        elseif arg:match("^%-(%d+)$") then
+            max_count = tonumber(arg:match("^%-(%d+)$"))
+        elseif arg:sub(1, 1) ~= "-" then
+            rev = arg
         end
         i += 1
     end
 
-    local sha = Handlers.get_ref("HEAD")
-    if not sha or sha == "" then
-        error("fatal: your current branch 'master' does not have any commits yet")
-        return
-    end
-
-    local refs_map = {}
-    local function scan_refs(dir, prefix)
-        for _, child in ipairs(dir:GetChildren()) do
-            if child:IsA("Folder") then
-                scan_refs(child, prefix .. child.Name .. "/")
-            else
-                local sha = Handlers.get_ref(prefix .. child.Name)
-                if sha then
-                    refs_map[sha] = refs_map[sha] or {}
-                    table.insert(refs_map[sha], prefix .. child.Name)
-                end
-            end
+    local sha
+    if rev then
+        sha = Handlers.resolve_revision(rev)
+        if not sha then
+            error("fatal: ambiguous argument '" .. rev .. "': unknown revision or path not in the working tree.")
+            return
+        end
+    else
+        sha = Handlers.get_ref("HEAD")
+        if not sha or sha == "" then
+            error("fatal: your current branch '" .. (Handlers.get_current_branch() or "master") .. "' does not have any commits yet")
+            return
         end
     end
-    local git_root = bash.getGitFolderRoot()
-    local refs_folder = git_root:FindFirstChild("refs")
-    if refs_folder then scan_refs(refs_folder, "refs/") end
-    
-    local head_sha = Handlers.get_ref("HEAD")
-    local current_branch = Handlers.get_current_branch()
-    
+
+    local decorations = collect_decorations()
     local count = 0
-    while sha do
-        if max_count and count >= max_count then break end
 
-        local obj = Handlers.read_object(sha)
-        if not obj then break end
+    walk_history(sha, function(commit_sha, commit)
+        if max_count and count >= max_count then return false end
 
-        local body = obj.content
-        local msg = body:match("\n\n(.+)$") or ""
-        
-        local decoration = ""
-        local local_refs = refs_map[sha]
-        if local_refs or sha == head_sha then
-            local items = {}
-            if sha == head_sha then
-                if current_branch then
-                    table.insert(items, "HEAD -> " .. current_branch)
-                else
-                    table.insert(items, "HEAD")
-                end
-            end
-            if local_refs then
-                for _, r in ipairs(local_refs) do
-                    local name = r:match("refs/heads/(.+)") or r:match("refs/remotes/(.+)") or r:match("refs/tags/(.+)")
-                    if name and name ~= current_branch then
-                        if r:match("tags/") then
-                            table.insert(items, "tag: " .. name)
-                        else
-                            table.insert(items, name)
-                        end
-                    end
-                end
-            end
-            if #items > 0 then
-                decoration = " (" .. table.concat(items, ", ") .. ")"
-            end
-        end
-
+        local msg = commit.message:gsub("\n+$", "")
         if oneline then
-            print(sha:sub(1, 7) .. decoration .. " " .. (msg:match("^[^\n]+") or msg))
+            local decoration = decorations[commit_sha] and (" (" .. table.concat(decorations[commit_sha], ", ") .. ")") or ""
+            print(commit_sha:sub(1, 7) .. decoration .. " " .. (msg:match("^[^\n]*") or msg))
         else
-            local author_line = body:match("\nauthor ([^\n]+)") or ""
-            local author_name_email, author_time, author_tz = author_line:match("(.-) (%d+) ([+%-%d]+)")
-            
-            print("commit " .. sha .. decoration)
-            if author_name_email and author_time then
-                print("Author: " .. author_name_email)
-                print("Date:   " .. os.date("%a %b %d %H:%M:%S %Y", tonumber(author_time)) .. " " .. author_tz)
-            else
-                print("Author: " .. author_line)
-            end
+            print_commit_header(commit_sha, commit, decorations[commit_sha])
             print("")
-            print("    " .. msg)
+            for line in (msg .. "\n"):gmatch("([^\n]*)\n") do
+                print("    " .. line)
+            end
             print("")
         end
 
         count += 1
-        sha = body:match("\nparent (%x+)")
+        return true
+    end)
+end)
+
+--[[
+commands:
+show
+
+Shows one commit (HEAD by default): its message and which instances changed.
+]]
+arguments.createArgument("git", "show", "", function(...)
+    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+
+    local rev = nil
+    local names_only = false
+    for _, arg in ipairs({...}) do
+        if arg == "--name-only" or arg == "--stat" or arg == "--name-status" then
+            names_only = true
+        elseif arg:sub(1, 1) ~= "-" then
+            rev = arg
+        end
+    end
+
+    local sha = Handlers.resolve_revision(rev or "HEAD")
+    local commit = sha and Handlers.read_commit(sha)
+    if not commit then
+        error("fatal: ambiguous argument '" .. tostring(rev or "HEAD") .. "': unknown revision or path not in the working tree.")
+        return
+    end
+
+    print_commit_header(sha, commit, collect_decorations()[sha])
+    print("")
+    for line in (commit.message:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do
+        print("    " .. line)
+    end
+    print("")
+
+    local parent = commit.parents[1] and Handlers.read_commit(commit.parents[1])
+    local old_index = parent and Handlers.tree_to_index(parent.tree) or {}
+    local new_index = Handlers.tree_to_index(commit.tree)
+
+    local paths, seen = {}, {}
+    for path in pairs(old_index) do seen[path] = true; table.insert(paths, path) end
+    for path in pairs(new_index) do if not seen[path] then table.insert(paths, path) end end
+    table.sort(paths)
+
+    local colors = {A = "\27[32m", M = "\27[33m", D = "\27[31m"}
+    for _, path in ipairs(paths) do
+        local old, new = old_index[path], new_index[path]
+        if not old or not new or old.sha ~= new.sha then
+            local status = (not old and "A") or (not new and "D") or "M"
+            print(colors[status] .. status .. "\27[0m  " .. path)
+            if status == "M" and not names_only then
+                for _, line in ipairs(diff.describe(read_blob_content(old.sha), read_blob_content(new.sha))) do
+                    print(line)
+                end
+            end
+        end
     end
 end)
 
@@ -2065,135 +2576,259 @@ arguments.createArgument("git", "branch", "br", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
 
     local tuple = {...}
+    local mode = "list"
+    local show_remotes, only_remotes, verbose, force = false, false, false, false
+    local positional = {}
 
-    if #tuple == 0 or (tuple[1] == "-a" or tuple[1] == "--all" or tuple[1] == "-r" or tuple[1] == "--remotes") then
-        local show_remotes = tuple[1] == "-a" or tuple[1] == "--all" or tuple[1] == "-r" or tuple[1] == "--remotes"
-        local only_remotes = tuple[1] == "-r" or tuple[1] == "--remotes"
-        
-        local root = bash.getGitFolderRoot()
-        local current_branch = Handlers.get_current_branch()
-        local branches = {}
-        
+    for _, arg in ipairs(tuple) do
+        if arg == "-a" or arg == "--all" then
+            show_remotes = true
+        elseif arg == "-r" or arg == "--remotes" then
+            show_remotes, only_remotes = true, true
+        elseif arg == "-v" or arg == "-vv" or arg == "--verbose" then
+            verbose = true
+        elseif arg == "-d" or arg == "--delete" then
+            mode = "delete"
+        elseif arg == "-D" then
+            mode, force = "delete", true
+        elseif arg == "-m" or arg == "--move" or arg == "-M" then
+            mode = "move"
+        elseif arg == "--show-current" then
+            mode = "current"
+        elseif arg == "-f" or arg == "--force" then
+            force = true
+        elseif arg:sub(1, 1) ~= "-" then
+            table.insert(positional, arg)
+        end
+    end
+
+    local current_branch = Handlers.get_current_branch()
+
+    if mode == "current" then
+        if current_branch then print(current_branch) end
+        return
+    end
+
+    if mode == "list" and #positional == 0 then
+        local entries = {}
         if not only_remotes then
-            local heads = root:FindFirstChild("refs")
-            if heads then heads = heads:FindFirstChild("heads") end
-            if heads then
-                for _, child in ipairs(heads:GetChildren()) do
-                    branches[child.Name] = { is_current = (child.Name == current_branch), is_remote = false }
+            for _, name in ipairs(Handlers.get_branches()) do
+                table.insert(entries, {name = name, display = name, sha = Handlers.get_ref("refs/heads/" .. name), is_current = name == current_branch})
+            end
+        end
+        if show_remotes then
+            for refName, sha in pairs(Handlers.list_refs()) do
+                local remote = refName:match("^refs/remotes/(.+)$")
+                if remote and not remote:match("/HEAD$") then
+                    table.insert(entries, {name = "remotes/" .. remote, display = "\27[31mremotes/" .. remote .. "\27[0m", sha = sha})
                 end
             end
         end
-        
-        if show_remotes or only_remotes then
-            local remotes = root:FindFirstChild("refs")
-            if remotes then remotes = remotes:FindFirstChild("remotes") end
-            if remotes then
-                for _, remote_node in ipairs(remotes:GetChildren()) do
-                    for _, branch_node in ipairs(remote_node:GetChildren()) do
-                        local name = remote_node.Name .. "/" .. branch_node.Name
-                        if not branches[name] then
-                            branches[name] = { is_current = false, is_remote = true }
-                        end
-                    end
-                end
+        table.sort(entries, function(x, y) return x.name < y.name end)
+
+        for _, entry in ipairs(entries) do
+            local line = (entry.is_current and "* " or "  ") .. (entry.is_current and ("\27[32m" .. entry.display .. "\27[0m") or entry.display)
+            if verbose and entry.sha then
+                local commit = Handlers.read_commit(entry.sha)
+                line = line .. " " .. entry.sha:sub(1, 7) .. " " .. (commit and commit.message:match("^[^\n]*") or "")
             end
+            print(line)
         end
 
-        local names = {}
-        for name in pairs(branches) do table.insert(names, name) end
-        table.sort(names)
-
-        for _, name in ipairs(names) do
-            local data = branches[name]
-            -- Filter out HEAD symbolic refs from listing
-            if name:match("/HEAD$") then continue end
-
-            local prefix = data.is_current and "* " or "  "
-            if data.is_remote then
-                print(prefix .. "remotes/" .. name)
-            else
-                print(prefix .. name)
-            end
-        end
-        
-        if not next(branches) and current_branch then
+        if #entries == 0 and current_branch then
             print("* " .. current_branch)
         end
         return
     end
 
-    if tuple[1] == "-d" or tuple[1] == "--delete" or tuple[1] == "-D" then
-        local branch = tuple[2]
-        assert(branch, "fatal: branch name required")
-
-        local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
-        local current_branch = current_ref:match("ref: refs/heads/(.+)")
-        if current_branch == branch then
-            print("error: Cannot delete branch '" .. branch .. "' checked out at '" .. bash.getGitFolderRoot().Parent:GetFullName() .. "'")
-            return
-        end
-
-        local heads = bash.getGitFolderRoot():FindFirstChild("refs")
-        if heads then heads = heads:FindFirstChild("heads") end
-        if heads then
-            local ref = heads:FindFirstChild(branch)
-            if ref then
-                ref:Destroy()
-                print("Deleted branch " .. branch)
+    if mode == "delete" then
+        assert(#positional > 0, "fatal: branch name required")
+        for _, branch in ipairs(positional) do
+            if current_branch == branch then
+                print("error: Cannot delete branch '" .. branch .. "' checked out at '" .. bash.getGitFolderRoot().Parent:GetFullName() .. "'")
             else
-                print("error: branch '" .. branch .. "' not found.")
+                local sha = Handlers.get_ref("refs/heads/" .. branch)
+                if not sha then
+                    print("error: branch '" .. branch .. "' not found.")
+                else
+                    local head_sha = Handlers.get_ref("HEAD")
+                    if not force and head_sha and not is_ancestor_commit(sha, head_sha) then
+                        print("error: The branch '" .. branch .. "' is not fully merged.")
+                        print("If you are sure you want to delete it, run 'git branch -D " .. branch .. "'")
+                    else
+                        Handlers.delete_ref("refs/heads/" .. branch)
+                        print("Deleted branch " .. branch .. " (was " .. sha:sub(1, 7) .. ").")
+                    end
+                end
             end
         end
         return
     end
 
-    if tuple[1] == "-m" or tuple[1] == "--move" then
-        local old_branch = tuple[2]
-        local new_branch = tuple[3]
+    if mode == "move" then
+        local old_branch, new_branch = positional[1], positional[2]
         if not new_branch then
             new_branch = old_branch
-            local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
-            old_branch = current_ref:match("ref: refs/heads/(.+)")
+            old_branch = current_branch
         end
         assert(old_branch and new_branch, "usage: git branch -m [<old>] <new>")
+        assert(is_valid_branch_name(new_branch), "fatal: '" .. new_branch .. "' is not a valid branch name.")
 
         local sha = Handlers.get_ref("refs/heads/" .. old_branch)
         assert(sha, "error: refname refs/heads/" .. old_branch .. " not found")
+        assert(force or old_branch == new_branch or not Handlers.get_ref("refs/heads/" .. new_branch), "fatal: a branch named '" .. new_branch .. "' already exists")
 
-        Handlers.update_ref("refs/heads/" .. new_branch, sha)
-
-        local heads = bash.getGitFolderRoot():FindFirstChild("refs")
-        if heads then heads = heads:FindFirstChild("heads") end
-        if heads then
-            local old_ref = heads:FindFirstChild(old_branch)
-            if old_ref then old_ref:Destroy() end
-        end
-
-        local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
-        if current_ref:match("ref: refs/heads/(.+)") == old_branch then
-            bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", "ref: refs/heads/" .. new_branch)
+        if old_branch ~= new_branch then
+            Handlers.update_ref("refs/heads/" .. new_branch, sha)
+            Handlers.delete_ref("refs/heads/" .. old_branch)
+            if current_branch == old_branch then
+                bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", "ref: refs/heads/" .. new_branch)
+            end
         end
         return
     end
 
-    local branch_name = tuple[1]
+    local branch_name = positional[1]
     assert(is_valid_branch_name(branch_name), "fatal: '" .. tostring(branch_name) .. "' is not a valid branch name.")
-    
-    local start_point = tuple[2]
-    if not start_point then
-        local head_sha = Handlers.get_ref("HEAD")
-        if not head_sha or head_sha == "" then
+    assert(force or not Handlers.get_ref("refs/heads/" .. branch_name), "fatal: a branch named '" .. branch_name .. "' already exists")
+
+    local start_point = positional[2]
+    local sha = Handlers.resolve_revision(start_point or "HEAD")
+    if not sha or sha == "" then
+        if not start_point then
             error("fatal: cannot create branch '" .. branch_name .. "' because there are no commits yet")
             print("hint: create your first commit, then run 'git branch " .. branch_name .. "'")
             return
         end
+        error("fatal: Not a valid object name: '" .. start_point .. "'.")
+        return
     end
 
-    local sha = start_point and Handlers.get_ref("refs/heads/" .. start_point) or Handlers.get_ref("HEAD")
-    assert(sha and sha ~= "", "fatal: Not a valid object name: '" .. (start_point or "HEAD") .. "'.")
     Handlers.update_ref("refs/heads/" .. branch_name, sha)
     print("Created branch '" .. branch_name .. "'")
 end)
+
+--[[
+commands:
+tag
+
+create, list or delete tags
+]]
+arguments.createArgument("git", "tag", "", function(...)
+    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+
+    local tuple = {...}
+    local annotated, delete, list = false, false, false
+    local message = nil
+    local force = false
+    local positional = {}
+
+    local i = 1
+    while i <= #tuple do
+        local arg = tuple[i]
+        if arg == "-a" or arg == "--annotate" then
+            annotated = true
+        elseif arg == "-d" or arg == "--delete" then
+            delete = true
+        elseif arg == "-l" or arg == "--list" then
+            list = true
+        elseif arg == "-f" or arg == "--force" then
+            force = true
+        elseif (arg == "-m" or arg == "--message") and tuple[i + 1] then
+            message = tuple[i + 1]
+            annotated = true
+            i += 1
+        elseif arg:sub(1, 1) ~= "-" then
+            table.insert(positional, arg)
+        end
+        i += 1
+    end
+
+    if list or (#positional == 0 and not delete) then
+        local pattern = positional[1]
+        local names = {}
+        for refName in pairs(Handlers.list_refs()) do
+            local tag = refName:match("^refs/tags/(.+)$")
+            if tag and not tag:match("%^{}$") then
+                if not pattern then
+                    table.insert(names, tag)
+                else
+                    local lua_pattern = "^" .. pattern:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"):gsub("%*", ".*") .. "$"
+                    if tag:match(lua_pattern) then table.insert(names, tag) end
+                end
+            end
+        end
+        table.sort(names)
+        for _, tag in ipairs(names) do print(tag) end
+        return
+    end
+
+    if delete then
+        assert(#positional > 0, "fatal: tag name required")
+        for _, tag in ipairs(positional) do
+            local sha = Handlers.get_ref("refs/tags/" .. tag)
+            if sha and Handlers.delete_ref("refs/tags/" .. tag) then
+                print("Deleted tag '" .. tag .. "' (was " .. sha:sub(1, 7) .. ")")
+            else
+                print("error: tag '" .. tag .. "' not found.")
+            end
+        end
+        return
+    end
+
+    local name = positional[1]
+    assert(is_valid_branch_name(name), "fatal: '" .. tostring(name) .. "' is not a valid tag name.")
+    assert(force or not Handlers.get_ref("refs/tags/" .. name), "fatal: tag '" .. name .. "' already exists")
+
+    local target = Handlers.resolve_revision(positional[2] or "HEAD")
+    if not target then
+        error("fatal: Failed to resolve '" .. (positional[2] or "HEAD") .. "' as a valid ref.")
+        return
+    end
+
+    local ref_sha = target
+    if annotated then
+        local tag_message = message or "Tag " .. name
+        local content = string.format("object %s\ntype commit\ntag %s\ntagger %s\n\n%s\n", target, name, make_signature(), tag_message)
+        ref_sha = Handlers.write_object("tag", content)
+    end
+    Handlers.update_ref("refs/tags/" .. name, ref_sha)
+end)
+
+--[[
+Moves HEAD/the working tree to `target_sha`. `branch` is the branch to attach HEAD to (nil = detached).
+Downloads the commit first if we only know it from the remote.
+]]
+local function switch_to(target_sha, branch, create)
+    local commit = Handlers.read_commit(target_sha)
+    if not commit then
+        print("Branch data not found locally. Fetching from origin...")
+        local ok = pcall(Remote.fetch, "origin", true)
+        commit = ok and Handlers.read_commit(target_sha)
+    end
+    assert(commit and commit.tree, "fatal: unable to read commit " .. target_sha .. " (try 'git fetch')")
+
+    local current_sha = Handlers.get_ref("HEAD")
+    if target_sha ~= current_sha then
+        local dirty = dirty_changes()
+        if #dirty > 0 then
+            print_dirty_abort(dirty, "checkout")
+            return false
+        end
+    end
+
+    if create then
+        Handlers.update_ref("refs/heads/" .. branch, target_sha)
+    end
+    bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", branch and ("ref: refs/heads/" .. branch) or target_sha)
+
+    if target_sha ~= current_sha then
+        print("Checking out files: 100% done.")
+        local ok, err = Remote.checkout(commit.tree)
+        assert(ok, err)
+    end
+    return true
+end
 
 --[[
 commands:
@@ -2205,89 +2840,75 @@ arguments.createArgument("git", "switch", "", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
 
     local tuple = {...}
-    
-    local create_branch = false
-    local branch_name = ""
-    
-    if tuple[1] == "-c" or tuple[1] == "--create" then
-        create_branch = true
-        branch_name = tuple[2]
-    else
-        branch_name = tuple[1]
+    local create_branch, detach, force_create = false, false, false
+    local positional = {}
+    for _, arg in ipairs(tuple) do
+        if arg == "-c" or arg == "--create" then
+            create_branch = true
+        elseif arg == "-C" then
+            create_branch, force_create = true, true
+        elseif arg == "-d" or arg == "--detach" then
+            detach = true
+        elseif arg:sub(1, 1) ~= "-" or arg == "-" then
+            table.insert(positional, arg)
+        end
     end
-    
-    if not branch_name or branch_name == "" then
-        error("fatal: branch name required")
-        print("usage: git switch [-c | --create] <branch>")
+
+    local name = positional[1]
+    if not name or name == "" then
+        error("fatal: missing branch or commit argument")
+        print("usage: git switch [-c | --create] <branch> [<start-point>]")
         return
     end
-    
-    assert(is_valid_branch_name(branch_name), "fatal: invalid reference: " .. tostring(branch_name))
 
     local current_branch = Handlers.get_current_branch()
-    if not create_branch and current_branch == branch_name then
-        print("Already on '" .. branch_name .. "'")
+
+    if detach then
+        local sha = Handlers.resolve_revision(name)
+        assert(sha, "fatal: invalid reference: " .. name)
+        if switch_to(sha, nil, false) then
+            print("HEAD is now at " .. sha:sub(1, 7) .. " (detached)")
+        end
         return
     end
 
-    local current_sha = Handlers.get_ref("HEAD")
-    local target_sha = nil
+    assert(is_valid_branch_name(name), "fatal: invalid reference: " .. tostring(name))
 
     if create_branch then
-        assert(current_sha and current_sha ~= "", "fatal: you are on a branch with no commits yet")
-        target_sha = current_sha
-    else
-        local heads = bash.getGitFolderRoot():FindFirstChild("refs")
-        if heads then heads = heads:FindFirstChild("heads") end
-        local branch_exists = heads and heads:FindFirstChild(branch_name)
-        assert(branch_exists, "fatal: invalid reference: " .. branch_name)
-        target_sha = Handlers.get_ref("refs/heads/" .. branch_name)
-        assert(target_sha and target_sha ~= "", "fatal: invalid reference: " .. branch_name)
+        assert(force_create or not Handlers.get_ref("refs/heads/" .. name), "fatal: a branch named '" .. name .. "' already exists")
+        local start_sha = Handlers.resolve_revision(positional[2] or "HEAD")
+        assert(start_sha and start_sha ~= "", positional[2] and ("fatal: invalid reference: " .. positional[2]) or "fatal: you are on a branch with no commits yet")
+        if switch_to(start_sha, name, true) then
+            print("Switched to a new branch '" .. name .. "'")
+        end
+        return
     end
 
-    if target_sha ~= current_sha then
-        local index = Handlers.read_index()
-        local modified, deleted = collect_worktree_changes(index)
-        if #modified + #deleted > 0 then
-            print("error: Your local changes to the following files would be overwritten by checkout:")
-            for _, path in ipairs(modified) do
-                print("\t" .. path)
+    if current_branch == name then
+        print("Already on '" .. name .. "'")
+        return
+    end
+
+    local target_sha = Handlers.get_ref("refs/heads/" .. name)
+    local created_tracking = false
+    if not target_sha or target_sha == "" then
+        --// like git: `git switch feature` creates a local branch that tracks origin/feature
+        for _, remote_ref in ipairs({"origin/" .. name}) do
+            local remote_sha = Handlers.get_ref("refs/remotes/" .. remote_ref)
+            if remote_sha and remote_sha ~= "" then
+                target_sha = remote_sha
+                created_tracking = true
             end
-            for _, path in ipairs(deleted) do
-                print("\t" .. path)
-            end
-            print("Please commit your changes or restore them before you switch branches.")
-            print("Aborting")
-            return
         end
     end
+    assert(target_sha and target_sha ~= "", "fatal: invalid reference: " .. name)
 
-    if create_branch then
-        Handlers.update_ref("refs/heads/" .. branch_name, target_sha)
-    end
-    
-    bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", "ref: refs/heads/" .. branch_name)
-    
-    target_sha = Handlers.get_ref("HEAD")
-    local tree_sha = ""
-    if target_sha then
-        local commit_obj = Handlers.read_object(target_sha)
-        if commit_obj then
-            tree_sha = commit_obj.content:match("^tree (%x+)") or ""
+    if switch_to(target_sha, name, created_tracking) then
+        if created_tracking then
+            print("branch '" .. name .. "' set up to track 'origin/" .. name .. "'.")
         end
+        print("Switched to branch '" .. name .. "'")
     end
-
-    if tree_sha ~= "" then
-        print("Checking out files: 100% done.")
-        Remote.checkout(tree_sha)
-    else
-        print("Branch data not found locally. Fetching and pulling from origin...")
-        local status, err = pcall(function()
-            arguments.execute("git", "pull")
-        end)
-        if not status then warn("Pull failed: " .. tostring(err)) end
-    end
-    print("Switched to " .. (create_branch and "a new branch '" or "branch '") .. branch_name .. "'")
 end)
 
 --[[
@@ -2298,7 +2919,6 @@ ck
 checkout branch or files
 ]]
 arguments.createArgument("git", "checkout", "ck", function(...)
-    
     local tuple = {...}
     if #tuple == 0 then
         error("fatal: you must specify a branch or path to checkout")
@@ -2306,14 +2926,24 @@ arguments.createArgument("git", "checkout", "ck", function(...)
     end
 
     local first = tuple[1]
-    
-    if first == "-b" then
+
+    if first == "-b" or first == "-B" then
         local branch = tuple[2]
         if not branch then
             error("fatal: branch name required for -b")
             return
         end
-        arguments.execute("git", "switch", "-c", branch)
+        arguments.execute("git", "switch", first == "-b" and "-c" or "-C", table.unpack(tuple, 2))
+        return
+    end
+
+    if first == "--detach" or first == "-d" then
+        arguments.execute("git", "switch", "--detach", table.unpack(tuple, 2))
+        return
+    end
+
+    if first == "--" then
+        arguments.execute("git", "restore", table.unpack(tuple, 2))
         return
     end
 
@@ -2322,30 +2952,19 @@ arguments.createArgument("git", "checkout", "ck", function(...)
         error("fatal: not a git repository")
         return
     end
-    
-    local heads = root:FindFirstChild("refs")
-    if heads then heads = heads:FindFirstChild("heads") end
-    local remotes = root:FindFirstChild("refs")
-    if remotes then remotes = remotes:FindFirstChild("remotes") end
-    
-    local is_branch = (heads and heads:FindFirstChild(first))
-    if not is_branch and remotes then
-        for _, r in ipairs(remotes:GetChildren()) do
-            if r:FindFirstChild(first) then
-                local remote_sha = Handlers.get_ref("refs/remotes/" .. r.Name .. "/" .. first)
-                Handlers.update_ref("refs/heads/" .. first, remote_sha)
-                print("Branch '" .. first .. "' set up to track remote branch '" .. first .. "' from '" .. r.Name .. "'.")
-                arguments.execute("git", "switch", first)
-                return
-            end
-        end
+
+    if Handlers.get_ref("refs/heads/" .. first) or Handlers.get_ref("refs/remotes/origin/" .. first) then
+        arguments.execute("git", "switch", first)
+        return
     end
 
-    if is_branch then
-        arguments.execute("git", "switch", first)
-    else
-        arguments.execute("git", "restore", ...)
+    --// A tag, commit hash or remote branch: detach HEAD there (unless it's really a path to an instance)
+    if not Utilities.parse_path(first) and Handlers.resolve_revision(first) then
+        arguments.execute("git", "switch", "--detach", first)
+        return
     end
+
+    arguments.execute("git", "restore", table.unpack(tuple))
 end)
 
 --[[
@@ -2390,12 +3009,7 @@ arguments.createArgument("git", "reset", "", function(...)
 
     if #positional > 0 then
         local first = positional[1]
-        local is_commit = false
-        if first == "HEAD" or Handlers.get_ref("refs/heads/" .. first) then
-            is_commit = true
-        elseif #first >= 7 and first:match("^%x+$") then
-            is_commit = true
-        end
+        local is_commit = Handlers.resolve_revision(first) ~= nil and not Utilities.parse_path(first)
         
         if is_commit then
             commit_target = table.remove(positional, 1)
@@ -2476,182 +3090,51 @@ arguments.createArgument("git", "reset", "", function(...)
         return
     end
 
-    local target_sha = commit_target
-    if target_sha == "HEAD" then
-        target_sha = Handlers.get_ref("HEAD")
-    else
-        local potential_ref = Handlers.get_ref("refs/heads/" .. commit_target)
-        if potential_ref then
-            target_sha = potential_ref
-        elseif #target_sha >= 7 then
-            local found_full = false
-            local objects_dir = bash.getGitFolderRoot():FindFirstChild("objects")
-            if objects_dir then
-                local prefix = target_sha:sub(1, 2)
-                local rem = target_sha:sub(3)
-                local prefix_dir = objects_dir:FindFirstChild(prefix)
-                if prefix_dir then
-                    for _, child in ipairs(prefix_dir:GetChildren()) do
-                        if child.Name:sub(1, #rem) == rem then
-                            target_sha = prefix .. child.Name
-                            found_full = true
-                            break
-                        end
-                    end
-                end
-            end
-            if not found_full then
-                local obj = Handlers.read_object(target_sha) 
-                if not obj then
-                   error("fatal: ambiguous argument '" .. commit_target .. "': unknown revision or path not in the working tree.")
-                end
-            end
-        end
+    local target_sha = Handlers.resolve_revision(commit_target)
+    if not target_sha or target_sha == "" then
+        error("fatal: ambiguous argument '" .. commit_target .. "': unknown revision or path not in the working tree.")
+        return
     end
 
-    assert(target_sha and target_sha ~= "", "fatal: Not a valid object name: '" .. commit_target .. "'.")
+    local target_commit = Handlers.read_commit(target_sha)
+    if not target_commit or not target_commit.tree then
+        error("fatal: Could not parse object '" .. commit_target .. "'.")
+        return
+    end
 
-    local current_ref = bash.getFileContents(bash.getGitFolderRoot(), "HEAD") or ""
-    local current_branch = current_ref:match("ref: refs/heads/(.+)")
-    
+    local current_branch = Handlers.get_current_branch()
     if current_branch then
         Handlers.update_ref("refs/heads/" .. current_branch, target_sha)
     else
         bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", target_sha)
     end
 
-    if mode == "--soft" then
+    if mode == "--hard" then
+        --// discards everything: instances are rebuilt from the target tree
+        local ok, err = Remote.checkout(target_commit.tree)
+        assert(ok, err)
+        print("HEAD is now at " .. target_sha:sub(1, 7) .. " " .. (target_commit.message:match("^[^\n]*") or ""))
         return
     end
 
-    local target_commit = Handlers.read_object(target_sha)
-    local target_tree_sha = target_commit.content:match("^tree (%x+)")
-
-    local fake_remote_map = {}
-    if mode == "--hard" then
-        local function collect_tree(current_sha)
-            if not current_sha or fake_remote_map[current_sha] then return end
-            local obj = Handlers.read_object(current_sha)
-            if not obj then return end
-            fake_remote_map[current_sha] = obj
-            
-            if obj.type == "tree" then
-                local content = obj.content
-                local pos = 1
-                while pos <= #content do
-                    local spacePos = content:find(" ", pos, true)
-                    local _entry_mode = content:sub(pos, spacePos - 1)
-                    local nullPos = content:find("\0", spacePos, true)
-                    local rawSha = content:sub(nullPos + 1, nullPos + 20)
-                    local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-                    pos = nullPos + 21
-                    collect_tree(child_sha)
-                end
-            end
-        end
-        collect_tree(target_tree_sha)
+    --// --soft keeps the index (so the undone changes show up as staged), --mixed resets it as well
+    local new_index = Handlers.tree_to_index(target_commit.tree)
+    if mode == "--mixed" then
+        Handlers.write_index(new_index)
     end
+    bash.writeFile(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
 
-    local function build_index_from_tree(tree_sha, prefix, new_index)
-        if not tree_sha or tree_sha == "" then return end
-        local obj = Handlers.read_object(tree_sha)
-        if not obj then return end
-        
-        local content = obj.content
-        local pos = 1
-        while pos <= #content do
-            local spacePos = content:find(" ", pos, true)
-            local entry_mode = content:sub(pos, spacePos - 1)
-            local nullPos = content:find("\0", spacePos, true)
-            local name = content:sub(spacePos + 1, nullPos - 1)
-            local rawSha = content:sub(nullPos + 1, nullPos + 20)
-            local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-            pos = nullPos + 21
-            
-            local full_path = prefix == "" and name or (prefix .. "/" .. name)
-            
-            if entry_mode == "40000" then
-                build_index_from_tree(child_sha, full_path, new_index)
-                if mode == "--hard" then
-                    local segments = string.split(full_path, "/")
-                    local currObj = game
-                    for _, segment in ipairs(segments) do
-                        if currObj and currObj:FindFirstChild(segment) then
-                            currObj = currObj:FindFirstChild(segment)
-                        elseif currObj then
-                            pcall(function() currObj = game:GetService(segment) end)
-                        end
-                    end
-                    if not currObj or (currObj.Name ~= name) then
-                    end
-                end
-            else
-                new_index[full_path] = {sha = child_sha, mode = entry_mode}
+    if mode == "--mixed" then
+        local unstaged = {}
+        for _, change in ipairs(git.get_changes()) do
+            if change.status ~= "U" then
+                table.insert(unstaged, change.status .. "\t" .. change.path)
             end
         end
-    end
-
-    local new_index = {}
-    build_index_from_tree(target_tree_sha, "", new_index)
-    
-    local old_index = nil
-    if mode == "--hard" then
-        old_index = Handlers.read_index()
-    end
-
-    Handlers.write_index(new_index)
-    bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
-
-    if mode == "--hard" then
-        local to_destroy = {}
-        for path, _ in pairs(old_index) do
-            if not new_index[path] then
-                local clean_path = path:match("^(.-)/%.properties$") or path
-                local currObj = Utilities.parse_path(clean_path)
-                if currObj and currObj ~= game and currObj.Parent ~= game then
-                    table.insert(to_destroy, currObj)
-                end
-            end
+        if #unstaged > 0 then
+            print("Unstaged changes after reset:")
+            for _, line in ipairs(unstaged) do print(line) end
         end
-        for _, obj in ipairs(to_destroy) do
-            pcall(function() obj:Destroy() end)
-        end
-
-        for _, service in ipairs(bash.trackingRoot) do
-            local obj = Handlers.read_object(target_tree_sha)
-            if obj then
-                local content = obj.content
-                local pos = 1
-                while pos <= #content do
-                    local spacePos = content:find(" ", pos, true)
-                    local entry_mode = content:sub(pos, spacePos - 1)
-                    local nullPos = content:find("\0", spacePos, true)
-                    local name = content:sub(spacePos + 1, nullPos - 1)
-                    local rawSha = content:sub(nullPos + 1, nullPos + 20)
-                    local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-                    pos = nullPos + 21
-                    
-                    if entry_mode == "40000" and service.Name == name then
-                        local objectsByShaFallback = setmetatable({}, {
-                            __index = function(_, key)
-                                local obj = Handlers.read_object(key)
-                                if not obj then return nil end
-                                return {
-                                    objType = ({commit=1, tree=2, blob=3, tag=4})[obj.type],
-                                    content = obj.content
-                                }
-                            end
-                        })
-                        Remote.writeTree(objectsByShaFallback, child_sha, service, name)
-                    end
-                end
-            end
-        end
-        
-        Remote.resolve_instance_refs()
-        print("HEAD is now at " .. target_sha:sub(1, 7))
-    elseif mode == "--mixed" or mode == "--soft" then
-        print("Unstaged changes after reset:")
     end
 end)
 

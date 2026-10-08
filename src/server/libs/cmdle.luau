@@ -3,8 +3,8 @@ local commandle_plugin = {}
 --// Services
 local StudioService = game:GetService("StudioService")
 
---// This is the root of our API
-local commandle_api_root = StudioService:WaitForChild("commandle_api", 5)
+--// This is the root of our API (looked up in setupPlugin, waiting for it here would stall the whole plugin on startup)
+local commandle_api_root = nil
 local argumentsModule = require(script.Parent.Parent.arguments)
 local gitHandlers = require(script.Parent.git_handlers)
 
@@ -34,13 +34,22 @@ local api_objects : api_objects = {
     requestInput = nil
 }
 
+--// Runs a git command, printing the error (if any) instead of "nil" noise when it succeeds
+local function runGit(...)
+    local ok, err = pcall(argumentsModule.execute, "git", ...)
+    if not ok then
+        warn("RoGit: " .. tostring(err):gsub("^.-:%d+: ", ""))
+    end
+    return ok
+end
+
 function commandle_plugin:setupCommands()
     commandle_plugin:createCommands("main", {
         {
             title = "RoGit: Initialize Repository",
 
             callback = function()
-                argumentsModule.execute("git", "init", ".")
+                runGit("init", ".")
                 commandle_plugin:closePalette(true)
             end
         },
@@ -51,11 +60,7 @@ function commandle_plugin:setupCommands()
                 commandle_plugin:requestInput(
                     "Repository URL...",
                     function(input : string)
-                        local _, out = pcall(function()
-                            argumentsModule.execute("git", "clone", input)
-                        end)
-
-                        print(out)
+                        runGit("clone", input)
                         commandle_plugin:closePalette(true)
                     end
                 )
@@ -71,24 +76,13 @@ function commandle_plugin:setupCommands()
                 for _, branch in gitHandlers.get_branches() do
                     -- is current branch?
                     local isCurr = (branch == gitHandlers.get_current_branch())
-                    
-                    -- is current?
-                    if isCurr then
-                        branch = "* " .. branch
-                    end
 
                     -- Insert as command
                     table.insert(commands, {
-                        title = branch,
+                        title = isCurr and ("* " .. branch) or branch,
 
                         callback = function()
-                            -- strip current branch indicator
-                            local _, out = pcall(function()
-                                argumentsModule.execute("git", "checkout", branch:gsub("* ", ""))
-                            end)
-
-                            -- Log out
-                            print(out)
+                            runGit("checkout", branch)
 
                             -- close
                             commandle_plugin:closePalette(true)
@@ -102,11 +96,7 @@ function commandle_plugin:setupCommands()
 
                     callback = function()
                         commandle_plugin:requestInput("branch name...", function(input : string)
-                            local _, out = pcall(function()
-                                argumentsModule.execute("git", "branch", input)
-                            end)
-
-                            print(out)
+                            runGit("branch", input)
                         end)
                     end
                 })
@@ -120,11 +110,7 @@ function commandle_plugin:setupCommands()
             title = "RoGit: Stage Changes",
 
             callback = function()
-                local _, out = pcall(function()
-                    argumentsModule.execute("git", "add", ".")
-                end)
-
-                print(out)
+                runGit("add", ".")
                 commandle_plugin:closePalette(true)
             end
         },
@@ -133,11 +119,7 @@ function commandle_plugin:setupCommands()
 
             callback = function()
                 commandle_plugin:requestInput("your commit description...", function(input : string)
-                    local _, out = pcall(function()
-                        argumentsModule.execute("git", "commit", "-m", input)
-                    end)
-
-                    print(out)
+                    runGit("commit", "-m", input)
 
                     commandle_plugin:closePalette(true)
                 end)
@@ -149,15 +131,9 @@ function commandle_plugin:setupCommands()
             callback = function()
                 commandle_plugin:requestInput("repository url...", function(repoUrl : string)
                     commandle_plugin:requestInput("remote name...", function(remoteName : string)
-                        local err, out = pcall(function()
-                            argumentsModule.execute("git", "remote", "add", remoteName, repoUrl)
-                        end)
-
-                        if err then
-                            argumentsModule.execute("git", "remote", "set-url", remoteName, repoUrl)
-                        end
-
-                        print(out)
+                        local config = require(script.Parent.Parent.bash).getFileContents(require(script.Parent.Parent.bash).getGitFolderRoot(), "config") or ""
+                        local exists = config:find('[remote "' .. remoteName .. '"]', 1, true) ~= nil
+                        runGit("remote", exists and "set-url" or "add", remoteName, repoUrl)
 
                         commandle_plugin:closePalette(true)
                     end)
@@ -168,11 +144,7 @@ function commandle_plugin:setupCommands()
             title = "RoGit: Pull from remote",
 
             callback = function()
-                local _, out = pcall(function()
-                    argumentsModule.execute("git", "pull")
-                end)
-
-                print(out)
+                runGit("pull")
                 commandle_plugin:closePalette(true)
             end
         },
@@ -181,11 +153,11 @@ function commandle_plugin:setupCommands()
 
             callback = function()
                 commandle_plugin:requestInput("remote name... (default: origin)", function(input : string)
-                    local _, out = pcall(function()
-                        argumentsModule.execute("git", "push", input or nil)
-                    end)
-
-                    print(out)
+                    if input and input ~= "" then
+                        runGit("push", input)
+                    else
+                        runGit("push")
+                    end
                     commandle_plugin:closePalette(true)
                 end)
             end
@@ -195,6 +167,8 @@ end
 
 --// Sets-up the API
 function commandle_plugin:setupPlugin()
+    commandle_api_root = StudioService:WaitForChild("commandle_api", 5)
+
     -- API does not exist (commandle not installed?)
     if not commandle_api_root then
         return

@@ -6,23 +6,34 @@ local conf = {
     gitRoot = ServerStorage
 }
 
-Bash.trackingRoot = {
-    game:GetService("Workspace"),
-    game:GetService("ReplicatedStorage"),
-    game:GetService("ReplicatedFirst"),
-    game:GetService("ServerScriptService"),
-    game:GetService("ServerStorage"),
-    game:GetService("StarterGui"),
-    game:GetService("Lighting"),
-    game:GetService("StarterPack"),
-    game:GetService("StarterPlayer"),
-    game:GetService("SoundService"),
-    game:GetService("AdService"),
-    game:GetService("LocalizationService"),
-    game:GetService("PhysicsService"),
-    game:GetService("TextService"),
-    game:GetService("Teams")
-}
+--// Services whose contents are tracked. A service Studio doesn't have is simply skipped.
+Bash.trackingRoot = {}
+for _, serviceName in ipairs({
+    "Workspace",
+    "ReplicatedStorage",
+    "ReplicatedFirst",
+    "ServerScriptService",
+    "ServerStorage",
+    "StarterGui",
+    "Lighting",
+    "StarterPack",
+    "StarterPlayer",
+    "SoundService",
+    "AdService",
+    "LocalizationService",
+    "PhysicsService",
+    "TextService",
+    "Teams",
+    "MaterialService",
+    "TextChatService",
+}) do
+    local ok, service = pcall(function()
+        return game:GetService(serviceName)
+    end)
+    if ok and service then
+        table.insert(Bash.trackingRoot, service)
+    end
+end
 
 --[[
 Kind-of emulates "bash"?
@@ -182,6 +193,16 @@ function Bash.modifyFileContents(parent, name, content)
         end
     end
     return nil
+end
+
+--[[
+Writes a file, creating it when it doesn't exist yet.
+]]
+function Bash.writeFile(parent, name, content)
+    if parent:FindFirstChild(name) then
+        return Bash.modifyFileContents(parent, name, content)
+    end
+    return Bash.createFile(parent, name, content)
 end
 
 --[[

@@ -21,6 +21,7 @@ Remote.error = error
 
 --[[
 Requests git refs, parses and returns.
+Second return value holds extra info from the server: `symrefs` (e.g. HEAD -> refs/heads/main) and `capabilities`.
 ]]
 function Remote.discoverRefs(url: string, service: string?)
 	local req = {
@@ -33,35 +34,62 @@ function Remote.discoverRefs(url: string, service: string?)
     
     local ok, res = Requests.url_request_with_retry(req)
 
-    if not ok or res.StatusCode ~= 200 then
-        Remote.error("fatal: repository '" .. url .. "' not found or access denied")
+    if not ok then
+        error("fatal: unable to access '" .. url .. "': " .. tostring(res), 0)
+    end
+    if res.StatusCode ~= 200 then
+        local reason = (res.StatusCode == 401 or res.StatusCode == 403) and "authentication failed or access denied"
+            or (res.StatusCode == 404 and "not found")
+            or ("HTTP " .. tostring(res.StatusCode))
+        error("fatal: repository '" .. url .. "' " .. reason, 0)
     end
     
 	local buf = buffer.fromstring(res.Body)
 	local cursor = 0
 	local refs = {}
+	local info = {symrefs = {}, capabilities = ""}
 
 	while cursor < buffer.len(buf) do
 		local data, next = git_proto.decodePkt(buf, cursor)
 		cursor = next
 		if data then
-			local sha, name = git_proto.parseRef(data)
-			if sha and name then
+			local sha, name, caps = git_proto.parseRef(data)
+			if sha and name and name ~= "capabilities^{}" then
 				refs[name] = sha
+			end
+			if caps and caps ~= "" then
+				info.capabilities = caps
+				for from, to in caps:gmatch("symref=([^:%s]+):([^%s]+)") do
+					info.symrefs[from] = to
+				end
 			end
 		end
 	end
 
-	return refs
+	return refs, info
 end
 
 --[[
 Fetches the git repository packfile, parses and returns.
+`wants` is a sha (or a list of them), `haves` are commits we already own so the server can skip sending them.
 ]]
-function Remote.fetchPackfile(url: string, sha: string)
-	local wantPkt = git_proto.encodePkt(buffer.fromstring("want " .. sha .. " side-band-64k ofs-delta\n"))
-	local donePkt = git_proto.encodePkt(buffer.fromstring("done\n"))
-	local body = buffer.tostring(wantPkt) .. buffer.tostring(git_proto.flush()) .. buffer.tostring(donePkt)
+function Remote.fetchPackfile(url: string, wants, haves)
+	if type(wants) == "string" then wants = {wants} end
+
+	local function pkt(line)
+		return buffer.tostring(git_proto.encodePkt(buffer.fromstring(line)))
+	end
+
+	local parts = {}
+	for i, sha in ipairs(wants) do
+		parts[#parts + 1] = pkt("want " .. sha .. (i == 1 and " side-band-64k ofs-delta" or "") .. "\n")
+	end
+	parts[#parts + 1] = buffer.tostring(git_proto.flush())
+	for _, sha in ipairs(haves or {}) do
+		parts[#parts + 1] = pkt("have " .. sha .. "\n")
+	end
+	parts[#parts + 1] = pkt("done\n")
+	local body = table.concat(parts)
 
 	local req = {
 		Url = Utilities.return_urls(url)[2],
@@ -75,8 +103,8 @@ function Remote.fetchPackfile(url: string, sha: string)
 	}
     
     local ok, res = Requests.url_request_with_retry(req)
-    assert(ok, "Upload-pack request error")
-	assert(res.StatusCode == 200, "Upload-pack failed: " .. res.StatusCode)
+    assert(ok, "Upload-pack request error: " .. tostring(res))
+	assert(res.StatusCode == 200, "Upload-pack failed: " .. tostring(res.StatusCode))
 
 	local resBuf = buffer.fromstring(res.Body)
 	local cursor = 0
@@ -103,7 +131,7 @@ function Remote.fetchPackfile(url: string, sha: string)
 					end
 				end
 			elseif channel == 3 then
-				Remote.error("remote error: " .. buffer.tostring(data))
+				error("remote error: " .. buffer.tostring(data):sub(2), 0)
 			end
 		end
 	end
@@ -496,10 +524,32 @@ function Remote.writeTree(objectsBySha, treeSha, parent, treePath)
 end
 
 --[[
-Fetches remote based off name.
+Stores every object from an unpacked pack in the repository.
 ]]
-function Remote.fetch(remote_name)
-    print("Fetching " .. remote_name)
+function Remote.storeObjects(objectsBySha, only)
+	local typeNames = {[1] = "commit", [2] = "tree", [3] = "blob", [4] = "tag"}
+	local written = 0
+	for objSha, obj in pairs(objectsBySha) do
+		if not only or only[objSha] then
+			local typeName = typeNames[obj.objType]
+			if typeName then
+				Utilities.roYield()
+				_Handlers.write_object_with_sha(typeName, obj.content, objSha)
+				written += 1
+			end
+		end
+	end
+	return written
+end
+
+--[[
+Fetches remote based off name.
+Downloads everything we don't have yet in a single pack and updates the remote-tracking refs and tags.
+Returns the remote refs and the discovery info.
+]]
+function Remote.fetch(remote_name, quiet)
+    local say = quiet and function() end or function(...) Remote.print(...) end
+    say("Fetching " .. remote_name)
 
     local config_content = bash.getFileContents(bash.getGitFolderRoot(), "config")
     local loaded_conf = ini_parser.parseIni(config_content)
@@ -510,32 +560,70 @@ function Remote.fetch(remote_name)
     
     local url = remote_section.url
 
-    local refs = Remote.discoverRefs(url)
-    
-    local output = { "From " .. url }
-    for name, sha in pairs(refs) do
-        if name ~= "HEAD" then
-            local branch_name = name:match("refs/heads/(.+)")
-            if branch_name then
-                table.insert(output, string.format(" * [new branch]      %-15s -> %s/%s", branch_name, remote_name, branch_name))
-                _Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, sha)
-            end
-        end
-    end
-    print(table.concat(output, "\n"))
+    local refs, info = Remote.discoverRefs(url)
 
+    --// only ask for the tips that we do not own yet
+    local wants, wantSet = {}, {}
     for name, sha in pairs(refs) do
-        if name ~= "HEAD" then
-            local pack = Remote.fetchPackfile(url, sha)
-            local _, objectsBySha = Remote.unpackObjects(pack)
-            for objSha, obj in pairs(objectsBySha) do
-                local typeName = ({[1]="commit", [2]="tree", [3]="blob", [4]="tag"})[obj.objType]
-                if typeName then
-                    _Handlers.write_object(typeName, obj.content)
-                end
+        if (name:match("^refs/heads/") or name:match("^refs/tags/")) and not name:match("%^{}$") then
+            if not wantSet[sha] and not _Handlers.read_object(sha) then
+                wantSet[sha] = true
+                table.insert(wants, sha)
             end
         end
     end
+    table.sort(wants)
+
+    if #wants > 0 then
+        local haves, haveSet = {}, {}
+        for _, sha in pairs(_Handlers.list_refs()) do
+            if not haveSet[sha] and #haves < 64 then
+                haveSet[sha] = true
+                table.insert(haves, sha)
+            end
+        end
+        table.sort(haves)
+
+        local pack = Remote.fetchPackfile(url, wants, haves)
+        local _, objectsBySha = Remote.unpackObjects(pack)
+        Remote.storeObjects(objectsBySha)
+    end
+
+    local output = { "From " .. url }
+    local names = {}
+    for name in pairs(refs) do table.insert(names, name) end
+    table.sort(names)
+
+    for _, name in ipairs(names) do
+        local sha = refs[name]
+        local branch_name = name:match("^refs/heads/(.+)")
+        local tag_name = name:match("^refs/tags/(.+)")
+        if branch_name then
+            local trackingRef = "refs/remotes/" .. remote_name .. "/" .. branch_name
+            local old = _Handlers.get_ref(trackingRef)
+            if old ~= sha then
+                if old then
+                    table.insert(output, string.format("   %s..%s  %-15s -> %s/%s", old:sub(1, 7), sha:sub(1, 7), branch_name, remote_name, branch_name))
+                else
+                    table.insert(output, string.format(" * [new branch]      %-15s -> %s/%s", branch_name, remote_name, branch_name))
+                end
+                _Handlers.update_ref(trackingRef, sha)
+            end
+        elseif tag_name and not tag_name:match("%^{}$") then
+            if _Handlers.get_ref(name) ~= sha then
+                table.insert(output, string.format(" * [new tag]         %-15s -> %s", tag_name, tag_name))
+                _Handlers.update_ref(name, sha)
+            end
+        end
+    end
+
+    if #output == 1 then
+        say("Already up to date.")
+    else
+        say(table.concat(output, "\n"))
+    end
+
+    return refs, info
 end
 
 --[[

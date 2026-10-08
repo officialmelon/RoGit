@@ -80,7 +80,35 @@ Returns the URLs for the git service we need.
 ]]
 function Utilities.return_urls(url: string, service: string?)
     local svc = service or "git-upload-pack"
+    url = (url:gsub("/+$", ""))
     return {url .. "/info/refs?service=" .. svc, url .. "/" .. svc}
+end
+
+--[[
+Cleans up a remote URL so more spellings work:
+`git@github.com:user/repo.git`, `ssh://git@host/user/repo`, `github.com/user/repo` and trailing slashes
+all end up as plain https:// URLs (only the smart HTTP protocol is supported).
+]]
+function Utilities.normalize_url(url: string): string
+    url = url:match("^%s*(.-)%s*$")
+
+    local host, path = url:match("^[%w_.-]+@([^:/]+):(.+)$")
+    if host then
+        url = "https://" .. host .. "/" .. path
+    end
+
+    local sshHost, sshPath = url:match("^ssh://[%w_.-]+@([^/]+)/(.+)$")
+    if sshHost then
+        url = "https://" .. sshHost .. "/" .. sshPath
+    end
+
+    url = url:gsub("^git://", "https://")
+    if not url:match("^https?://") then
+        url = "https://" .. url
+    end
+
+    url = url:gsub("/+$", "")
+    return url
 end
 
 --[[

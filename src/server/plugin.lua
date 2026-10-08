@@ -21,8 +21,10 @@ local RunService = game:GetService("RunService")
 local git_handlers = require(script.Parent.libs.git_handlers)
 
 local user = "User"
-pcall(function()
-    user = Players:GetNameFromUserIdAsync(StudioService:GetUserId())
+task.spawn(function()
+    pcall(function()
+        user = Players:GetNameFromUserIdAsync(StudioService:GetUserId())
+    end)
 end)
 local name = game.Name
 
@@ -242,7 +244,8 @@ function initDesktop(gui)
     end
 
     --// populate our changes!
-    function populateChangesList()
+    local refreshing, refreshQueued = false, false
+    local function populateChangesListInner()
         local list = gui.Body.ChangesArea.ChangesBg.List
         local label = gui.Body.ChangesArea.ChangesLabel
         local commitBtn = gui.Body.BottomArea.ActionsRow.CommitBtn
@@ -285,6 +288,21 @@ function initDesktop(gui)
         end
 
         label.Text = "<b>Changes</b>   <font color='#8b949e'>" .. tostring(#changes) .. "</font>"
+    end
+
+    --// Refreshing walks the whole tracked tree, never let two refreshes run at the same time.
+    function populateChangesList()
+        if refreshing then
+            refreshQueued = true
+            return
+        end
+        refreshing = true
+        repeat
+            refreshQueued = false
+            local ok, err = pcall(populateChangesListInner)
+            if not ok then warn("roGit: couldn't refresh changes: " .. tostring(err)) end
+        until not refreshQueued
+        refreshing = false
     end
 
     --// Global Modal Okay button
@@ -397,10 +415,9 @@ function initDesktop(gui)
         gui.SettingsView.ModalInner.Body.ActionsRow.SaveBtn.Activated:Connect(function()
             local url = gui.SettingsView.ModalInner.Body.OriginInputBg.OriginInput.Text
             if url and url ~= "" then
-                local succ = pcall(function() arguments.execute("git", "remote", "add", "origin", url) end)
-                if not succ then
-                    pcall(function() arguments.execute("git", "remote", "set-url", "origin", url) end)
-                end
+                local config = bash.getFileContents(bash.getGitFolderRoot(), "config") or ""
+                local hasOrigin = config:find('[remote "origin"]', 1, true) ~= nil
+                pcall(function() arguments.execute("git", "remote", hasOrigin and "set-url" or "add", "origin", url) end)
             end
 
             local userSet = gui.SettingsView.ModalInner.Body.UsernameInputBg.UsernameInput.Text
@@ -491,11 +508,14 @@ function initDesktop(gui)
         populateBranchList()
         populateChangesList()
 
-        --// check changes very 5 seconds!
+        --// check for changes every few seconds, but only while the window is actually open
+        local widget = gui:FindFirstAncestorWhichIsA("DockWidgetPluginGui")
         task.spawn(function()
             while true do
                 task.wait(5)
-                pcall(populateChangesList)
+                if not widget or widget.Enabled then
+                    populateChangesList()
+                end
             end
         end)
     end
@@ -557,6 +577,34 @@ TERMINAL STUFF
 ]]
 
 --[[
+Output arrives with ANSI colour codes (\27[31m ...) like a real git. The terminal renders rich text,
+so escape anything that looks like markup and turn the colour codes into <font> tags.
+]]
+local ANSI_COLORS = {
+    ["31"] = "#f85149",
+    ["32"] = "#3fb950",
+    ["33"] = "#d29922",
+    ["36"] = "#58a6ff",
+}
+
+local function ansiToRichText(text)
+    text = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+
+    local open = 0
+    text = text:gsub("\27%[(%d+)m", function(code)
+        if ANSI_COLORS[code] then
+            open += 1
+            return '<font color="' .. ANSI_COLORS[code] .. '">'
+        elseif code == "0" and open > 0 then
+            open -= 1
+            return "</font>"
+        end
+        return ""
+    end)
+    return text .. string.rep("</font>", open)
+end
+
+--[[
 Creates output of commands.
 ]]
 function createCommandOutput(parent, text, optionalColor)
@@ -594,7 +642,7 @@ function createCommandOutput(parent, text, optionalColor)
     output.Size = UDim2.new(1, 0, 0, 0)
     output.AutomaticSize = Enum.AutomaticSize.Y
     output.Font = Enum.Font.Ubuntu
-    output.Text = text
+    output.Text = ansiToRichText(text)
     output.TextColor3 = optionalColor or Color3.fromRGB(255, 255, 255)
     output.TextSize = 14.000
     output.TextXAlignment = Enum.TextXAlignment.Left
@@ -770,7 +818,10 @@ function handleCommandCallback(TextBox:TextBox, parent)
                 end)
                 if not status then
                     local cleanErr = tostring(err):gsub("^.-:%d+: ", "")
-                    createCommandOutput(parent, "fatal: " .. cleanErr)
+                    if not cleanErr:match("^fatal:") and not cleanErr:match("^error:") then
+                        cleanErr = "fatal: " .. cleanErr
+                    end
+                    createCommandOutput(parent, cleanErr, Color3.fromRGB(255, 90, 90))
                 end
             else
                 createCommandOutput(parent, "RoGit: command not found: " .. (cmdName or ""))

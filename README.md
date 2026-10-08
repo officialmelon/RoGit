@@ -32,25 +32,39 @@ We have implemented a console to give the user a native git feel if they are adv
 
 ## Features to implement
 
-- [ ] Union/Combined-Instance support
+- [ ] Union/Combined-Instance support *(in progress: binary properties such as `ChildData`/`MeshData` are now stored (base64) instead of breaking the commit, but this still needs testing in Studio)*
 
 - [ ] Implement MInstance instead of custom solution! (better support)
 
-- [ ] Make branching much better
+- [x] Make branching much better *(real three-way `git merge`, `git tag`, detached HEAD, `HEAD~1`-style revisions, remote branches, `git switch` creating tracking branches)*
 
 - [x] Improve speeds
 
 ## Features & Supported Commands
 
-`roGit` currently supports a subset of standard Git commands, adapted for the Roblox `Instance` tree:
+`roGit` supports a large subset of standard Git commands, adapted for the Roblox `Instance` tree:
 
-- `git clone <url>` - Clone remote repositories directly into Workspace.
-- `git status` - View modified, added, and staged Instances.
-- `git add <path>` - Stage specific Instances or properties for commit.
-- `git commit -m "..."` - Create local commits natively.
-- `git push` & `git pull` - Sync with remote HTTPS repositories (GitHub, GitLab, etc.).
-- `git checkout` & `git switch` - Checkout at a certain branch or commit.
-- `git branch`, `git diff`, `git fetch`, `git config` and more!
+- `git clone <url>` - Clone remote repositories directly into your place (`-b <branch>`, `--single-branch`). Understands `https://`, `git@host:user/repo.git` and `host/user/repo` style URLs.
+- `git status` - Staged, unstaged and untracked Instances, plus how far you are ahead/behind `origin`.
+- `git add <path>` / `git rm` / `git mv` / `git restore` / `git reset` - Stage, remove, move and restore Instances.
+- `git commit -m "..."` (`-a`, `--amend`, `--allow-empty`) - Create local commits natively.
+- `git diff [--cached]` - See *what* changed: every modified property, and a line diff for scripts.
+- `git log [--oneline] [-n N] [<rev>]` / `git show [<rev>]` - Browse history, including merge commits.
+- `git fetch`, `git pull` and `git push` - Sync with remote HTTPS repositories (GitHub, GitLab, etc.). Only the objects you don't have are downloaded/uploaded. `push` supports `-u`, `-f`, `--all`, `--tags`, `--delete` and `src:dst` refspecs.
+- `git branch` (`-a`, `-r`, `-v`, `-d/-D`, `-m`) / `git switch` / `git checkout` - Work with branches, tags, commits (detached HEAD) and files.
+- `git merge <branch>` - Fast-forwards when possible, otherwise does a real three-way merge (see below).
+- `git tag` - Lightweight and annotated (`-a -m`) tags.
+- `git remote`, `git config` and more! Run `git help` to see everything.
+
+### How merging works
+
+Instances are stored as property lists, so `git merge` (and `git pull` when the branches diverged) merges in layers:
+
+1. **Instances**: added/removed/changed on only one side - taken as is.
+2. **Properties**: an instance edited on both sides is merged property by property (attributes and tags too).
+3. **Scripts**: if both sides edited the same script, the lines are merged like Git does. Edits to different parts of the file merge cleanly.
+
+If the two sides really changed the same thing, the merge **stops without touching your place** and lists the conflicts. Re-run with `-X ours` or `-X theirs` to settle conflicts in favour of one side.
 
 ---
 
@@ -69,4 +83,32 @@ We have implemented a console to give the user a native git feel if they are adv
 - Lets start by cloning in a repository (this is the original crossroads map!):
 ```
 git clone https://github.com/officialmelon/crossroads-rogit.git
+```
+- Make some changes, then look at them, commit and push:
+```
+git status
+git diff
+git add .
+git commit -m "Tweak the map"
+git push
+```
+- Work on a branch and merge it back:
+```
+git switch -c lighting-pass
+git commit -am "Warmer lighting"
+git switch master
+git merge lighting-pass
+```
+
+---
+
+## Development
+
+The plugin is plain Luau and builds with [Rojo](https://rojo.space) (`rojo build -o roGit.rbxm`).
+
+`tests/` contains a small Roblox mock so the real command code can be exercised outside Studio with the [Luau CLI](https://github.com/luau-lang/luau):
+
+```
+python3 tests/build.py tests/merge_test.lua && luau tests/_run.lua
+python3 tests/build.py tests/workflow_test.lua && luau tests/_run.lua
 ```

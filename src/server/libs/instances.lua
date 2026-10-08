@@ -5,6 +5,7 @@ local HttpService = game:GetService("HttpService")
 
 local Utilities = require(script.Parent.utilities)
 local Handlers = require(script.Parent.git_handlers)
+local hashlib = require(script.Parent.hashlib)
 local bash = require(script.Parent.Parent.bash)
 
 local ROGIT_ID = "_rogit_id"
@@ -12,8 +13,15 @@ local ROGIT_ID = "_rogit_id"
 --[[
 Helper to round numbers to avoid floating point jitter in Git.
 ]]
+local rawTypeOf = type
+local FLOAT_MAX = 3.4028234663852886e38
+
 local function round(num)
     if typeof(num) ~= "number" then return num end
+    --// JSON cannot represent NaN/inf, clamp them to something that round-trips.
+    if num ~= num then return 0 end
+    if num == math.huge then return FLOAT_MAX end
+    if num == -math.huge then return -FLOAT_MAX end
     -- Round to 6 decimal places and return as number
     local rounded = tonumber(string.format("%.6f", num))
     if rounded == 0 then return 0 end -- Clean -0 to 0
@@ -31,6 +39,21 @@ function instances.serialize_property(prop)
 
     if type == "number" then
         r = round(prop)
+    elseif type == "string" then
+        --// JSON only holds valid UTF-8, anything else (e.g. union/mesh data) is stored as base64.
+        if not utf8.len(prop) then
+            r = {__b64 = hashlib.bin_to_base64(prop)}
+        end
+    elseif type == "Vector3int16" then
+        r = {X = prop.X, Y = prop.Y, Z = prop.Z}
+    elseif type == "Vector2int16" then
+        r = {X = prop.X, Y = prop.Y}
+    elseif type == "Faces" then
+        r = {Top = prop.Top, Bottom = prop.Bottom, Left = prop.Left, Right = prop.Right, Back = prop.Back, Front = prop.Front}
+    elseif type == "Axes" then
+        r = {X = prop.X, Y = prop.Y, Z = prop.Z}
+    elseif type == "Ray" then
+        r = {Origin = instances.serialize_property(prop.Origin), Direction = instances.serialize_property(prop.Direction)}
     elseif type == "BrickColor" then
         r = tostring(prop)
     elseif type == "CFrame" then
@@ -81,7 +104,9 @@ function instances.serialize_property(prop)
     elseif type == "Content" then
         r = tostring(prop)
     else
-        if typeof(prop) == "userdata" or typeof(prop) == "function" or typeof(prop) == "thread" then
+        --// Anything JSON can't encode falls back to its string form so one odd property can't break a whole instance.
+        local luaType = rawTypeOf(prop)
+        if luaType ~= "string" and luaType ~= "number" and luaType ~= "boolean" and luaType ~= "table" then
             r = tostring(prop)
         end
     end
@@ -93,6 +118,10 @@ end
     Serializes a property back into an Instance property.
 ]]
 function instances.deserialize_property(prop, propType)
+    if type(prop) == "table" and prop.__b64 ~= nil then
+        return hashlib.base64_to_bin(prop.__b64)
+    end
+
     if propType == "BrickColor" then
         return BrickColor.new(prop)
     elseif propType == "CFrame" then
@@ -126,6 +155,24 @@ function instances.deserialize_property(prop, propType)
         return PhysicalProperties.new(prop.Density, prop.Friction, prop.Elasticity, prop.FrictionWeight, prop.ElasticityWeight)
     elseif propType == "Font" then
         return Font.new(prop.Family, instances.deserialize_property(prop.Weight, "EnumItem"), instances.deserialize_property(prop.Style, "EnumItem"))
+    elseif propType == "Vector3int16" then
+        return Vector3int16.new(prop.X, prop.Y, prop.Z)
+    elseif propType == "Vector2int16" then
+        return Vector2int16.new(prop.X, prop.Y)
+    elseif propType == "Faces" then
+        local faces = {}
+        for _, face in ipairs({"Top", "Bottom", "Left", "Right", "Back", "Front"}) do
+            if prop[face] then table.insert(faces, Enum.NormalId[face]) end
+        end
+        return Faces.new(table.unpack(faces))
+    elseif propType == "Axes" then
+        local axes = {}
+        for _, axis in ipairs({"X", "Y", "Z"}) do
+            if prop[axis] then table.insert(axes, Enum.Axis[axis]) end
+        end
+        return Axes.new(table.unpack(axes))
+    elseif propType == "Ray" then
+        return Ray.new(instances.deserialize_property(prop.Origin, "Vector3"), instances.deserialize_property(prop.Direction, "Vector3"))
     elseif propType == "NumberSequenceKeypoint" then
         return NumberSequenceKeypoint.new(prop.Time, prop.Value, prop.Envelope)
     elseif propType == "ColorSequenceKeypoint" then
@@ -146,18 +193,52 @@ function instances.deserialize_property(prop, propType)
     return prop
 end
 
+--// Property lists never change for a class, so look them up once instead of per instance.
+local class_property_cache = {}
+
+local INTERNAL_TO_PUBLIC = {
+    size = "Size",
+    color = "Color",
+    color3uint8 = "Color",
+    formFactorRaw = "FormFactor",
+    shape = "Shape",
+    MaterialVariantSerialized = "MaterialVariant",
+}
+
+local function get_class_properties(className)
+    local cached = class_property_cache[className]
+    if cached then return cached end
+
+    local list = {}
+    local ok, classProperties = pcall(function()
+        return game:GetService("ReflectionService"):GetPropertiesOfClass(className)
+    end)
+
+    if ok then
+        for _, propertyData in ipairs(classProperties) do
+            --// Often the 'true' serialized property is lowercase (e.g. 'size') or internal (e.g. 'Color3uint8')
+            --// We try to map it to its public PascalCase member if possible.
+            local internalName = propertyData.Name
+            local publicName = INTERNAL_TO_PUBLIC[internalName] or (internalName:sub(1,1):upper() .. internalName:sub(2))
+            if internalName == "Color3uint8" then publicName = "Color" end
+
+            if (propertyData.Serialized == true or publicName == "Color" or publicName == "Size") and publicName ~= "Parent" then
+                table.insert(list, {publicName = publicName, internalName = internalName})
+            end
+        end
+        class_property_cache[className] = list
+    end
+
+    return list
+end
+
 --[[
 Serializes instance & instance properties
 ]]
 function instances.serialize_instance(instance)
     assert(typeof(instance) == "Instance", "no instance passed or instance is not a Instance")
 
-    local instancePropertiesClassList = game:GetService("ReflectionService"):GetPropertiesOfClass(instance.ClassName)
     local instanceProperties = {}
-    
-    local skipList = {
-        Parent = true,
-    }
 
     table.insert(instanceProperties, {
         name = "ClassName",
@@ -165,55 +246,28 @@ function instances.serialize_instance(instance)
         valueType = "string"
     })
 
-    local INTERNAL_TO_PUBLIC = {
-        size = "Size",
-        color = "Color",
-        color3uint8 = "Color",
-        formFactorRaw = "FormFactor",
-        shape = "Shape",
-        MaterialVariantSerialized = "MaterialVariant",
-    }
-
-    for _, propertyData in ipairs(instancePropertiesClassList) do
-        --// Often the 'true' serialized property is lowercase (e.g. 'size') or internal (e.g. 'Color3uint8')
-        --// We try to map it to its public PascalCase member if possible.
-        local internalName = propertyData.Name
-        local publicName = INTERNAL_TO_PUBLIC[internalName] or (internalName:sub(1,1):upper() .. internalName:sub(2))
-        
-        --// Special case: Color3uint8 is just 'Color'
-        if internalName == "Color3uint8" then publicName = "Color" end
-
-        if (propertyData.Serialized == true or publicName == "Color" or publicName == "Size") and not skipList[publicName] then
+    local added = {}
+    for _, entry in ipairs(get_class_properties(instance.ClassName)) do
+        local publicName = entry.publicName
+        if not added[publicName] then
             pcall(function()
                 local val = instance[publicName]
-                if val == nil and publicName ~= internalName then
-                    val = instance[internalName]
+                if val == nil and publicName ~= entry.internalName then
+                    val = instance[entry.internalName]
                 end
 
                 if val ~= nil then
-                    --// Check if we already added this (e.g. redirected both 'size' and 'Size')
-                    local found = false
-                    for _, existing in ipairs(instanceProperties) do
-                        if existing.name == publicName then
-                            found = true
-                            break
-                        end
-                    end
-
-                    if not found then
-                        table.insert(instanceProperties, {
-                            name = publicName,
-                            value = instances.serialize_property(val),
-                            valueType = typeof(val)
-                        })
-                    end
+                    added[publicName] = true
+                    table.insert(instanceProperties, {
+                        name = publicName,
+                        value = instances.serialize_property(val),
+                        valueType = typeof(val)
+                    })
                 end
             end)
         end
     end
 
-    --// No immediate sort here, we'll sort at the end
-    
     if instance:IsA("LuaSourceContainer") then
         pcall(function()
             local found = false

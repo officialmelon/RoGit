@@ -18,11 +18,14 @@ end
 
 local output = {}
 print = function(...) table.insert(output, table.concat({...}, " ")) end
+loadModule("libs/output.lua").set(function(...) print(...) end, function(...) print(...) end)
 
+-- returns success and everything the command printed (plus the error message when it failed)
 local function run(...)
 	output = {}
 	local ok, err = pcall(arguments.execute, "git", ...)
-	return ok, (ok and table.concat(output, "\n") or tostring(err))
+	if not ok then table.insert(output, tostring(err)) end
+	return ok, table.concat(output, "\n")
 end
 
 local function find(path)
@@ -64,7 +67,8 @@ find("Workspace/Stuff/Config").Value = "feature-value"
 local extra = Instance.new("Script"); extra.Name = "FeatureOnly"; extra.Source = "-- hi\n"; extra.Parent = find("Workspace/Stuff")
 ok, out = run("diff")
 check("diff shows script lines", out:find("FEATURE line 2") and out:find("feature%-value"))
-check("commit on feature", run("commit", "-am", "feature work"))
+run("add", ".")
+check("commit on feature", run("commit", "-m", "feature work"))
 
 check("switch back", run("switch", "master"))
 check("feature-only instance removed", find("Workspace/Stuff/FeatureOnly") == nil)
@@ -88,8 +92,12 @@ run("switch", "master")
 find("Workspace/Stuff/Config").Value = "master-value"
 run("commit", "-am", "master config")
 ok, out = run("merge", "c1")
-check("conflicting merge is refused", not ok and out:find("CONFLICT"))
-check("conflicting merge changes nothing", find("Workspace/Stuff/Config").Value == "master-value")
+check("conflicting merge stops", not ok and out:find("CONFLICT") and out:find("Automatic merge failed"))
+check("conflict keeps our version in the place", find("Workspace/Stuff/Config").Value == "master-value")
+check("status shows the unmerged path", select(2, run("status")):find("both modified:%s+Workspace/Stuff/Config"))
+check("commit refused while unmerged", not run("commit", "-m", "nope"))
+check("merge --abort", run("merge", "--abort"))
+check("abort leaves a clean tree", select(2, run("status")):find("nothing to commit"))
 ok = run("merge", "c1", "-X", "theirs")
 check("-X theirs settles it", ok and find("Workspace/Stuff/Config").Value == "c1-value")
 

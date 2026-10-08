@@ -7,6 +7,7 @@ local hashlib = require(script.Parent.hashlib)
 local zlib = require(script.Parent.zlib)
 local git_proto = require(script.Parent.git_proto)
 local Utilities = require(script.Parent.utilities)
+local Auth = require(script.Parent.localstore)
 
 --// Cache for .rogitignore
 local ignore_cache = {}
@@ -455,39 +456,88 @@ end
 --[[
 Updates the ref.
 ]]
-function Handlers.update_ref(ref_path, sha)
-    local function do_update(full_path, sha_content)
-        local segments = string.split(full_path, "/")
-        local filename = table.remove(segments)
-        
-        local parent_folder = bash.getGitFolderRoot()
-        if #segments > 0 then
-            local dir_path = table.concat(segments, "/")
-            parent_folder = bash.createFolder(parent_folder, dir_path)
-        end
+local ZERO_SHA = ("0"):rep(40)
 
-        if parent_folder and parent_folder:FindFirstChild(filename) then
-            bash.modifyFileContents(parent_folder, filename, sha_content)
-        else
-            bash.createFile(parent_folder, filename, sha_content)
+local function write_git_file(full_path, content)
+    local segments = string.split(full_path, "/")
+    local filename = table.remove(segments)
+
+    local parent_folder = bash.getGitFolderRoot()
+    if #segments > 0 then
+        parent_folder = bash.createFolder(parent_folder, table.concat(segments, "/"))
+    end
+    bash.writeFile(parent_folder, filename, content)
+end
+
+local function read_git_file(path)
+    local root = bash.getGitFolderRoot()
+    local file = root and bash.getDirectoryOrFile(root, path)
+    if file then
+        return bash.getFileContents(file.Parent, file.Name)
+    end
+    return nil
+end
+
+--[[
+Appends an entry to a reflog (.git/logs/<ref>), in git's own format.
+]]
+function Handlers.append_reflog(ref_path, old_sha, new_sha, message)
+    if not ref_path:match("^HEAD$") and not ref_path:match("^refs/heads/") and not ref_path:match("^refs/stash$") then
+        return
+    end
+    local name = Auth.getConfigValue("user_name") or "roGit"
+    local email = Auth.getConfigValue("user_email") or "ro-git@example.com"
+    local line = string.format("%s %s %s <%s> %d +0000\t%s\n",
+        (old_sha and old_sha ~= "") and old_sha or ZERO_SHA, new_sha, name, email, os.time(), (message or "update"):gsub("\n.*", ""))
+    write_git_file("logs/" .. ref_path, (read_git_file("logs/" .. ref_path) or "") .. line)
+end
+
+--[[
+Reads a reflog, newest entry first: {{old, new, message}}.
+]]
+function Handlers.read_reflog(ref_path)
+    local entries = {}
+    local content = read_git_file("logs/" .. ref_path) or ""
+    for line in content:gmatch("[^\n]+") do
+        local old, new, rest = line:match("^(%x+) (%x+) (.*)$")
+        if old then
+            table.insert(entries, 1, {old = old, new = new, message = rest:match("\t(.*)$") or ""})
         end
     end
+    return entries
+end
 
-    local function get_file_content_by_path(path)
-        local file = bash.getDirectoryOrFile(bash.getGitFolderRoot(), path)
-        if file then
-            return bash.getFileContents(file.Parent, file.Name)
-        end
-        return nil
-    end
-
-    local content = get_file_content_by_path(ref_path)
+--[[
+Updates the ref (following HEAD to the branch it points at) and records it in the reflogs.
+]]
+function Handlers.update_ref(ref_path, sha, message)
+    local content = read_git_file(ref_path)
 
     if content and string.sub(content, 1, 5) == "ref: " then
         local symbolic_path = string.sub(content, 6)
-        do_update(symbolic_path, sha)
+        local old = read_git_file(symbolic_path)
+        write_git_file(symbolic_path, sha)
+        Handlers.append_reflog(symbolic_path, old, sha, message)
+        Handlers.append_reflog(ref_path, old, sha, message)
     else
-        do_update(ref_path, sha)
+        write_git_file(ref_path, sha)
+        Handlers.append_reflog(ref_path, content, sha, message)
+    end
+end
+
+--[[
+Points HEAD at a branch ("refs/heads/main") or a commit (detached), logging it like git checkout does.
+]]
+function Handlers.set_head(target, message)
+    local old = Handlers.get_ref("HEAD")
+    if target:match("^refs/") then
+        write_git_file("HEAD", "ref: " .. target)
+    else
+        write_git_file("HEAD", target)
+    end
+    local new = Handlers.get_ref("HEAD")
+    if new and new ~= "" then
+        Handlers.append_reflog("HEAD", old, new, message)
     end
 end
 
@@ -616,6 +666,41 @@ Resolves a revision (branch, tag, remote branch, full or abbreviated sha, HEAD) 
 ]]
 function Handlers.resolve_revision(rev)
     if not rev or rev == "" then return nil end
+    if rev == "@" then rev = "HEAD" end
+
+    --// peeling: v1.0^{} / HEAD^{commit} (the commit), HEAD^{tree} (its tree)
+    local peeled, kind = rev:match("^(.-)%^{(%a*)}$")
+    if peeled then
+        local sha = Handlers.resolve_revision(peeled)
+        if kind == "tree" then
+            local commit = sha and Handlers.read_commit(sha)
+            return commit and commit.tree or nil
+        end
+        return sha
+    end
+    rev = rev:gsub("^@{", "HEAD@{")
+
+    --// reflog / upstream suffixes: HEAD@{2}, main@{1}, main@{upstream}, @{u}
+    local refName, selector, rest = rev:match("^([^@]*)@{([^}]*)}(.*)$")
+    if refName then
+        if refName == "" then refName = "HEAD" end
+        local sha
+        if selector == "u" or selector == "upstream" or selector == "push" then
+            local branch = refName == "HEAD" and Handlers.get_current_branch() or refName
+            sha = branch and Handlers.get_ref("refs/remotes/origin/" .. branch)
+        else
+            local n = tonumber(selector)
+            if not n then return nil end
+            local logRef = refName == "HEAD" and "HEAD" or ("refs/heads/" .. refName)
+            local entry = Handlers.read_reflog(logRef)[n + 1]
+            sha = entry and entry.new
+        end
+        if not sha then return nil end
+        if rest ~= "" then
+            return Handlers.resolve_revision(sha .. rest)
+        end
+        return sha
+    end
 
     --// HEAD~2, main^, v1.0~1^2 ...
     local base, modifiers = rev:match("^([^~^]+)([~^].*)$")

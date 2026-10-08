@@ -28,7 +28,6 @@ end
 --[[
 Helper to round numbers to avoid floating point jitter in Git.
 ]]
-local rawTypeOf = type
 local FLOAT_MAX = 3.4028234663852886e38
 
 local function round(num)
@@ -485,6 +484,364 @@ SPECIAL.EditableMesh = {
     end,
 }
 
+--// ---------------------------------------------------------------- Terrain
+--// Voxels are stored in chunks of 32x32x32 cells (128 studs). Each chunk is run length encoded:
+--// runs of (count u16, material index u8, solid occupancy u8, water occupancy u8), materials index the chunk's palette.
+--// Reading the whole terrain is expensive, so the result is kept until Studio records an edit (or a command asks again).
+local TERRAIN_CHUNK = 32
+local TERRAIN_MAX_CHUNK_READS = 6000
+local TERRAIN_MATERIALS = {
+    "Asphalt", "Basalt", "Brick", "Cobblestone", "Concrete", "CrackedLava", "Glacier", "Grass", "Ground", "Ice",
+    "LeafyGrass", "Limestone", "Mud", "Pavement", "Rock", "Salt", "Sand", "Sandstone", "Slate", "Snow", "WoodPlanks",
+}
+
+local terrain_cache = {dirty = true, value = nil}
+local terrain_watching = false
+
+--[[
+Forget the cached terrain, the next serialization reads the voxels again.
+]]
+function instances.invalidate_terrain()
+    terrain_cache.dirty = true
+end
+
+local function watch_terrain()
+    if terrain_watching then return end
+    terrain_watching = true
+    local ok, history = pcall(function() return game:GetService("ChangeHistoryService") end)
+    if not ok then return end
+    for _, name in ipairs({"OnUndo", "OnRedo", "OnRecordingFinished"}) do
+        pcall(function()
+            history[name]:Connect(function() terrain_cache.dirty = true end)
+        end)
+    end
+end
+
+local function chunk_region(cx, cy, cz)
+    local size = TERRAIN_CHUNK * 4
+    local min = Vector3.new(cx * size, cy * size, cz * size)
+    return Region3.new(min, min + Vector3.new(size, size, size))
+end
+
+--[[
+Reads one chunk as (materials, solid occupancy, water occupancy) 3D arrays.
+]]
+local function read_chunk(terrain, cx, cy, cz)
+    local region = chunk_region(cx, cy, cz)
+    local ok, channels = pcall(function()
+        return terrain:ReadVoxelChannels(region, 4, {"SolidMaterial", "SolidOccupancy", "LiquidOccupancy"})
+    end)
+    if ok and channels and channels.SolidMaterial then
+        return channels.SolidMaterial, channels.SolidOccupancy, channels.LiquidOccupancy
+    end
+    local materials, occupancies = terrain:ReadVoxels(region, 4)
+    return materials, occupancies, nil
+end
+
+local function encode_chunk(materials, solids, liquids)
+    local palette, paletteIndex = {}, {}
+    local runs = {}
+    local count = 0
+    local lastM, lastO, lastL, run = nil, nil, nil, 0
+    local filled = 0
+
+    local function flush()
+        if run > 0 then
+            table.insert(runs, {run, lastM, lastO, lastL})
+        end
+    end
+
+    for x = 1, #materials do
+        local mx, ox, lx = materials[x], solids[x], liquids and liquids[x]
+        for y = 1, #mx do
+            local my, oy, ly = mx[y], ox[y], lx and lx[y]
+            for z = 1, #my do
+                local material = my[z]
+                local name = typeof(material) == "EnumItem" and material.Name or tostring(material)
+                local occupancy = math.clamp(math.floor((oy[z] or 0) * 255 + 0.5), 0, 255)
+                local water = ly and math.clamp(math.floor((ly[z] or 0) * 255 + 0.5), 0, 255) or 0
+                if name == "Air" then occupancy = 0 end
+                if name == "Water" and not ly then
+                    --// old style water: a material of its own
+                    water, occupancy, name = occupancy, 0, "Air"
+                end
+
+                local index = paletteIndex[name]
+                if not index then
+                    table.insert(palette, name)
+                    index = #palette - 1
+                    paletteIndex[name] = index
+                end
+
+                if occupancy > 0 or water > 0 then filled += 1 end
+                if index == lastM and occupancy == lastO and water == lastL and run < 65535 then
+                    run += 1
+                else
+                    flush()
+                    lastM, lastO, lastL, run = index, occupancy, water, 1
+                end
+                count += 1
+            end
+        end
+    end
+    flush()
+
+    if filled == 0 then return nil, 0 end
+
+    local buf = buffer.create(#runs * 5)
+    for i, r in ipairs(runs) do
+        local offset = (i - 1) * 5
+        buffer.writeu16(buf, offset, r[1])
+        buffer.writeu8(buf, offset + 2, r[2])
+        buffer.writeu8(buf, offset + 3, r[3])
+        buffer.writeu8(buf, offset + 4, r[4])
+    end
+    return {P = palette, D = hashlib.bin_to_base64(buffer.tostring(buf))}, filled
+end
+
+--[[
+Expands a stored chunk back into 3D arrays (all air when chunk is nil).
+]]
+local function decode_chunk(chunk)
+    local n = TERRAIN_CHUNK
+    local materials, solids, liquids = table.create(n), table.create(n), table.create(n)
+    for x = 1, n do
+        materials[x], solids[x], liquids[x] = table.create(n), table.create(n), table.create(n)
+        for y = 1, n do
+            materials[x][y], solids[x][y], liquids[x][y] = table.create(n, Enum.Material.Air), table.create(n, 0), table.create(n, 0)
+        end
+    end
+    if not chunk then return materials, solids, liquids end
+
+    local palette = {}
+    for i, name in ipairs(chunk.P) do
+        local ok, material = pcall(function() return Enum.Material[name] end)
+        palette[i - 1] = ok and material or Enum.Material.Air
+    end
+
+    local buf = buffer.fromstring(hashlib.base64_to_bin(chunk.D))
+    local cell = 0
+    for offset = 0, buffer.len(buf) - 5, 5 do
+        local run = buffer.readu16(buf, offset)
+        local material = palette[buffer.readu8(buf, offset + 2)]
+        local solid = buffer.readu8(buf, offset + 3) / 255
+        local water = buffer.readu8(buf, offset + 4) / 255
+        for _ = 1, run do
+            local x = cell // (n * n) + 1
+            local y = (cell // n) % n + 1
+            local z = cell % n + 1
+            materials[x][y][z], solids[x][y][z], liquids[x][y][z] = material, solid, water
+            cell += 1
+        end
+    end
+    return materials, solids, liquids
+end
+
+local function write_chunk(terrain, cx, cy, cz, chunk)
+    local materials, solids, liquids = decode_chunk(chunk)
+    local region = chunk_region(cx, cy, cz)
+    local ok = pcall(function()
+        terrain:WriteVoxelChannels(region, 4, {SolidMaterial = materials, SolidOccupancy = solids, LiquidOccupancy = liquids})
+    end)
+    if not ok then
+        --// older API: water is a material of its own
+        for x = 1, #materials do
+            for y = 1, #materials[x] do
+                for z = 1, #materials[x][y] do
+                    if solids[x][y][z] == 0 and liquids[x][y][z] > 0 then
+                        materials[x][y][z], solids[x][y][z] = Enum.Material.Water, liquids[x][y][z]
+                    end
+                end
+            end
+        end
+        terrain:WriteVoxels(region, 4, materials, solids)
+    end
+end
+
+--[[
+Which chunks to look at. A "RoGitTerrainBounds" attribute ("x1,y1,z1,x2,y2,z2" in studs) wins,
+otherwise rings of chunks around the origin are scanned until every cell Terrain:CountCells() knows about was found.
+Returns an iterator over chunk coordinates, and the expected number of filled cells (or nil).
+]]
+local function terrain_chunks(terrain)
+    local bounds = terrain:GetAttribute("RoGitTerrainBounds")
+    if type(bounds) == "string" then
+        local v = {}
+        for number in bounds:gmatch("-?%d+%.?%d*") do table.insert(v, tonumber(number)) end
+        if #v == 6 then
+            local size = TERRAIN_CHUNK * 4
+            local list = {}
+            for cx = math.floor(math.min(v[1], v[4]) / size), math.floor(math.max(v[1], v[4]) / size) do
+                for cy = math.floor(math.min(v[2], v[5]) / size), math.floor(math.max(v[2], v[5]) / size) do
+                    for cz = math.floor(math.min(v[3], v[6]) / size), math.floor(math.max(v[3], v[6]) / size) do
+                        table.insert(list, {cx, cy, cz})
+                    end
+                end
+            end
+            return list, nil, true
+        end
+    end
+
+    local ok, cells = pcall(function() return terrain:CountCells() end)
+    local expected = ok and tonumber(cells) or nil
+    return nil, expected, false
+end
+
+local function read_terrain_voxels(terrain)
+    local chunks = {}
+    local list, expected, explicit = terrain_chunks(terrain)
+
+    if explicit then
+        for _, c in ipairs(list) do
+            local data = encode_chunk(read_chunk(terrain, c[1], c[2], c[3]))
+            if data then
+                data.X, data.Y, data.Z = c[1], c[2], c[3]
+                table.insert(chunks, data)
+            end
+            Utilities.roYield()
+        end
+        return chunks, true
+    end
+
+    if expected == 0 then
+        terrain_cache.known = {}
+        return chunks, true
+    end
+
+    local read, found, reads = {}, 0, 0
+    local function visit(cx, cy, cz)
+        cx, cy, cz = cx + 0, cy + 0, cz + 0 --// no "-0" chunks (a loop from -0 to 0 produces those)
+        local key = cx .. "," .. cy .. "," .. cz
+        if read[key] then return end
+        read[key] = true
+        reads += 1
+        local data, filled = encode_chunk(read_chunk(terrain, cx, cy, cz))
+        if data then
+            data.X, data.Y, data.Z = cx, cy, cz
+            table.insert(chunks, data)
+            found += filled
+        end
+        Utilities.roYield()
+    end
+    local function done()
+        return expected ~= nil and found >= expected
+    end
+
+    --// 1. where terrain was last time, then around it (edits usually happen next to existing terrain)
+    if terrain_cache.known and next(terrain_cache.known) then
+        for _, c in pairs(terrain_cache.known) do
+            visit(c[1], c[2], c[3])
+        end
+        local frontier = table.clone(chunks)
+        while not done() and #frontier > 0 and reads < TERRAIN_MAX_CHUNK_READS do
+            local nextFrontier = {}
+            local before = #chunks
+            for _, c in ipairs(frontier) do
+                for dx = -1, 1 do for dy = -1, 1 do for dz = -1, 1 do
+                    visit(c.X + dx, c.Y + dy, c.Z + dz)
+                end end end
+            end
+            for i = before + 1, #chunks do table.insert(nextFrontier, chunks[i]) end
+            frontier = nextFrontier
+        end
+    end
+
+    --// 2. rings around the origin, 1536 studs of height (-512 .. 1024)
+    if not done() then
+        for radius = 0, 64 do
+            for cx = -radius, radius do
+                for cz = -radius, radius do
+                    if math.max(math.abs(cx), math.abs(cz)) == radius then
+                        for cy = -4, 7 do
+                            visit(cx, cy, cz)
+                        end
+                    end
+                end
+            end
+            if done() or reads >= TERRAIN_MAX_CHUNK_READS or (not expected and radius >= 8) then
+                break
+            end
+        end
+    end
+
+    terrain_cache.known = {}
+    for _, c in ipairs(chunks) do
+        terrain_cache.known[c.X .. "," .. c.Y .. "," .. c.Z] = {c.X, c.Y, c.Z}
+    end
+
+    if not done() and expected then
+        warn("roGit: only part of the terrain could be located. Set a \"RoGitTerrainBounds\" attribute on Terrain (\"x1,y1,z1,x2,y2,z2\" in studs) to store all of it.")
+    end
+    return chunks, done()
+end
+
+SPECIAL.Terrain = {
+    key = "_terrain",
+
+    read = function(terrain)
+        watch_terrain()
+        if not terrain_cache.dirty and terrain_cache.value and terrain_cache.terrain == terrain then
+            return terrain_cache.value
+        end
+
+        local colors = {}
+        for _, name in ipairs(TERRAIN_MATERIALS) do
+            local ok, color = pcall(function() return terrain:GetMaterialColor(Enum.Material[name]) end)
+            if ok and color then
+                colors[name] = instances.serialize_property(color)
+            end
+        end
+
+        local chunks = read_terrain_voxels(terrain)
+        table.sort(chunks, function(a, b)
+            if a.X ~= b.X then return a.X < b.X end
+            if a.Y ~= b.Y then return a.Y < b.Y end
+            return a.Z < b.Z
+        end)
+
+        local value = {Colors = colors, Chunks = chunks}
+        terrain_cache.value, terrain_cache.terrain, terrain_cache.dirty = value, terrain, false
+        return value
+    end,
+
+    write = function(terrain, value)
+        for name, color in pairs(value.Colors or {}) do
+            pcall(function() terrain:SetMaterialColor(Enum.Material[name], instances.deserialize_property(color, "Color3")) end)
+        end
+
+        --// compare against what's there (the cached read when nothing was edited since)
+        local ok, current = pcall(SPECIAL.Terrain.read, terrain)
+        current = ok and current or {Chunks = {}}
+        local wrote = false
+
+        local function key(c) return c.X .. "," .. c.Y .. "," .. c.Z end
+        local now = {}
+        for _, c in ipairs(current.Chunks or {}) do now[key(c)] = c end
+
+        --// rewrite chunks that differ, and empty the ones the commit doesn't have
+        local wanted = {}
+        for _, c in ipairs(value.Chunks or {}) do
+            wanted[key(c)] = true
+            local existing = now[key(c)]
+            if not existing or existing.D ~= c.D or table.concat(existing.P, ",") ~= table.concat(c.P, ",") then
+                write_chunk(terrain, c.X, c.Y, c.Z, c)
+                wrote = true
+                Utilities.roYield()
+            end
+        end
+        for k, c in pairs(now) do
+            if not wanted[k] then
+                write_chunk(terrain, c.X, c.Y, c.Z, nil)
+                wrote = true
+                Utilities.roYield()
+            end
+        end
+        if wrote then
+            terrain_cache.dirty = true
+        end
+    end,
+}
+
 --// ---------------------------------------------------------------- Path2D
 SPECIAL.Path2D = {
     key = "_controlPoints",
@@ -515,9 +872,7 @@ SPECIAL.Path2D = {
 }
 
 --// Classes where roGit knows it can't store everything. `git doctor` lists these.
-instances.KNOWN_LIMITS = {
-    Terrain = "terrain voxels (the actual landscape) are not stored, only the terrain's settings",
-}
+instances.KNOWN_LIMITS = {}
 
 --// Properties that are real and settable but missing from the reflected "serialized" list.
 local EXTRA_PROPERTIES = {
@@ -548,6 +903,24 @@ function instances.create_instance(className, props)
         if created and typeof(result) == "Instance" then return result end
     end
     return nil
+end
+
+--[[
+Names of the properties that currently hold a value which can also be "nothing" (an instance reference or
+custom physical properties). When the blob being applied doesn't have them, they were cleared.
+]]
+function instances.nullable_properties(instance)
+    local names = {}
+    for _, entry in ipairs(get_class_properties(instance.ClassName)) do
+        local ok, value = pcall(function() return instance[entry.publicName] end)
+        if ok and value ~= nil then
+            local kind = typeof(value)
+            if kind == "Instance" or kind == "PhysicalProperties" then
+                table.insert(names, entry.publicName)
+            end
+        end
+    end
+    return names
 end
 
 --[[
@@ -626,6 +999,19 @@ function instances.serialize_instance(instance, report)
     end
 
     if instance:IsA("LuaSourceContainer") then
+        --// what the script editor shows wins (with drafts/collaborative editing it can differ from .Source)
+        pcall(function()
+            local document = game:GetService("ScriptEditorService"):FindScriptDocument(instance)
+            local text = document and document:GetText()
+            if type(text) == "string" then
+                for i, prop in ipairs(instanceProperties) do
+                    if prop.name == "Source" then table.remove(instanceProperties, i) break end
+                end
+                added.Source = nil
+                table.insert(instanceProperties, {name = "Source", value = text, valueType = "string"})
+                added.Source = true
+            end
+        end)
         pcall(function()
             if not added.Source then
                 local val = (instance :: any).Source

@@ -1,8 +1,7 @@
 
 --[[
-This is an extremely large file that should be cleaned/split for future reference.
-This holds all the commands for `git` & most functionality.
-
+The core `git` commands. Shared repository logic lives in libs/repo.lua,
+the history/stash/inspection commands live in commands/.
 ]]
 local git = {}
 
@@ -23,9 +22,10 @@ local Requests = require(script.Parent.libs.requests)
 local Remote = require(script.Parent.libs.git_remote)
 local merge = require(script.Parent.libs.merge)
 local diff = require(script.Parent.libs.diff)
+local repo = require(script.Parent.libs.repo)
+local output = require(script.Parent.libs.output)
 
 
-local ROGIT_ID = "_rogit_id"
 local ACTIVE_PLUGIN = nil
 
 --[[
@@ -46,10 +46,11 @@ end
 --[[
 Replace some output commands (print, warn, error) with custom plugin implementatinos
 ]]
-function git.replaceOutputCallback(callback, warncallback, errcallback)
+function git.replaceOutputCallback(callback, warncallback)
+    --// errors are always real errors: the terminal catches them and prints them in red
     print = callback
     warn = warncallback
-    error = errcallback
+    output.set(callback, warncallback)
 end
 
 --[[
@@ -67,238 +68,37 @@ local function compute_blob_sha(content)
     return Handlers.blob_sha(content)
 end
 
---[[
-Reads the index as of the last commit (used to tell staged changes apart).
-]]
-local function read_last_index()
-    local raw = bash.getFileContents(bash.getGitFolderRoot(), "last_commit_index")
-    if raw and raw ~= "" then
-        return HttpService:JSONDecode(raw)
-    end
-    return {}
-end
-
---[[
-Builds the "Name <email>" signature used for commits and tags.
-]]
-local function make_signature()
-    local user_name = Auth.getConfigValue("user_name") or Auth.getConfigValue("user.name") or "roGit"
-    local user_email = Auth.getConfigValue("user_email") or Auth.getConfigValue("user.email") or "ro-git@example.com"
-    return string.format("%s <%s> %d +0000", user_name, user_email, os.time())
-end
-
---[[
-Writes a commit object and moves HEAD (and the branch it points at) to it.
-]]
-local function create_commit(tree_sha, parents, message)
-    local lines = {"tree " .. tree_sha}
-    for _, parent in ipairs(parents) do
-        table.insert(lines, "parent " .. parent)
-    end
-    local signature = make_signature()
-    table.insert(lines, "author " .. signature)
-    table.insert(lines, "committer " .. signature)
-
-    local sha = Handlers.write_object("commit", table.concat(lines, "\n") .. "\n\n" .. message)
-    Handlers.update_ref("HEAD", sha)
-    return sha
-end
-
---[[
-Get all changes in our worktree.
-]]
-local function collect_worktree_changes(index)
-    local modified = {}
-    local deleted = {}
-
-    for path, data in pairs(index) do
-        Utilities.roYield()
-        local clean_path = path:match("^(.-)/%.properties$") or path
-        local currObj = Utilities.parse_path(clean_path)
-
-        if not currObj then
-            table.insert(deleted, path)
-        else
-            local serialized = instances.serialize_instance(currObj)
-            local current_sha = compute_blob_sha(serialized)
-            if current_sha ~= data.sha then
-                table.insert(modified, path)
-            end
-        end
-    end
-
-    table.sort(modified)
-    table.sort(deleted)
-    return modified, deleted
-end
-
---[[
-Is ancestor a commit of descendant?
-]]
-local function is_ancestor_commit(ancestor_sha, descendant_sha)
-    if not ancestor_sha or not descendant_sha then
-        return false
-    end
-    if ancestor_sha == descendant_sha then
-        return true
-    end
-
-    local queue = {descendant_sha}
-    local visited = {}
-    local cursor = 1
-
-    while cursor <= #queue do
-        local sha = queue[cursor]
-        cursor += 1
-
-        if not visited[sha] then
-            visited[sha] = true
-            local obj = Handlers.read_object(sha)
-            if obj and obj.type == "commit" then
-                for parent in obj.content:gmatch("\nparent (%x+)") do
-                    if parent == ancestor_sha then
-                        return true
-                    end
-                    table.insert(queue, parent)
-                end
-            end
-        end
-        Utilities.roYield()
-    end
-
-    return false
-end
-
---[[
-Returns the children of an instance that roGit tracks (ignores .rogitignore'd instances and the .git folder),
-in the same deterministic order used when staging. Duplicate names get a stable id so they can be told apart.
-]]
-local function tracked_children(parent, seen_ids)
-    local gitRoot = bash.getGitFolderRoot()
-    local children = {}
-    local counts = {}
-    for _, child in ipairs(parent:GetChildren()) do
-        if child ~= gitRoot and not (gitRoot and child:IsDescendantOf(gitRoot)) and not Handlers.is_ignored(child:GetFullName()) then
-            table.insert(children, child)
-            counts[child.Name] = (counts[child.Name] or 0) + 1
-        end
-    end
-
-    for _, child in ipairs(children) do
-        if counts[child.Name] > 1 then
-            local id = child:GetAttribute(ROGIT_ID)
-            if not id or id == "" or seen_ids[id] then
-                id = HttpService:GenerateGUID(false)
-                child:SetAttribute(ROGIT_ID, id)
-            end
-            seen_ids[id] = true
-        end
-    end
-
-    table.sort(children, function(a, b)
-        if a.Name ~= b.Name then
-            return a.Name < b.Name
-        end
-        return (a:GetAttribute(ROGIT_ID) or "") < (b:GetAttribute(ROGIT_ID) or "")
-    end)
-
-    return children, counts
-end
-
---[[
-Finds every tracked instance that is not part of the index yet. Returns a set of virtual paths.
-]]
-local function collect_untracked(index)
-    local untracked = {}
-    local seen_ids = {}
-
-    local function traverse(children, counts, path_prefix)
-        local seen_local = {}
-
-        for _, child in ipairs(children) do
-            Utilities.roYield()
-            local virtualName = Utilities.escape_name(child.Name)
-            if counts[child.Name] > 1 then
-                seen_local[child.Name] = (seen_local[child.Name] or 0) + 1
-                virtualName = virtualName .. " [" .. tostring(seen_local[child.Name]) .. "]"
-            end
-
-            local my_path = path_prefix == "" and virtualName or (path_prefix .. "/" .. virtualName)
-            local grandchildren, grandCounts = tracked_children(child, seen_ids)
-
-            local index_path = #grandchildren > 0 and (my_path .. "/.properties") or my_path
-            if not index[index_path] and not index[my_path] then
-                untracked[my_path] = true
-            end
-
-            traverse(grandchildren, grandCounts, my_path)
-        end
-    end
-
-    for _, service in ipairs(bash.trackingRoot) do
-        local children, counts = tracked_children(service, seen_ids)
-        traverse(children, counts, service.Name)
-    end
-
-    return untracked
-end
+local read_last_index = repo.read_last_index
+local make_signature = repo.make_signature
+local create_commit = repo.create_commit
+local collect_worktree_changes = repo.collect_worktree_changes
+local is_ancestor_commit = repo.is_ancestor
+local collect_untracked = repo.collect_untracked
+local normalize_user_path = repo.normalize_user_path
+local matches_filters = repo.matches_filters
+local read_blob_content = repo.read_blob_content
+local dirty_changes = repo.dirty_changes
 
 --[[
 Returns a combined table of all active working tree/index changes for the UI.
 ]]
-function git.get_changes()
-    Handlers.load_ignore_patterns()
-    local index = Handlers.read_index()
-    local last_index = read_last_index()
+git.get_changes = repo.get_changes
 
-    local changes = {}
-    local seen_paths = {}
 
-    --// STAGED (Compared to last commit)
-    for path, data in pairs(index) do
-        if not last_index[path] then
-            table.insert(changes, {path = path, status = "A"})
-            seen_paths[path] = true
-        elseif last_index[path].sha ~= data.sha then
-            table.insert(changes, {path = path, status = "M"})
-            seen_paths[path] = true
-        end
+--// Terrain is expensive to read, so between commands it is only re-read after Studio records an edit.
+--// Commands that look at or change the place always start from a fresh read (scripts can edit terrain silently).
+local READ_ONLY_COMMANDS = {
+    log = true, show = true, branch = true, br = true, tag = true, reflog = true, help = true, h = true, version = true,
+    v = true, ["--version"] = true, config = true, remote = true, ["cat-file"] = true, ["ls-files"] = true, ["ls-tree"] = true,
+    ["rev-parse"] = true, ["rev-list"] = true, ["show-ref"] = true, describe = true, shortlog = true, blame = true,
+    grep = true, ["count-objects"] = true, ["merge-base"] = true, ["symbolic-ref"] = true, ["update-ref"] = true,
+    fetch = true, push = true, credential = true, bisect = true,
+}
+arguments.onExecute = function(_, argument)
+    if not READ_ONLY_COMMANDS[argument or ""] then
+        instances.invalidate_terrain()
     end
-    for path, _ in pairs(last_index) do
-        if not index[path] then
-            table.insert(changes, {path = path, status = "D"})
-            seen_paths[path] = true
-        end
-    end
-
-    --// UNSTAGED (Compared to index)
-    local unstaged_modified, unstaged_deleted = collect_worktree_changes(index)
-    for _, path in ipairs(unstaged_modified) do
-         if not seen_paths[path] then
-             table.insert(changes, {path = path, status = "M"})
-             seen_paths[path] = true
-         end
-    end
-    for _, path in ipairs(unstaged_deleted) do
-         if not seen_paths[path] then
-             table.insert(changes, {path = path, status = "D"})
-             seen_paths[path] = true
-         end
-    end
-
-    --// UNTRACKED (Files not in index at all)
-    for path in pairs(collect_untracked(index)) do
-        if not seen_paths[path] then
-            table.insert(changes, {path = path, status = "U"})
-        end
-    end
-
-    table.sort(changes, function(a, b)
-        return a.path < b.path
-    end)
-    return changes
 end
-
 
 -- Create command
 arguments.createCommand("git", function(...)
@@ -313,7 +113,10 @@ v
 Outputs the version to the console.
 ]]
 arguments.createArgument("git", "version", "v", function ()
-    print(config.version)
+    print("git version " .. config.version .. " (roGit)")
+end)
+arguments.createArgument("git", "--version", function ()
+    print("git version " .. config.version .. " (roGit)")
 end)
 
 --[[
@@ -339,19 +142,40 @@ arguments.createArgument("git", "help", "h", function (...)
             fetch = "git-fetch - Download objects and refs from another repository.\n\nUsage: git fetch [<repository>]",
             reset = "git-reset - Reset current HEAD to the specified state.\n\nUsage: git reset [--soft | --mixed | --hard] [<commit>]\n\n    --hard       reset HEAD, index and working tree",
             rm = "git-rm - Remove files from the working tree and from the index.\n\nUsage: git rm [-r] <file>...",
-            diff = "git-diff - Show what changed in the working tree.\n\nUsage: git diff [--cached] [--name-only] [<path>...]\n\nShows property changes of every modified instance, and a line diff for scripts.",
+            diff = "git-diff - Show changes between commits, the index and the place.\n\nUsage: git diff [--cached] [--stat | --name-only | --name-status] [<commit> [<commit>]] [-- <path>...]\n\nShows property changes of every modified instance, and a line diff for scripts.",
             show = "git-show - Show a commit and the instances it changed.\n\nUsage: git show [<commit>] [--name-only]",
             merge = "git-merge - Join two or more development histories together.\n\nUsage: git merge [--no-ff] [-m <msg>] [-X ours|theirs] <commit-or-branch>\n\nInstances changed on both sides are merged property by property, scripts line by line.\nIf something can't be merged the merge stops without changing anything.",
             mv = "git-mv - Move or rename a file, a directory, or a symlink.\n\nUsage: git mv <source> <destination>",
             restore = "git-restore - Restore working tree files.\n\nUsage: git restore <pathspec>",
             remote = "git-remote - Manage set of tracked repositories.\n\nUsage: git remote [-v | --verbose]\n       git remote add [-f] <name> <url>\n       git remote remove <name>\n       git remote set-url <name> <newurl>",
             init = "git-init - Create an empty Git repository or reinitialize an existing one.\n\nUsage: git init [-q | --quiet] [-b <branch-name>]",
-            log = "git-log - Show commit logs.\n\nUsage: git log [--oneline] [-n <number>] [<revision>]",
+            log = "git-log - Show commit logs.\n\nUsage: git log [--oneline] [--graph] [--all] [-n <number>] [-p | --stat | --name-status]\n               [--author=<name>] [--grep=<text>] [--format=<format>] [--reverse] [<revision range>] [-- <path>...]",
             doctor = "git-doctor - Check what roGit cannot store.\n\nUsage: git doctor [-v]\n\nScans every tracked instance and lists property types, instances and data roGit can't save.",
             tag = "git-tag - Create, list, delete tags.\n\nUsage: git tag [-l [<pattern>]]\n       git tag [-a -m <msg>] <tagname> [<commit>]\n       git tag -d <tagname>",
             config = "git-config - Get and set repository or global options.\n\nUsage: git config [--global] <name> [<value>]",
             version = "git-version - Show the RoGit version information.\n\nUsage: git version",
             credential = "git-credential - Prompt for and cache user credentials.\n\nUsage: git credential (fill|approve|reject)",
+            stash = "git-stash - Stash the changes in a dirty working directory away.\n\nUsage: git stash [push [-u] [-m <message>]]\n       git stash list | show [-p] [<stash>]\n       git stash pop | apply | drop [<stash>]\n       git stash branch <branchname> [<stash>]\n       git stash clear",
+            ["cherry-pick"] = "git-cherry-pick - Apply the changes introduced by some existing commits.\n\nUsage: git cherry-pick [-n] [-x] [-m <parent>] [-X ours|theirs] <commit>...\n       git cherry-pick (--continue | --skip | --abort | --quit)",
+            bisect = "git-bisect - Use binary search to find the commit that introduced a bug.\n\nUsage: git bisect start [<bad> [<good>...]]\n       git bisect (bad | good | skip) [<rev>]\n       git bisect reset | log",
+            revert = "git-revert - Revert some existing commits.\n\nUsage: git revert [-n] [-m <parent>] <commit>...\n       git revert (--continue | --skip | --abort | --quit)",
+            rebase = "git-rebase - Reapply commits on top of another base tip.\n\nUsage: git rebase [-X ours|theirs] [--onto <newbase>] [<upstream> [<branch>]]\n       git rebase (--continue | --skip | --abort | --quit)",
+            reflog = "git-reflog - Show where HEAD (or a branch) has been.\n\nUsage: git reflog [show] [-n <number>] [<ref>]\n\nEntries can be used as revisions, e.g. git reset --hard HEAD@{1}",
+            clean = "git-clean - Remove untracked instances.\n\nUsage: git clean [-n] [-f] [<path>...]",
+            grep = "git-grep - Search script sources.\n\nUsage: git grep [-i] [-n] [-c] [-l] [-v] [-w] [-E] <pattern> [<rev>] [-- <path>...]\n\nPatterns are plain text; -E makes them Lua patterns.",
+            blame = "git-blame - Show what revision and author last modified each line of a script.\n\nUsage: git blame [<rev>] [--] <path>",
+            describe = "git-describe - Give an object a human readable name based on a tag.\n\nUsage: git describe [--tags] [--always] [--long] [<commit>]",
+            shortlog = "git-shortlog - Summarize git log output.\n\nUsage: git shortlog [-s] [-n] [-e] [<revision range>]",
+            ["cat-file"] = "git-cat-file - Show the content or type of objects.\n\nUsage: git cat-file (-t | -s | -e | -p) <object>   (<object> may be <rev>:<path>)",
+            ["ls-files"] = "git-ls-files - Show tracked (or -o untracked, -m modified, -d deleted, -u unmerged) instances.\n\nUsage: git ls-files [-s] [-o] [-m] [-d] [-u] [<path>...]",
+            ["ls-tree"] = "git-ls-tree - List the contents of a tree object.\n\nUsage: git ls-tree [-r] [--name-only] <tree-ish> [<path>]",
+            ["rev-parse"] = "git-rev-parse - Resolve revisions.\n\nUsage: git rev-parse [--short] [--abbrev-ref] [--verify] <rev>...",
+            ["rev-list"] = "git-rev-list - List commit objects in reverse chronological order.\n\nUsage: git rev-list [--count] [-n <n>] [--all] <commit>... [^<commit>] [<a>..<b>]",
+            ["merge-base"] = "git-merge-base - Find a common ancestor for a merge.\n\nUsage: git merge-base [--is-ancestor] <commit> <commit>",
+            ["show-ref"] = "git-show-ref - List references.\n\nUsage: git show-ref [--heads] [--tags]",
+            ["symbolic-ref"] = "git-symbolic-ref - Read or change HEAD.\n\nUsage: git symbolic-ref [--short] HEAD [<ref>]",
+            ["update-ref"] = "git-update-ref - Update a ref safely.\n\nUsage: git update-ref [-d] <ref> [<commit>]",
+            ["count-objects"] = "git-count-objects - Count stored objects.\n\nUsage: git count-objects",
             checkout = "git-checkout - Switch branches or restore working tree files.\n\nUsage: git checkout [-b] <branchname>\n       git checkout <commit-or-tag>   (detached HEAD)\n       git checkout -- <pathspec>..."
         }
 
@@ -391,12 +215,18 @@ work on the current change (see also: git help everyday)
    mv        Move or rename a file, a directory, or a symlink
    restore   Restore working tree files
    rm        Remove files from the working tree and from the index
+   clean     Remove untracked instances
+   stash     Stash the changes in a dirty working directory away
 
 examine the history and state (see also: git help revisions)
    diff      Show changes between commits, commit and working tree, etc
    log       Show commit logs
    show      Show a commit and the instances it changed
    status    Show the working tree status
+   grep      Search script sources
+   blame     Show who last changed each line of a script
+   reflog    Show where HEAD has been
+   bisect    Use binary search to find the commit that introduced a bug
 
 grow, mark and tweak your common history
    branch    List, create, or delete branches
@@ -405,8 +235,10 @@ grow, mark and tweak your common history
    switch    Switch branches
    merge     Join two or more development histories together
    tag       Create, list, delete tags
-   rebase    Reapply commits on top of another base tip (NOT IMPLEMENTED YET)
+   rebase    Reapply commits on top of another base tip
    reset     Reset current HEAD to the specified state
+   cherry-pick  Apply the changes introduced by some existing commits
+   revert    Revert some existing commits
 
 collaborate (see also: git help workflows)
    fetch     Download objects and refs from another repository
@@ -418,6 +250,8 @@ Other commands:
    init      Create an empty Git repository or reinitialize an existing one
    config    Get and set repository or global options
    doctor    Check what roGit cannot store in this place
+   describe, shortlog, cat-file, ls-files, ls-tree, rev-parse, rev-list,
+   merge-base, show-ref, symbolic-ref, update-ref, count-objects
 
 'git help -a' and 'git help -g' list available subcommands and some
 concept guides. See 'git help <command>' or 'git help <concept>'
@@ -425,231 +259,266 @@ to read about a specific subcommand or concept.
 See 'git help git' for an overview of the system.]=])
 end)
 
---[[
-Turns a user supplied path (Workspace/Part, game.Workspace.Part) into an index style path.
-]]
-local function normalize_user_path(path)
-    path = path:gsub("^game[./]", "")
-    if not path:find("/", 1, true) then
-        path = path:gsub("%.", "/")
-    end
-    return (path:gsub("/+$", ""))
-end
-
-local function matches_filters(path, filters)
-    if #filters == 0 then return true end
-    local entity = path:match("^(.-)/%.properties$") or path
-    for _, filter in ipairs(filters) do
-        if entity == filter or entity:sub(1, #filter + 1) == filter .. "/" then
-            return true
-        end
-    end
-    return false
-end
-
-local function read_blob_content(sha)
-    local obj = sha and Handlers.read_object(sha)
-    return obj and obj.type == "blob" and obj.content or nil
+--// commands/inspect.lua registers commands itself, so it can only be loaded once `git` exists
+local function inspect()
+    return require(script.Parent.commands.inspect)
 end
 
 --[[
-commands:
-diff
-
-View what changed in the working tree (or, with --cached, in the staged changes).
-Shows property level changes, and a line diff for scripts.
+What the place currently holds for an index path (serialized), nil when the instance is gone.
 ]]
-arguments.createArgument("git", "diff", "", function(...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository")
-    Handlers.load_ignore_patterns()
+local function live_blob(path)
+    local currObj = Utilities.parse_path(repo.entity_of(path))
+    return currObj and instances.serialize_instance(currObj) or nil
+end
 
-    local cached = false
-    local names_only = false
-    local filters = {}
-    for _, arg in ipairs({...}) do
-        if arg == "--cached" or arg == "--staged" then
-            cached = true
-        elseif arg == "--name-only" or arg == "--stat" or arg == "--name-status" then
-            names_only = true
-        elseif arg ~= "--" and arg:sub(1, 1) ~= "-" then
-            table.insert(filters, normalize_user_path(arg))
-        end
-    end
-
-    local index = Handlers.read_index()
+--[[
+Compares two indexes. `new` may be the string "worktree" (the live place, for the paths in `tracked`).
+Returns a sorted list of {path, status = A/M/D, old_sha, new_sha, new_content}.
+]]
+local function compare_indexes(old, new, tracked, filters)
     local entries = {}
-
-    if cached then
-        local last_index = read_last_index()
-        for path, data in pairs(index) do
-            if not last_index[path] then
-                table.insert(entries, {path = path, status = "A", new = data.sha})
-            elseif last_index[path].sha ~= data.sha then
-                table.insert(entries, {path = path, status = "M", old = last_index[path].sha, new = data.sha})
-            end
-        end
-        for path, data in pairs(last_index) do
-            if not index[path] then
-                table.insert(entries, {path = path, status = "D", old = data.sha})
-            end
-        end
-    else
-        for path, data in pairs(index) do
-            Utilities.roYield()
-            local currObj = Utilities.parse_path(path:match("^(.-)/%.properties$") or path)
-            if not currObj then
-                table.insert(entries, {path = path, status = "D", old = data.sha})
-            else
-                local serialized = instances.serialize_instance(currObj)
-                if compute_blob_sha(serialized) ~= data.sha then
-                    table.insert(entries, {path = path, status = "M", old = data.sha, live = serialized})
+    if new == "worktree" then
+        local paths, seen = {}, {}
+        for path in pairs(old) do seen[path] = true table.insert(paths, path) end
+        for path in pairs(tracked) do if not seen[path] then table.insert(paths, path) end end
+        for _, path in ipairs(paths) do
+            if matches_filters(path, filters) then
+                Utilities.roYield()
+                local content = live_blob(path)
+                local old_entry = old[path]
+                if not content then
+                    if old_entry then table.insert(entries, {path = path, status = "D", old_sha = old_entry.sha}) end
+                else
+                    local sha = compute_blob_sha(content)
+                    if not old_entry then
+                        table.insert(entries, {path = path, status = "A", new_sha = sha, new_content = content})
+                    elseif old_entry.sha ~= sha then
+                        table.insert(entries, {path = path, status = "M", old_sha = old_entry.sha, new_sha = sha, new_content = content})
+                    end
                 end
             end
         end
+    else
+        for path, data in pairs(new) do
+            if matches_filters(path, filters) then
+                if not old[path] then
+                    table.insert(entries, {path = path, status = "A", new_sha = data.sha})
+                elseif old[path].sha ~= data.sha then
+                    table.insert(entries, {path = path, status = "M", old_sha = old[path].sha, new_sha = data.sha})
+                end
+            end
+        end
+        for path, data in pairs(old) do
+            if matches_filters(path, filters) and not new[path] then
+                table.insert(entries, {path = path, status = "D", old_sha = data.sha})
+            end
+        end
     end
-
     table.sort(entries, function(x, y) return x.path < y.path end)
+    return entries
+end
 
+--[[
+Prints compare_indexes() results. format: "patch" (default), "stat", "name-only", "name-status".
+]]
+local function print_changes(entries, format)
     local colors = {A = "\27[32m", M = "\27[33m", D = "\27[31m"}
-    local shown = 0
+    if format == "stat" then
+        for _, entry in ipairs(entries) do
+            print(string.format(" %s | %s", entry.path, entry.status == "A" and "new" or (entry.status == "D" and "deleted" or "changed")))
+        end
+        if #entries > 0 then
+            print(string.format(" %d file%s changed", #entries, #entries == 1 and "" or "s"))
+        end
+        return
+    end
     for _, entry in ipairs(entries) do
-        if matches_filters(entry.path, filters) then
-            shown += 1
+        if format == "name-only" then
+            print(entry.path)
+        elseif format == "name-status" then
+            print(entry.status .. "\t" .. entry.path)
+        else
             print(colors[entry.status] .. entry.status .. "\27[0m  " .. entry.path)
-            if not names_only and entry.status == "M" then
-                for _, line in ipairs(diff.describe(read_blob_content(entry.old), entry.live or read_blob_content(entry.new))) do
+            local old = entry.old_sha and read_blob_content(entry.old_sha) or nil
+            local new = entry.new_content or (entry.new_sha and read_blob_content(entry.new_sha)) or nil
+            if entry.status ~= "D" then
+                for _, line in ipairs(diff.describe(old, new)) do
                     print(line)
                 end
             end
         end
     end
+end
 
-    if not cached then
-        local untracked = {}
-        for path in pairs(collect_untracked(index)) do
-            if matches_filters(path, filters) then
-                table.insert(untracked, path)
-            end
-        end
-        table.sort(untracked)
-        for _, path in ipairs(untracked) do
-            shown += 1
-            print("\27[31m??\27[0m " .. path)
-        end
-    end
-
-    if shown == 0 then
-        print(cached and "No staged changes." or "Everything up-to-date with index.")
-    end
-end)
+git.compare_indexes = compare_indexes
+git.print_changes = print_changes
 
 --[[
 commands:
-rebase
+diff
 
-stubbed.
+git diff                      the place vs the index
+git diff --cached [<commit>]  the index vs HEAD (or <commit>)
+git diff <commit>             the place vs <commit>
+git diff <a> <b> / <a>..<b>   two commits (a...b: from their merge base)
+Shows property level changes, and a line diff for scripts.
 ]]
-arguments.createArgument("git", "rebase", "", function()
-    error("fatal: 'rebase' requires interactive graph rewrites which are complex in Luau. Please use 'git merge' instead.")
-end)
+arguments.createArgument("git", "diff", "", function(...)
+    repo.require_root()
+    Handlers.load_ignore_patterns()
 
---[[
-Lists staged/unstaged changes to tracked instances (untracked ones are ignored, they can't be overwritten).
-]]
-local function dirty_changes()
-    local dirty = {}
-    for _, change in ipairs(git.get_changes()) do
-        if change.status ~= "U" then
-            table.insert(dirty, change.path)
+    local cached = false
+    local format = "patch"
+    local filters = {}
+    local revs = {}
+    local after_dashes = false
+    for _, arg in ipairs({...}) do
+        if after_dashes then
+            table.insert(filters, normalize_user_path(arg))
+        elseif arg == "--" then
+            after_dashes = true
+        elseif arg == "--cached" or arg == "--staged" then
+            cached = true
+        elseif arg == "--name-only" then
+            format = "name-only"
+        elseif arg == "--name-status" then
+            format = "name-status"
+        elseif arg == "--stat" or arg == "--shortstat" or arg == "--numstat" then
+            format = "stat"
+        elseif arg:sub(1, 1) ~= "-" then
+            local from, dots, to = arg:match("^(.-)(%.%.%.?)(.*)$")
+            if from and (Handlers.resolve_revision(from ~= "" and from or "HEAD")) then
+                local a = Handlers.resolve_revision(from ~= "" and from or "HEAD")
+                local b = Handlers.resolve_revision(to ~= "" and to or "HEAD")
+                if dots == "..." then a = Handlers.merge_base(a, b) or a end
+                table.insert(revs, a)
+                table.insert(revs, b)
+            elseif #filters == 0 and Handlers.resolve_revision(arg) and not Utilities.parse_path(arg) then
+                table.insert(revs, Handlers.resolve_revision(arg))
+            else
+                table.insert(filters, normalize_user_path(arg))
+            end
         end
     end
-    return dirty
+
+    local function tree_of(sha)
+        local commit = Handlers.read_commit(sha)
+        if not commit then error("fatal: bad revision '" .. tostring(sha) .. "'", 0) end
+        return repo.tree_index(commit.tree)
+    end
+
+    local index = Handlers.read_index()
+    local entries
+    if #revs >= 2 then
+        entries = compare_indexes(tree_of(revs[1]), tree_of(revs[2]), nil, filters)
+    elseif cached then
+        local base = revs[1] and tree_of(revs[1]) or read_last_index()
+        entries = compare_indexes(base, index, nil, filters)
+    elseif revs[1] then
+        entries = compare_indexes(tree_of(revs[1]), "worktree", index, filters)
+    else
+        entries = compare_indexes(index, "worktree", {}, filters)
+    end
+
+    print_changes(entries, format)
+end)
+
+local function print_dirty_abort(_dirty, action)
+    repo.ensure_clean(action)
 end
 
-local function print_dirty_abort(dirty, action)
-    local lines = {"error: Your local changes to the following files would be overwritten by " .. action .. ":"}
-    for _, path in ipairs(dirty) do
-        table.insert(lines, "\t" .. path)
+--[[
+Fails when a merge/cherry-pick/revert/rebase is still waiting to be concluded.
+]]
+local function ensure_no_operation()
+    local op = repo.operation_in_progress()
+    if op == "merge" then
+        error("fatal: You have not concluded your merge (MERGE_HEAD exists).\nPlease, commit your changes before you merge.", 0)
+    elseif op then
+        error("fatal: a " .. op .. " is in progress. Finish it with 'git " .. op .. " --continue' or cancel it with 'git " .. op .. " --abort'.", 0)
     end
-    table.insert(lines, "Please commit your changes or restore them before you " .. (action == "merge" and "merge" or "switch branches") .. ".")
-    table.insert(lines, "Aborting")
-    error(table.concat(lines, "\n"))
+    if #repo.read_conflicts() > 0 then
+        error("error: you need to resolve your current conflicts first.", 0)
+    end
 end
 
 --[[
 Merges the commit `target_sha` into the current branch.
 Fast-forwards when possible, otherwise performs a three-way merge of the instances and creates a merge commit.
-Returns true on success; on conflicts nothing is changed and false is returned.
+On conflicts the place is left half merged (like git): resolve, `git add`, then `git commit` (or `git merge --abort`).
 
-opts: prefer ("ours" | "theirs"), no_ff, message
+opts: prefer ("ours" | "theirs"), no_ff, ff_only, no_commit, squash, message, name (shown in conflict markers)
 ]]
 local function perform_merge(target_sha, label, opts)
     opts = opts or {}
-    local head_sha = Handlers.get_ref("HEAD")
-    if head_sha == "" then head_sha = nil end
+    ensure_no_operation()
 
+    local head_sha = repo.head_sha()
     local target_commit = Handlers.read_commit(target_sha)
     assert(target_commit and target_commit.tree, "fatal: " .. tostring(target_sha) .. " is not a commit we have locally")
+    local name = opts.name or label
 
     if head_sha and (head_sha == target_sha or is_ancestor_commit(target_sha, head_sha)) then
         print("Already up to date.")
         return true
     end
 
-    local dirty = dirty_changes()
-    if #dirty > 0 then
-        print_dirty_abort(dirty, "merge")
-        return false
-    end
+    repo.ensure_clean("merge")
 
-    if not head_sha or (is_ancestor_commit(head_sha, target_sha) and not opts.no_ff) then
+    if not head_sha or (is_ancestor_commit(head_sha, target_sha) and not opts.no_ff and not opts.squash) then
         print(string.format("Updating %s..%s", string.sub(head_sha or "0000000", 1, 7), string.sub(target_sha, 1, 7)))
-        Handlers.update_ref("HEAD", target_sha)
-        local ok, err = Remote.checkout(target_commit.tree)
-        assert(ok, err)
+        repo.save_orig_head()
+        Handlers.update_ref("HEAD", target_sha, "merge " .. name .. ": Fast-forward")
+        repo.checkout_tree(target_commit.tree)
         print("Fast-forward")
         return true
     end
 
-    local head_commit = Handlers.read_commit(head_sha)
+    if opts.ff_only then
+        error("fatal: Not possible to fast-forward, aborting.", 0)
+    end
+
     local base_sha = Handlers.merge_base(head_sha, target_sha)
     local base_commit = base_sha and Handlers.read_commit(base_sha)
+    local message = opts.message or ("Merge " .. label)
 
-    print("Merging " .. label .. " into " .. (Handlers.get_current_branch() or "HEAD") .. "...")
-    local merged_index, conflicts, combined = merge.merge_indexes(
-        base_commit and Handlers.tree_to_index(base_commit.tree) or {},
-        Handlers.tree_to_index(head_commit.tree),
-        Handlers.tree_to_index(target_commit.tree),
-        {
-            prefer = opts.prefer,
-            read_blob = read_blob_content,
-            write_blob = function(content) return Handlers.write_blob(content) end,
-        }
-    )
+    repo.save_orig_head()
+    local tree_sha = repo.three_way(base_commit and base_commit.tree, target_commit.tree, {
+        prefer = opts.prefer,
+        ours_label = "HEAD",
+        theirs_label = name,
+    })
 
-    if #conflicts > 0 then
-        local lines = {}
-        for _, conflict in ipairs(conflicts) do
-            table.insert(lines, "CONFLICT (" .. conflict.reason .. "): " .. conflict.path)
+    if not tree_sha then
+        if not opts.squash then
+            repo.write_file("MERGE_HEAD", target_sha)
         end
-        table.insert(lines, "Automatic merge failed; nothing was changed.")
-        table.insert(lines, "hint: re-run with '-X ours' or '-X theirs' to settle the conflicts in favour of one side.")
-        error(table.concat(lines, "\n"))
-        return false
+        repo.write_file("MERGE_MSG", message)
+        error("Automatic merge failed; fix conflicts and then commit the result.", 0)
     end
 
-    local tree_sha = Handlers.write_tree(merged_index)
-    local commit_sha = create_commit(tree_sha, {head_sha, target_sha}, opts.message or ("Merge " .. label))
-    local ok, err = Remote.checkout(tree_sha)
-    assert(ok, err)
-
-    table.sort(combined)
-    for _, path in ipairs(combined) do
-        print("Auto-merging " .. path)
+    if opts.squash or opts.no_commit then
+        repo.checkout_tree(tree_sha)
+        if opts.squash then
+            repo.write_file("MERGE_MSG", "Squashed commit of the following:\n\n" .. target_sha .. " " .. target_commit.message)
+            print("Squash commit -- not updating HEAD")
+        else
+            repo.write_file("MERGE_HEAD", target_sha)
+            repo.write_file("MERGE_MSG", message)
+            print("Automatic merge went well; stopped before committing as requested")
+        end
+        return true
     end
-    print(string.format("Merge made by the 'roGit' strategy. [%s]", string.sub(commit_sha, 1, 7)))
+
+    create_commit(tree_sha, {head_sha, target_sha}, message, {reflog = "merge " .. name})
+    repo.checkout_tree(tree_sha)
+    print("Merge made by the 'ort' strategy.")
     return true
 end
+
+git.perform_merge = perform_merge
+git.ensure_no_operation = ensure_no_operation
 
 --[[
 commands:
@@ -659,7 +528,7 @@ Joins another branch (or commit) into the current branch.
 Instances changed on both sides are merged property by property, scripts line by line.
 ]]
 arguments.createArgument("git", "merge", "", function(...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    repo.require_root()
 
     local tuple = {...}
     local rev = nil
@@ -668,12 +537,32 @@ arguments.createArgument("git", "merge", "", function(...)
     local i = 1
     while i <= #tuple do
         local arg = tuple[i]
-        if arg == "--no-ff" then
+        if arg == "--abort" or arg == "--quit" then
+            if not repo.read_file("MERGE_HEAD") and #repo.read_conflicts() == 0 then
+                error("fatal: There is no merge to abort (MERGE_HEAD missing).", 0)
+            end
+            if arg == "--abort" then
+                repo.checkout_tree(repo.head_tree())
+            end
+            repo.clear_operation_state()
+            return
+        elseif arg == "--continue" then
+            arguments.execute("git", "commit")
+            return
+        elseif arg == "--no-ff" then
             opts.no_ff = true
-        elseif arg == "-m" and tuple[i + 1] then
+        elseif arg == "--ff-only" then
+            opts.ff_only = true
+        elseif arg == "--ff" then
+            opts.no_ff = false
+        elseif arg == "--no-commit" then
+            opts.no_commit = true
+        elseif arg == "--squash" then
+            opts.squash = true
+        elseif (arg == "-m" or arg == "--message") and tuple[i + 1] then
             opts.message = tuple[i + 1]
             i += 1
-        elseif arg == "-X" and tuple[i + 1] then
+        elseif (arg == "-X" or arg == "--strategy-option") and tuple[i + 1] then
             opts.prefer = tuple[i + 1]
             i += 1
         elseif arg:match("^%-X(%a+)$") then
@@ -687,23 +576,30 @@ arguments.createArgument("git", "merge", "", function(...)
     end
 
     if opts.prefer and opts.prefer ~= "ours" and opts.prefer ~= "theirs" then
-        error("fatal: unknown strategy option '" .. opts.prefer .. "' (use ours or theirs)")
-        return
+        error("fatal: unknown strategy option '" .. opts.prefer .. "' (use ours or theirs)", 0)
     end
 
     if not rev then
-        error("fatal: No commit specified and merge.defaultToUpstream not set.")
-        return
+        --// like merge.defaultToUpstream: merge the branch's upstream
+        local branch = Handlers.get_current_branch()
+        local remote, remote_branch = repo.get_upstream(branch)
+        if branch and Handlers.get_ref("refs/remotes/" .. remote .. "/" .. remote_branch) then
+            rev = remote .. "/" .. remote_branch
+        else
+            error("fatal: No remote for the current branch.", 0)
+        end
     end
 
     local target_sha = Handlers.resolve_revision(rev)
     if not target_sha then
-        print("merge: " .. rev .. " - not something we can merge")
-        return
+        error("merge: " .. rev .. " - not something we can merge", 0)
     end
 
     local label = (rev:find("/", 1, true) and Handlers.get_ref("refs/remotes/" .. rev)) and ("remote-tracking branch '" .. rev .. "'")
-        or ("branch '" .. rev .. "'")
+        or (Handlers.get_ref("refs/heads/" .. rev) and ("branch '" .. rev .. "'"))
+        or (Handlers.get_ref("refs/tags/" .. rev) and ("tag '" .. rev .. "'"))
+        or ("commit '" .. rev .. "'")
+    opts.name = rev
     perform_merge(target_sha, label, opts)
 end)
 
@@ -711,171 +607,199 @@ end)
 commands:
 mv
 
-moves instance path
+Moves or renames an instance and updates the index.
 ]]
 arguments.createArgument("git", "mv", "", function(...)
-    local tuple = {...}
-    local source = tuple[1]
-    local destination = tuple[2]
-
-    if not source or not destination then
-        error("fatal: bad source, source=")
-        return
+    repo.require_root()
+    local positional = {}
+    local dry_run, verbose = false, false
+    for _, arg in ipairs({...}) do
+        if arg == "-n" or arg == "--dry-run" then
+            dry_run = true
+        elseif arg == "-v" or arg == "--verbose" then
+            verbose = true
+        elseif arg ~= "-f" and arg ~= "--force" and arg ~= "-k" and arg ~= "--" then
+            table.insert(positional, arg)
+        end
+    end
+    if #positional < 2 then
+        error("usage: git mv [<options>] <source>... <destination>", 0)
     end
 
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository")
-    
-    local source_path_cleaned = source:gsub("^game[./]", ""):gsub("%.", "/")
-    local dest_path_cleaned = destination:gsub("^game[./]", ""):gsub("%.", "/")
-    
-    local sourceObj = Utilities.parse_path(source_path_cleaned)
-    assert(sourceObj, "fatal: bad source, source=" .. source_path_cleaned)
-    
-    local destObj, destName, destSegments = Utilities.parse_path(dest_path_cleaned)
-    if destObj then
-        sourceObj.Parent = destObj
-    else
-        local parentPath = table.concat(destSegments, "/", 1, #destSegments - 1)
-        local parentObj = Utilities.parse_path(parentPath)
-        assert(parentObj, "fatal: destination parent does not exist")
-        sourceObj.Parent = parentObj
-        sourceObj.Name = destName
+    local destination = normalize_user_path(table.remove(positional))
+    local index = Handlers.read_index()
+
+    for _, source_arg in ipairs(positional) do
+        local source = normalize_user_path(source_arg)
+        local sourceObj = Utilities.parse_path(source)
+        if not sourceObj then
+            error("fatal: bad source, source=" .. source .. ", destination=" .. destination, 0)
+        end
+        local tracked = false
+        for path in pairs(index) do
+            if repo.matches_filters(path, {source}) then tracked = true break end
+        end
+        if not tracked then
+            error("fatal: not under version control, source=" .. source .. ", destination=" .. destination, 0)
+        end
+
+        --// into an existing instance (keeping the name), or to a new name
+        local destObj = Utilities.parse_path(destination)
+        local newParent, newName
+        if destObj then
+            newParent, newName = destObj, sourceObj.Name
+        else
+            local parentPath, name = destination:match("^(.*)/([^/]+)$")
+            newParent = parentPath and Utilities.parse_path(parentPath)
+            newName = name and Utilities.unescape_name(name)
+            if not newParent then
+                error("fatal: destination directory does not exist, source=" .. source .. ", destination=" .. destination, 0)
+            end
+        end
+
+        if verbose or dry_run then
+            print("Renaming " .. source .. " to " .. destination)
+        end
+        if not dry_run then
+            for path in pairs(table.clone(index)) do
+                if repo.matches_filters(path, {source}) then index[path] = nil end
+            end
+            Handlers.write_index(index)
+
+            sourceObj.Name = newName
+            sourceObj.Parent = newParent
+            local newPath = destObj and (destination .. "/" .. Utilities.escape_name(newName)) or destination
+            arguments.execute("git", "add", newPath)
+            index = Handlers.read_index()
+        end
     end
-    
-    print("Moved '" .. source_path_cleaned .. "' to '" .. dest_path_cleaned .. "'")
-    arguments.execute("git", "add", ".")
 end)
 
 --[[
 commands:
 restore
 
-restores removed file
+Restores instances from the index (or --source), or with --staged restores the index from HEAD.
 ]]
 arguments.createArgument("git", "restore", "", function(...)
+    repo.require_root()
     local tuple = {...}
-    if #tuple == 0 then
-        error("fatal: you must specify path(s) to restore")
-        return
+    local source_rev, staged, worktree = nil, false, false
+    local filters = {}
+
+    local i = 1
+    while i <= #tuple do
+        local arg = tuple[i]
+        if (arg == "-s" or arg == "--source") and tuple[i + 1] then
+            source_rev = tuple[i + 1]
+            i += 1
+        elseif arg:match("^%-%-source=") then
+            source_rev = arg:match("^%-%-source=(.*)$")
+        elseif arg == "-S" or arg == "--staged" then
+            staged = true
+        elseif arg == "-W" or arg == "--worktree" then
+            worktree = true
+        elseif arg == "-SW" or arg == "-WS" then
+            staged, worktree = true, true
+        elseif arg ~= "--" and arg:sub(1, 1) ~= "-" then
+            table.insert(filters, arg == "." and "." or normalize_user_path(arg))
+        end
+        i += 1
+    end
+    if not staged then worktree = true end
+
+    if #filters == 0 then
+        error("fatal: you must specify path(s) to restore", 0)
     end
 
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository")
     local index = Handlers.read_index()
-    local path = tuple[1]
-    
-    local is_all = (path == ".")
-    
-    if is_all then
-        local objectsByShaFallback = setmetatable({}, {
-            __index = function(_, key)
-                local obj = Handlers.read_object(key)
-                if not obj then return nil end
-                return {
-                    objType = ({commit=1, tree=2, blob=3, tag=4})[obj.type],
-                    content = obj.content
-                }
-            end
-        })
-
-        local to_destroy = {}
-        local function check_untracked(parent, prefix)
-            local child_counts = {}
-            for _, child in ipairs(parent:GetChildren()) do
-                if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() then
-                    child_counts[child.Name] = (child_counts[child.Name] or 0) + 1
-                end
-            end
-
-            local seen = {}
-            for _, child in ipairs(parent:GetChildren()) do
-                if not Handlers.is_ignored(child:GetFullName()) and child ~= bash.getGitFolderRoot() then
-                    local virtualName = Utilities.escape_name(child.Name)
-                    if child_counts[child.Name] > 1 then
-                        seen[child.Name] = (seen[child.Name] or 0) + 1
-                        virtualName = virtualName .. " [" .. tostring(seen[child.Name]) .. "]"
-                    end
-                    local my_path = prefix == "" and virtualName or (prefix .. "/" .. virtualName)
-                    
-                    local hasValidChildren = false
-                    for _, sub in ipairs(child:GetChildren()) do
-                        if not Handlers.is_ignored(sub:GetFullName()) and sub ~= bash.getGitFolderRoot() then
-                            hasValidChildren = true; break
-                        end
-                    end
-                    
-                    local idx_p = hasValidChildren and (my_path .. "/.properties") or my_path
-                    if not index[idx_p] and not index[my_path] then
-                        table.insert(to_destroy, child)
-                    else
-                        check_untracked(child, my_path)
-                    end
-                end
-            end
+    local original_index = table.clone(index)
+    local source
+    if source_rev then
+        local commit = Handlers.read_commit(Handlers.resolve_revision(source_rev))
+        if not commit then
+            error("fatal: could not resolve " .. source_rev, 0)
         end
-
-        for _, service in ipairs(bash.trackingRoot) do
-            check_untracked(service, service.Name)
-        end
-        for _, obj in ipairs(to_destroy) do pcall(function() obj:Destroy() end) end
-
-        for idx_path, data in pairs(index) do
-            local clean_path = idx_path:match("^(.-)/%.properties$") or idx_path
-            local targetObj = Utilities.parse_path(clean_path)
-            
-            if not targetObj then
-                local segments = string.split(clean_path, "/")
-                local name = table.remove(segments)
-                local parentPath = table.concat(segments, "/")
-                local parentObj = Utilities.parse_path(parentPath)
-                if parentObj then
-                    local obj = Handlers.read_object(data.sha)
-                    if obj and obj.type == "blob" then
-                        local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
-                        if ok then
-                            local className = "Folder"
-                            for _, p in ipairs(props) do if p.name == "ClassName" then className = p.value; break end end
-                            local inst = instances.create_instance(className, props)
-                            local ok2 = inst ~= nil
-                            if ok2 then
-                                inst.Name = Utilities.unescape_name((name:gsub(" %[%d+%]$", "")))
-                                Remote.applyProperties(inst, props)
-                                inst.Parent = parentObj
-                            end
-                        end
-                    end
-                end
-            else
-                local obj = Handlers.read_object(data.sha)
-                if obj and obj.type == "blob" then
-                    local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
-                    if ok then
-                        Remote.applyProperties(targetObj, props)
-                    end
-                end
-            end
-        end
-        Remote.resolve_instance_refs()
-        print("Restored working tree from index")
+        source = repo.tree_index(commit.tree)
+    elseif staged then
+        source = read_last_index()
     else
-        local _, _, segments = Utilities.parse_path(path)
-        local target_path_base = table.concat(segments or {}, "/")
-        local found = false
-        for idx_path, data in pairs(index) do
-            local entry_path = idx_path:match("^(.-)/%.properties$") or idx_path
-            if entry_path == target_path_base or entry_path:sub(1, #target_path_base + 1) == target_path_base .. "/" then
-                found = true
-                local targetObj = Utilities.parse_path(entry_path)
-                if targetObj then
-                    local obj = Handlers.read_object(data.sha)
-                    if obj and obj.type == "blob" then
-                        local ok, props = pcall(function() return HttpService:JSONDecode(obj.content) end)
-                        if ok then Remote.applyProperties(targetObj, props) end
-                    end
-                end
+        source = index
+    end
+
+    local matched = 0
+    if staged then
+        for path in pairs(table.clone(index)) do
+            if matches_filters(path, filters) and not source[path] then
+                index[path] = nil
+                matched += 1
             end
         end
-        Remote.resolve_instance_refs()
-        if found then print("Restored " .. path) else print("error: pathspec '" .. path .. "' did not match any files") end
+        for path, data in pairs(source) do
+            if matches_filters(path, filters) then
+                index[path] = {sha = data.sha, mode = data.mode}
+                matched += 1
+            end
+        end
+        Handlers.write_index(index)
+    end
+
+    if worktree then
+        matched += repo.restore_worktree(source, original_index, filters)
+    end
+
+    if matched == 0 then
+        error("error: pathspec '" .. table.concat(filters, "', '") .. "' did not match any file(s) known to git", 0)
+    end
+end)
+
+--[[
+commands:
+clean
+
+Removes untracked instances.
+]]
+arguments.createArgument("git", "clean", "", function(...)
+    repo.require_root()
+    local force, dry_run, quiet = false, false, false
+    local filters = {}
+    for _, arg in ipairs({...}) do
+        if arg:match("^%-[fdnqx]+$") then
+            if arg:find("f") then force = true end
+            if arg:find("n") then dry_run = true end
+            if arg:find("q") then quiet = true end
+        elseif arg == "--force" then
+            force = true
+        elseif arg == "--dry-run" then
+            dry_run = true
+        elseif arg ~= "--" and arg:sub(1, 1) ~= "-" then
+            table.insert(filters, normalize_user_path(arg))
+        end
+    end
+
+    if not force and not dry_run and repo.get_config("clean.requireForce") ~= "false" then
+        error("fatal: clean.requireForce defaults to true and neither -i, -n, nor -f given; refusing to clean", 0)
+    end
+
+    Handlers.load_ignore_patterns()
+    local untracked = collect_untracked(Handlers.read_index())
+    local paths = {}
+    for path in pairs(untracked) do
+        local parent = path:match("^(.*)/[^/]+$")
+        --// only the top-most untracked instance, its children go with it
+        if not (parent and untracked[parent]) and matches_filters(path, filters) then
+            table.insert(paths, path)
+        end
+    end
+    table.sort(paths)
+
+    for _, path in ipairs(paths) do
+        if dry_run then
+            print("Would remove " .. path)
+        else
+            if not quiet then print("Removing " .. path) end
+            pcall(function() untracked[path]:Destroy() end)
+        end
     end
 end)
 
@@ -887,25 +811,73 @@ a
 Adds files to be commited
 ]]
 arguments.createArgument("git", "add", "a", function (...)
-    assert(bash.getGitFolderRoot(),
-        "fatal: not a git repository (or any of the parent directories): .git")
+    repo.require_root()
     Handlers.load_ignore_patterns()
 
     local args = {...}
-    local force = false
     local dry_run = false
+    local verbose = false
+    local update_only = false
     local paths = {}
 
     for _, arg in ipairs(args) do
-        if arg == "-f" or arg == "--force" then
-            force = true
+        if arg == "-f" or arg == "--force" or arg == "--" then
+            --// accepted: ignored instances are never staged (they're not part of the tree at all)
         elseif arg == "-n" or arg == "--dry-run" then
             dry_run = true
+        elseif arg == "-v" or arg == "--verbose" then
+            verbose = true
+        elseif arg == "-u" or arg == "--update" then
+            update_only = true
         elseif arg == "-A" or arg == "--all" then
             table.insert(paths, ".")
         else
             table.insert(paths, arg)
         end
+    end
+
+    local index = Handlers.read_index()
+    local before = table.clone(index)
+    local seen_ids = {}
+
+    local function report()
+        if not (verbose or dry_run) then return end
+        local names = {}
+        for path, data in pairs(index) do
+            if not before[path] or before[path].sha ~= data.sha then table.insert(names, "add '" .. path .. "'") end
+        end
+        for path in pairs(before) do
+            if not index[path] then table.insert(names, "remove '" .. path .. "'") end
+        end
+        table.sort(names)
+        for _, line in ipairs(names) do print(line) end
+    end
+
+    local function finish(resolved)
+        report()
+        if not dry_run then
+            Handlers.write_index(index)
+            repo.resolve_conflicts(resolved)
+        end
+    end
+
+    --// git add -u: refresh what is tracked, never pick up new instances
+    if update_only then
+        local filters = {}
+        for _, path in ipairs(paths) do table.insert(filters, normalize_user_path(path)) end
+        for path in pairs(table.clone(index)) do
+            if repo.matches_filters(path, filters) then
+                Utilities.roYield()
+                local currObj = Utilities.parse_path(repo.entity_of(path))
+                if currObj then
+                    index[path] = {mode = "100644", sha = Handlers.write_blob(instances.serialize_instance(currObj))}
+                else
+                    index[path] = nil
+                end
+            end
+        end
+        finish(#filters > 0 and filters or {"."})
+        return
     end
 
     if #paths == 0 then
@@ -916,15 +888,13 @@ arguments.createArgument("git", "add", "a", function (...)
 
     local has_dot = false
     for _, p in ipairs(paths) do
-        if p == "." then
+        if p == "." or p == "*" or p == ":/" then
             has_dot = true
             break
         end
     end
 
     if has_dot then
-        local index = Handlers.read_index()
-        
         for path, _ in pairs(index) do
             for _, service in ipairs(bash.trackingRoot) do
                 if path == service.Name or path:sub(1, #service.Name + 1) == service.Name .. "/" then
@@ -934,49 +904,36 @@ arguments.createArgument("git", "add", "a", function (...)
             end
         end
 
-        local seen_ids = {}
         for _, service in ipairs(bash.trackingRoot) do
-            if force or not Handlers.is_ignored(service:GetFullName()) then
-                if dry_run then
-                    print("add '" .. service:GetFullName() .. "'")
-                    for _, desc in ipairs(service:GetDescendants()) do
-                        if desc ~= bash.getGitFolderRoot() and not desc:IsDescendantOf(bash.getGitFolderRoot()) then
-                            print("add '" .. desc:GetFullName() .. "'")
-                        end
-                    end
-                else
-                    instances.stage_recursive(service, index, seen_ids)
-                end
+            if not Handlers.is_ignored(service:GetFullName()) then
+                instances.stage_recursive(service, index, seen_ids)
             end
         end
-        if not dry_run then
-            Handlers.write_index(index)
-        end
+        finish({"."})
         return
     end
 
-    local index = Handlers.read_index()
-    local seen_ids = {}
-
+    local resolved = {}
     for _, target in ipairs(paths) do
         local currObj, _, segments = Utilities.parse_path(target)
+        local ownPath = segments and table.concat(segments, "/") or normalize_user_path(target)
+        table.insert(resolved, ownPath)
 
-        if not currObj then
-            error("fatal: pathspec '" .. target .. "' did not match any files")
-            return
+        --// Restage the whole subtree: drop what the index knew about it (deleted children included)
+        local known = false
+        for path in pairs(index) do
+            if path == ownPath or path:sub(1, #ownPath + 1) == ownPath .. "/" then
+                index[path] = nil
+                known = true
+            end
         end
 
-        if dry_run then
-            print("add '" .. currObj:GetFullName() .. "'")
-        else
-            --// Restage the whole subtree: drop what the index knew about it (deleted children included)
-            local ownPath = table.concat(segments, "/")
-            for path in pairs(index) do
-                if path == ownPath or path:sub(1, #ownPath + 1) == ownPath .. "/" then
-                    index[path] = nil
-                end
+        if not currObj then
+            --// staging a deletion is fine, a path nobody knows about isn't
+            if not known then
+                error("fatal: pathspec '" .. target .. "' did not match any files", 0)
             end
-
+        else
             instances.stage_recursive(currObj, index, seen_ids, nil, #segments > 1 and ownPath or nil)
 
             --// The parents need an entry too (and one in the "has children" form), otherwise the tree would lose their class/properties
@@ -991,9 +948,7 @@ arguments.createArgument("git", "add", "a", function (...)
         end
     end
 
-    if not dry_run then
-        Handlers.write_index(index)
-    end
+    finish(resolved)
 end)
 
 
@@ -1001,23 +956,31 @@ end)
 commands:
 pull
 
-Fetches the latest commits and integrates them: fast-forwards when it can, merges when the branches have diverged.
+Fetches the latest commits and integrates them: fast-forwards when it can, otherwise merges (or rebases with --rebase).
 ]]
 arguments.createArgument("git", "pull", "", function (...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    repo.require_root()
 
     local positional = {}
-    local ff_only = false
     local opts = {}
+    local rebase = repo.get_config("pull.rebase") == "true"
     local tuple = {...}
     local i = 1
     while i <= #tuple do
         local arg = tuple[i]
         if arg == "--ff-only" then
-            ff_only = true
+            opts.ff_only = true
         elseif arg == "--no-ff" then
             opts.no_ff = true
-        elseif arg == "-X" and tuple[i + 1] then
+        elseif arg == "--rebase" or arg == "-r" then
+            rebase = true
+        elseif arg == "--no-rebase" then
+            rebase = false
+        elseif arg == "--squash" then
+            opts.squash = true
+        elseif arg == "--no-commit" then
+            opts.no_commit = true
+        elseif (arg == "-X" or arg == "--strategy-option") and tuple[i + 1] then
             opts.prefer = tuple[i + 1]
             i += 1
         elseif arg:match("^%-X(%a+)$") then
@@ -1028,73 +991,60 @@ arguments.createArgument("git", "pull", "", function (...)
         i += 1
     end
 
-    local remote_name = positional[1] or "origin"
+    ensure_no_operation()
+
     local current_branch = Handlers.get_current_branch()
-    local branch_name = positional[2] or current_branch or "master"
+    local upstream_remote, upstream_branch = repo.get_upstream(current_branch)
+    local remote_name = positional[1] or upstream_remote or "origin"
+    local branch_name = positional[2] or (positional[1] == nil and upstream_branch) or current_branch or repo.default_branch()
 
     local refs = Remote.fetch(remote_name)
     local remoteSha = refs["refs/heads/" .. branch_name]
     assert(remoteSha, "fatal: couldn't find remote ref 'refs/heads/" .. branch_name .. "'")
 
-    Handlers.update_ref("refs/remotes/" .. remote_name .. "/" .. branch_name, remoteSha)
-
-    local head_sha = Handlers.get_ref("HEAD")
-    local local_branch_sha = Handlers.get_ref("refs/heads/" .. branch_name)
-    if not local_branch_sha and current_branch == branch_name then
-        local_branch_sha = head_sha
-    end
+    local remote_ref = remote_name .. "/" .. branch_name
+    Handlers.update_ref("refs/remotes/" .. remote_ref, remoteSha, "pull")
 
     local remote_commit = Handlers.read_commit(remoteSha)
     assert(remote_commit and remote_commit.tree, "fatal: the remote commit " .. remoteSha .. " was not downloaded")
 
-    if current_branch == branch_name then
-        --// If we are already up to date, make sure the instances still match the tree
-        if local_branch_sha == remoteSha then
-            local index = Handlers.read_index()
-            for path, _ in pairs(index) do
-                local clean = path:match("^(.-)/%.properties$") or path
-                if not Utilities.parse_path(clean) then
-                    local dirty = dirty_changes()
-                    if #dirty > 0 then
-                        print_dirty_abort(dirty, "merge")
-                        return
-                    end
-                    print("Restoring missing instances...")
-                    local ok, err = Remote.checkout(remote_commit.tree)
-                    assert(ok, err)
-                    return
-                end
-            end
-            print("Already up to date.")
-            return
-        end
-
-        if ff_only and local_branch_sha and not is_ancestor_commit(local_branch_sha, remoteSha) then
-            error("fatal: Not possible to fast-forward, aborting.")
-            return
-        end
-
-        local label = "branch '" .. branch_name .. "' of " .. remote_name
-        if perform_merge(remoteSha, label, opts) then
-            print("Successfully pulled from " .. branch_name)
-        end
+    local head_sha = repo.head_sha()
+    if not head_sha then
+        --// nothing local yet: just take theirs
+        perform_merge(remoteSha, "branch '" .. branch_name .. "' of " .. remote_name, {name = remote_ref})
         return
     end
 
-    --// Pulling a branch that is not checked out: only fast-forwards are possible
-    if local_branch_sha == remoteSha or (local_branch_sha and is_ancestor_commit(remoteSha, local_branch_sha)) then
+    --// If we are already up to date, make sure the instances still match the tree
+    if head_sha == remoteSha then
+        local index = Handlers.read_index()
+        for path, _ in pairs(index) do
+            if not Utilities.parse_path(repo.entity_of(path)) then
+                repo.ensure_clean("merge")
+                print("Restoring missing instances...")
+                repo.checkout_tree(remote_commit.tree)
+                return
+            end
+        end
         print("Already up to date.")
         return
     end
-    if local_branch_sha and not is_ancestor_commit(local_branch_sha, remoteSha) then
-        error("fatal: Not possible to fast-forward, aborting.")
-        print("hint: Switch to '" .. branch_name .. "' and run 'git pull' to merge the remote changes.")
+
+    if rebase then
+        arguments.execute("git", "rebase", remote_ref)
         return
     end
 
-    print("Updating " .. string.sub(local_branch_sha or "0000000", 1, 7) .. ".." .. string.sub(remoteSha, 1, 7))
-    Handlers.update_ref("refs/heads/" .. branch_name, remoteSha)
-    print("Successfully pulled from " .. branch_name)
+    local remote_url = (repo.read_config()['remote "' .. remote_name .. '"'] or {}).url or remote_name
+    local label = "branch '" .. branch_name .. "' of " .. remote_url
+    perform_merge(remoteSha, label, {
+        name = remote_ref,
+        prefer = opts.prefer,
+        no_ff = opts.no_ff,
+        ff_only = opts.ff_only,
+        squash = opts.squash,
+        no_commit = opts.no_commit,
+    })
 end)
 
 
@@ -1102,77 +1052,85 @@ end)
 commands:
 rm
 
-Removes file from staged
+Removes instances from the index (and the place, unless --cached).
 ]]
 arguments.createArgument("git", "rm", "", function (...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    repo.require_root()
 
-    local tuple = {...}
-    local is_cached = false
-    local recursive = false
-    local _force = false
-    local paths = {}
-
-    for _, arg in ipairs(tuple) do
+    local is_cached, recursive, force, quiet, dry_run = false, false, false, false, false
+    local filters = {}
+    for _, arg in ipairs({...}) do
         if arg == "--cached" then
             is_cached = true
         elseif arg == "-r" then
             recursive = true
         elseif arg == "-f" or arg == "--force" then
-            _force = true
-        else
-            table.insert(paths, arg)
+            force = true
+        elseif arg == "-q" or arg == "--quiet" then
+            quiet = true
+        elseif arg == "-n" or arg == "--dry-run" then
+            dry_run = true
+        elseif arg:match("^%-[rfq]+$") then
+            if arg:find("r") then recursive = true end
+            if arg:find("f") then force = true end
+            if arg:find("q") then quiet = true end
+        elseif arg ~= "--" then
+            table.insert(filters, normalize_user_path(arg))
         end
     end
 
-    if #paths == 0 then
-        error("fatal: No pathspec was given. Which files should I remove?")
-        return
+    if #filters == 0 then
+        error("usage: git rm [<options>] [--] <file>...", 0)
     end
 
     local index = Handlers.read_index()
     local removed = {}
 
-    for _, path_to_remove in ipairs(paths) do
-        if path_to_remove:sub(1, 5) == "game." or path_to_remove:sub(1, 5) == "game/" then
-            path_to_remove = path_to_remove:sub(6)
+    for _, filter in ipairs(filters) do
+        local matches = {}
+        local has_children = false
+        for path in pairs(index) do
+            if matches_filters(path, {filter}) then
+                table.insert(matches, path)
+                if repo.entity_of(path) ~= filter then has_children = true end
+            end
         end
-        path_to_remove = path_to_remove:gsub("%.", "/")
+        if #matches == 0 then
+            error("fatal: pathspec '" .. filter .. "' did not match any files", 0)
+        end
+        if has_children and not recursive then
+            error("fatal: not removing '" .. filter .. "' recursively without -r", 0)
+        end
 
-        if recursive then
-            for path, _ in pairs(index) do
-                if path == path_to_remove or path:sub(1, #path_to_remove + 1) == path_to_remove .. "/" then
-                    index[path] = nil
-                    table.insert(removed, path)
-                end
+        if not force and not is_cached then
+            local currObj = Utilities.parse_path(filter)
+            if currObj and index[filter] and Handlers.blob_sha(instances.serialize_instance(currObj)) ~= index[filter].sha then
+                error("error: the following file has local modifications:\n    " .. filter .. "\n(use --cached to keep the file, or -f to force removal)", 0)
             end
-        else
-            if index[path_to_remove] then
-                index[path_to_remove] = nil
-                table.insert(removed, path_to_remove)
-            elseif index[path_to_remove .. "/.properties"] then
-                index[path_to_remove .. "/.properties"] = nil
-                table.insert(removed, path_to_remove .. "/.properties")
-            else
-                error("fatal: pathspec '" .. path_to_remove .. "' did not match any files")
-            end
+        end
+
+        for _, path in ipairs(matches) do
+            table.insert(removed, path)
+            index[path] = nil
         end
     end
+
+    table.sort(removed)
+    for _, path in ipairs(removed) do
+        if not quiet then print("rm '" .. path .. "'") end
+    end
+    if dry_run then return end
 
     Handlers.write_index(index)
+    repo.resolve_conflicts(filters)
 
     if not is_cached then
-        for _, path in ipairs(removed) do
-            local clean_path = path:match("^(.-)/%.properties$") or path
-            local currObj = Utilities.parse_path(clean_path)
-            if currObj and currObj ~= game then
-                currObj:Destroy()
+        for _, filter in ipairs(filters) do
+            local currObj = Utilities.parse_path(filter)
+            if currObj and currObj.Parent ~= game then
+                pcall(function() currObj:Destroy() end)
             end
         end
-    end
-
-    for _, path in ipairs(removed) do
-        print("rm '" .. path .. "'")
     end
 end)
 
@@ -1188,8 +1146,12 @@ arguments.createArgument("git", "commit", "", function(...)
     local tuple = { ... }
     local messages = {}
     local allow_empty = false
+    local allow_empty_message = false
     local amend = false
     local stage_all = false
+    local no_edit = false
+    local author_override = nil
+    local quiet = false
 
     local i = 1
     while i <= #tuple do
@@ -1207,19 +1169,61 @@ arguments.createArgument("git", "commit", "", function(...)
             stage_all = true
         elseif arg == "--allow-empty" then
             allow_empty = true
+        elseif arg == "--allow-empty-message" then
+            allow_empty_message = true
         elseif arg == "--amend" then
             amend = true
+        elseif arg == "--no-edit" then
+            no_edit = true
+        elseif arg == "-q" or arg == "--quiet" then
+            quiet = true
+        elseif arg:match("^%-%-author=") then
+            author_override = arg:match("^%-%-author=(.*)$")
+        elseif (arg == "-C" or arg == "--reuse-message") and tuple[i + 1] then
+            local reused = Handlers.read_commit(Handlers.resolve_revision(tuple[i + 1]))
+            assert(reused, "fatal: could not lookup commit " .. tuple[i + 1])
+            table.insert(messages, (reused.message:gsub("\n+$", "")))
+            i += 1
         end
         i += 1
     end
 
-    local message = table.concat(messages, "\n\n")
-    if message == "" and not amend then
-        message = "default commit message"
+    --// A stopped merge/cherry-pick/revert can only be committed once every conflict is resolved
+    local conflicts = repo.read_conflicts()
+    if #conflicts > 0 then
+        local lines = {
+            "error: Committing is not possible because you have unmerged files.",
+            "hint: Fix them up in the work tree, and then use 'git add <file>'",
+            "hint: as appropriate to mark resolution and make a commit.",
+        }
+        for _, conflict in ipairs(conflicts) do
+            table.insert(lines, "U\t" .. conflict.path)
+        end
+        table.insert(lines, "fatal: Exiting because of an unresolved conflict.")
+        error(table.concat(lines, "\n"), 0)
     end
 
+    local merge_head = repo.read_file("MERGE_HEAD")
+    local pick_author = repo.read_file("ROGIT_PICK_AUTHOR")
+    local message = table.concat(messages, "\n\n")
+
+    if message == "" then
+        local prepared = repo.read_file("MERGE_MSG")
+        if prepared then
+            message = prepared:gsub("\n#[^\n]*", ""):gsub("^#[^\n]*\n?", "")
+        end
+    end
+    if message == "" and amend then
+        local old_commit = Handlers.read_commit(repo.head_sha())
+        message = old_commit and old_commit.message or ""
+    end
+    if message:match("^%s*$") and not allow_empty_message then
+        error("Aborting commit due to empty commit message.\nhint: use 'git commit -m \"<message>\"' to give the commit a message.", 0)
+    end
+    local _ = no_edit
+
     if stage_all then
-        arguments.execute("git", "add", ".")
+        arguments.execute("git", "add", "-u")
     end
 
     local index = Handlers.read_index()
@@ -1279,35 +1283,55 @@ arguments.createArgument("git", "commit", "", function(...)
 
     local num_files_changed = #files_added + #files_deleted + #files_modified + #files_renamed
 
-    if not allow_empty and num_files_changed == 0 and not amend then
-        print("nothing to commit, working tree clean")
-        return
-    end
-
-    if message == "default commit message" then
-        warn("hint: It's recommended to provide a descriptive commit message with -m")
+    if not allow_empty and num_files_changed == 0 and not amend and not merge_head then
+        local unstaged, untracked = false, false
+        for _, change in ipairs(repo.get_changes()) do
+            if change.status == "U" then untracked = true else unstaged = true end
+        end
+        local branch = Handlers.get_current_branch()
+        local lines = {branch and ("On branch " .. branch) or "HEAD detached"}
+        if unstaged then
+            table.insert(lines, 'no changes added to commit (use "git add" and/or "git commit -a")')
+        elseif untracked then
+            table.insert(lines, 'nothing added to commit but untracked files present (use "git add" to track)')
+        else
+            table.insert(lines, "nothing to commit, working tree clean")
+        end
+        error(table.concat(lines, "\n"), 0)
     end
 
     local parent_sha = Handlers.get_ref("HEAD")
     if parent_sha == "" then parent_sha = nil end
 
     local parents = {}
+    local author = author_override or pick_author
     if amend then
         local old_commit = Handlers.read_commit(parent_sha)
         if old_commit then
             parents = old_commit.parents
-            if message == "" then
-                message = old_commit.message ~= "" and old_commit.message or "default commit message"
-            end
+            author = author or old_commit.author
         end
     elseif parent_sha then
         parents = {parent_sha}
     end
+    if merge_head and not amend then
+        table.insert(parents, merge_head)
+    end
+
+    local reflog = amend and "commit (amend)" or (merge_head and "commit (merge)") or nil
+    if repo.read_file("CHERRY_PICK_HEAD") then reflog = "commit (cherry-pick)" end
 
     local tree_sha = Handlers.write_tree(index)
-    local commit_sha = create_commit(tree_sha, parents, message)
+    local commit_sha = create_commit(tree_sha, parents, message, {author = author, reflog = reflog})
 
-    bash.writeFile(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(index))
+    --// a concluded merge/cherry-pick/revert (a running sequence keeps its own state)
+    for _, name in ipairs({"MERGE_HEAD", "MERGE_MSG", "CHERRY_PICK_HEAD", "REVERT_HEAD", "ROGIT_PICK_AUTHOR"}) do
+        repo.delete_file(name)
+    end
+    local op, sequence = repo.operation_in_progress()
+    if sequence and op ~= "rebase" and #(sequence.todo or {}) == 0 then
+        repo.delete_file("ROGIT_SEQUENCER")
+    end
 
     local output_details = {}
     for _, entry in ipairs(files_renamed) do
@@ -1348,7 +1372,9 @@ arguments.createArgument("git", "commit", "", function(...)
         end
         final_output = final_output .. "\n" .. table.concat(output_details, "\n")
     end
-    print(final_output)
+    if not quiet then
+        print(final_output)
+    end
 end)
 
 --[[
@@ -1360,15 +1386,17 @@ initializes new repository
 arguments.createArgument("git", "init", "", function (...)
     local tuple = {...}
     local quiet = false
-    local initial_branch = "master"
+    local initial_branch = Auth.getConfigValue("init_defaultBranch") or Auth.getConfigValue("init.defaultBranch") or "master"
 
     local i = 1
     while i <= #tuple do
         if tuple[i] == "-q" or tuple[i] == "--quiet" then
             quiet = true
-        elseif tuple[i] == "-b" and tuple[i + 1] then
+        elseif (tuple[i] == "-b" or tuple[i] == "--initial-branch") and tuple[i + 1] then
             initial_branch = tuple[i + 1]
             i += 1
+        elseif tuple[i]:match("^%-%-initial%-branch=") then
+            initial_branch = tuple[i]:match("=(.*)$")
         end
         i += 1
     end
@@ -1563,6 +1591,7 @@ arguments.createArgument("git", "clone", "", function(...)
 
     local gitRoot = bash.getGitFolderRoot()
     bash.modifyFileContents(gitRoot, "HEAD", "ref: refs/heads/" .. activeBranch)
+    Handlers.append_reflog("HEAD", nil, headSha, "clone: from " .. url)
     for refName, sha in pairs(refs) do
         if refName:match("^refs/heads/") then
             local bName = refName:sub(12)
@@ -1697,7 +1726,9 @@ arguments.createArgument("git", "remote", "", function(...)
         ["rm"] = true,
         ["get-url"] = true,
         ["rename"] = true,
-        ["show"] = true
+        ["show"] = true,
+        ["prune"] = true,
+        ["update"] = true,
     }
     local subcommand = tuple[1]
     if not accepted_args[subcommand] then
@@ -1709,6 +1740,15 @@ arguments.createArgument("git", "remote", "", function(...)
         return
     end
     
+    if subcommand == "prune" then
+        assert(tuple[2], "usage: git remote prune <name>")
+        git_remote.fetch(tuple[2], false, {prune = true})
+        return
+    elseif subcommand == "update" then
+        arguments.execute("git", "fetch", "--all")
+        return
+    end
+
     if subcommand == "add" then
         local do_fetch = false
         local name, url
@@ -1915,10 +1955,19 @@ arguments.createArgument("git", "push", "", function(...)
     local push_all = false
     local push_tags = false
     local delete = false
+    local dry_run = false
+    local lease = nil
     local positional = {}
 
     for _, arg in ipairs(tuple) do
-        if arg == "-f" or arg == "--force" then
+        if arg == "-n" or arg == "--dry-run" then
+            dry_run = true
+        elseif arg == "--force-with-lease" then
+            lease = {}
+        elseif arg:match("^%-%-force%-with%-lease=") then
+            local ref, expect = arg:match("^%-%-force%-with%-lease=([^:]+):?(.*)$")
+            lease = {ref = ref, expect = expect ~= "" and expect or nil}
+        elseif arg == "-f" or arg == "--force" then
             force_push = true
         elseif arg == "-u" or arg == "--set-upstream" then
             set_upstream = true
@@ -1936,8 +1985,9 @@ arguments.createArgument("git", "push", "", function(...)
     local root = bash.getGitFolderRoot()
     assert(root, "fatal: not a git repository")
 
-    local remote_name = table.remove(positional, 1) or "origin"
     local current_branch = Handlers.get_current_branch()
+    local upstream_remote, upstream_branch, has_upstream = repo.get_upstream(current_branch)
+    local remote_name = table.remove(positional, 1) or upstream_remote or "origin"
 
     local config_content = bash.getFileContents(root, "config")
     local loaded_conf = ini_parser.parseIni(config_content)
@@ -1955,7 +2005,7 @@ arguments.createArgument("git", "push", "", function(...)
             sha = Handlers.resolve_revision(src_name)
             assert(sha, "error: src refspec '" .. tostring(src_name) .. "' does not match any")
         end
-        table.insert(specs, {sha = sha, ref = dst_ref, force = plus or force_push, label = (src_name == "HEAD" and current_branch) or src_name})
+        table.insert(specs, {sha = sha, ref = dst_ref, force = plus or force_push, lease = lease, label = (src_name == "HEAD" and current_branch) or src_name})
     end
 
     local function qualified(name, source_is_tag)
@@ -1980,7 +2030,9 @@ arguments.createArgument("git", "push", "", function(...)
 
     if #positional == 0 and #specs == 0 then
         assert(current_branch, "fatal: You are not currently on a branch.\nTo push the history leading to the current (detached HEAD) state, name a ref explicitly.")
-        add_spec("HEAD", "refs/heads/" .. current_branch)
+        --// push.default=simple: to the configured upstream branch (same name otherwise)
+        local destination = (has_upstream and upstream_remote == remote_name) and upstream_branch or current_branch
+        add_spec("HEAD", "refs/heads/" .. destination)
     end
 
     for _, spec in ipairs(positional) do
@@ -2021,7 +2073,15 @@ arguments.createArgument("git", "push", "", function(...)
             end
         elseif remoteSha ~= newSha then
             local rejected = false
-            if remoteSha and spec.ref:match("^refs/heads/") and not spec.force then
+            if spec.lease and not spec.force then
+                --// only overwrite what we last saw on the remote
+                local short_name = spec.ref:gsub("^refs/heads/", "")
+                local expected = spec.lease.expect and Handlers.resolve_revision(spec.lease.expect)
+                    or Handlers.get_ref("refs/remotes/" .. remote_name .. "/" .. short_name)
+                if remoteSha and remoteSha ~= expected then
+                    error("To " .. url .. "\n ! [rejected]        " .. spec.label .. " -> " .. short_name .. " (stale info)\nerror: failed to push some refs to '" .. url .. "'", 0)
+                end
+            elseif remoteSha and spec.ref:match("^refs/heads/") and not spec.force then
                 rejected = not is_ancestor_commit(remoteSha, newSha)
             elseif remoteSha and spec.ref:match("^refs/tags/") and not spec.force then
                 rejected = true
@@ -2048,6 +2108,22 @@ arguments.createArgument("git", "push", "", function(...)
 
     if #updates == 0 then
         print("Everything up-to-date")
+        return
+    end
+
+    if dry_run then
+        local lines = {"To " .. url}
+        for _, update in ipairs(updates) do
+            local short_name = update.ref:gsub("^refs/%a+/", "")
+            if update.delete then
+                table.insert(lines, " - [deleted]         " .. short_name)
+            elseif update.old == ZERO_SHA then
+                table.insert(lines, " * [new " .. (update.ref:match("^refs/tags/") and "tag" or "branch") .. "]      " .. update.label .. " -> " .. short_name)
+            else
+                table.insert(lines, "   " .. update.old:sub(1, 7) .. ".." .. update.new:sub(1, 7) .. "  " .. update.label .. " -> " .. short_name)
+            end
+        end
+        print(table.concat(lines, "\n"))
         return
     end
 
@@ -2235,101 +2311,220 @@ local function count_ahead_behind(local_sha, other_sha)
 end
 
 --[[
+Describes how the current branch relates to its upstream, nil when there is nothing to compare.
+Returns the upstream name, ahead, behind.
+]]
+local function upstream_state(branch, head_sha)
+    if not branch or not head_sha then return nil end
+    local remote, remote_branch = repo.get_upstream(branch)
+    local upstream_name = remote .. "/" .. remote_branch
+    local upstream = Handlers.get_ref("refs/remotes/" .. upstream_name)
+    if not upstream or not Handlers.read_commit(upstream) then return nil end
+    local ahead, behind = count_ahead_behind(head_sha, upstream)
+    return upstream_name, ahead, behind
+end
+
+local CONFLICT_LABELS = {
+    ["content"] = "both modified",
+    ["add/add"] = "both added",
+    ["modify/delete: deleted in theirs"] = "deleted by them",
+    ["modify/delete: deleted in ours"] = "deleted by us",
+}
+
+local function conflict_label(reason)
+    local kind = reason:match("^([^:]+:?[^:]*)") or reason
+    for prefix, label in pairs(CONFLICT_LABELS) do
+        if reason:sub(1, #prefix) == prefix then return label end
+    end
+    return kind
+end
+
+--[[
 commands:
 status
 st
 
 gets status of branch/changes
 ]]
-arguments.createArgument("git", "status", "st", function()
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+arguments.createArgument("git", "status", "st", function(...)
+    repo.require_root()
     Handlers.load_ignore_patterns()
 
+    local short, porcelain, show_branch = false, false, false
+    for _, arg in ipairs({...}) do
+        if arg == "-s" or arg == "--short" then
+            short = true
+        elseif arg == "--porcelain" or arg:match("^%-%-porcelain=") then
+            short, porcelain = true, true
+        elseif arg == "-b" or arg == "--branch" then
+            show_branch = true
+        elseif arg == "-sb" or arg == "-bs" then
+            short, show_branch = true, true
+        end
+    end
+
     local index = Handlers.read_index()
-    local headSha = Handlers.get_ref("HEAD")
+    local headSha = repo.head_sha()
     local current_branch = Handlers.get_current_branch()
     local last_index = read_last_index()
 
-    local staged_new = {}
-    local staged_modified = {}
-    local staged_deleted = {}
+    local conflicted = {}
+    local conflicts = repo.read_conflicts()
+    for _, conflict in ipairs(conflicts) do
+        conflicted[conflict.path] = conflict
+    end
+    local function is_conflicted(path)
+        return conflicted[repo.entity_of(path)] ~= nil
+    end
+
+    --// per path: staged status (X) and worktree status (Y)
+    local entries = {}
+    local function entry(path)
+        entries[path] = entries[path] or {path = path, x = " ", y = " "}
+        return entries[path]
+    end
 
     for path, data in pairs(index) do
         Utilities.roYield()
         if not last_index[path] then
-            table.insert(staged_new, path)
+            entry(path).x = "A"
         elseif last_index[path].sha ~= data.sha then
-            table.insert(staged_modified, path)
+            entry(path).x = "M"
         end
     end
-    for path, _ in pairs(last_index) do
+    for path in pairs(last_index) do
         if not index[path] then
-            table.insert(staged_deleted, path)
+            entry(path).x = "D"
         end
-    end
-    table.sort(staged_new)
-    table.sort(staged_modified)
-    table.sort(staged_deleted)
-
-    if current_branch then
-        print("On branch " .. current_branch)
-
-        local upstream = Handlers.get_ref("refs/remotes/origin/" .. current_branch)
-        if upstream and headSha and headSha ~= "" and Handlers.read_commit(upstream) then
-            local ahead, behind = count_ahead_behind(headSha, upstream)
-            local name = "origin/" .. current_branch
-            if ahead > 0 and behind > 0 then
-                print(string.format("Your branch and '%s' have diverged,\nand have %d and %d different commits each, respectively.", name, ahead, behind))
-            elseif ahead > 0 then
-                print(string.format("Your branch is ahead of '%s' by %d commit%s.", name, ahead, ahead == 1 and "" or "s"))
-            elseif behind > 0 then
-                print(string.format("Your branch is behind '%s' by %d commit%s, and can be fast-forwarded.", name, behind, behind == 1 and "" or "s"))
-            else
-                print(string.format("Your branch is up to date with '%s'.", name))
-            end
-        end
-    else
-        print("HEAD detached at " .. string.sub(headSha or "", 1, 7))
-    end
-
-    if not headSha or headSha == "" then
-        print("\nNo commits yet\n")
     end
 
     local unstaged_modified, unstaged_deleted = collect_worktree_changes(index)
-    local has_unstaged = #unstaged_modified + #unstaged_deleted > 0
-
-    local has_staged = #staged_new + #staged_modified + #staged_deleted > 0
-    if has_staged then
-        print("Changes to be committed:")
-        for _, path in ipairs(staged_new) do
-            print("\t\27[32mnew file:   " .. path .. "\27[0m")
-        end
-        for _, path in ipairs(staged_modified) do
-            print("\t\27[32mmodified:   " .. path .. "\27[0m")
-        end
-        for _, path in ipairs(staged_deleted) do
-            print("\t\27[32mdeleted:    " .. path .. "\27[0m")
-        end
-    end
-
-    if has_unstaged then
-        print("Changes not staged for commit:")
-        for _, path in ipairs(unstaged_modified) do
-            print("\t\27[31mmodified:   " .. path .. "\27[0m")
-        end
-        for _, path in ipairs(unstaged_deleted) do
-            print("\t\27[31mdeleted:    " .. path .. "\27[0m")
-        end
-    end
+    for _, path in ipairs(unstaged_modified) do entry(path).y = "M" end
+    for _, path in ipairs(unstaged_deleted) do entry(path).y = "D" end
 
     local untracked = {}
     for path in pairs(collect_untracked(index)) do
         table.insert(untracked, path)
     end
     table.sort(untracked)
+
+    local sorted = {}
+    for _, e in pairs(entries) do
+        if not is_conflicted(e.path) then table.insert(sorted, e) end
+    end
+    table.sort(sorted, function(x, y) return x.path < y.path end)
+
+    local upstream_name, ahead, behind = upstream_state(current_branch, headSha)
+
+    if short then
+        local red, green, reset = "\27[31m", "\27[32m", "\27[0m"
+        if porcelain then red, green, reset = "", "", "" end
+
+        if show_branch then
+            local line = "## " .. (current_branch or "HEAD (no branch)")
+            if upstream_name then
+                line ..= "..." .. upstream_name
+                local parts = {}
+                if ahead > 0 then table.insert(parts, "ahead " .. ahead) end
+                if behind > 0 then table.insert(parts, "behind " .. behind) end
+                if #parts > 0 then line ..= " [" .. table.concat(parts, ", ") .. "]" end
+            end
+            print(line)
+        end
+        for _, conflict in ipairs(conflicts) do
+            local codes = {["both modified"] = "UU", ["both added"] = "AA", ["deleted by them"] = "UD", ["deleted by us"] = "DU"}
+            print(red .. (codes[conflict_label(conflict.reason)] or "UU") .. reset .. " " .. conflict.path)
+        end
+        for _, e in ipairs(sorted) do
+            print(green .. e.x .. reset .. red .. e.y .. reset .. " " .. e.path)
+        end
+        for _, path in ipairs(untracked) do
+            print(red .. "??" .. reset .. " " .. path)
+        end
+        return
+    end
+
+    if current_branch then
+        print("On branch " .. current_branch)
+        if upstream_name then
+            if ahead > 0 and behind > 0 then
+                print(string.format("Your branch and '%s' have diverged,\nand have %d and %d different commits each, respectively.", upstream_name, ahead, behind))
+            elseif ahead > 0 then
+                print(string.format("Your branch is ahead of '%s' by %d commit%s.", upstream_name, ahead, ahead == 1 and "" or "s"))
+            elseif behind > 0 then
+                print(string.format("Your branch is behind '%s' by %d commit%s, and can be fast-forwarded.", upstream_name, behind, behind == 1 and "" or "s"))
+            else
+                print(string.format("Your branch is up to date with '%s'.", upstream_name))
+            end
+        end
+    else
+        local op, state = repo.operation_in_progress()
+        if op == "rebase" and state then
+            print("interactive rebase in progress; onto " .. tostring(state.onto):sub(1, 7))
+        else
+            print("HEAD detached at " .. string.sub(headSha or "", 1, 7))
+        end
+    end
+
+    if not headSha then
+        print("\nNo commits yet\n")
+    end
+
+    --// operations that stopped half way
+    local op, state = repo.operation_in_progress()
+    if op then
+        local verbs = {merge = "merge", ["cherry-pick"] = "cherry-pick", revert = "revert", rebase = "rebase"}
+        if op == "rebase" and state then
+            print(string.format("You are currently rebasing%s on '%s'.", state.head_name and (" branch '" .. state.head_name:gsub("^refs/heads/", "") .. "'") or "", tostring(state.onto):sub(1, 7)))
+        end
+        if #conflicts > 0 then
+            print(op == "merge" and "You have unmerged paths." or ("You are currently in a " .. verbs[op] .. "."))
+            print(op == "merge" and '  (fix conflicts and run "git commit")' or ('  (fix conflicts and run "git ' .. verbs[op] .. ' --continue")'))
+            print('  (use "git ' .. verbs[op] .. ' --abort" to abort the ' .. verbs[op] .. ")")
+        else
+            print(op == "merge" and "All conflicts fixed but you are still merging." or ("All conflicts fixed: run \"git " .. verbs[op] .. " --continue\""))
+            if op == "merge" then print('  (use "git commit" to conclude merge)') end
+        end
+        print("")
+    elseif #conflicts > 0 then
+        print("You have unmerged paths.\n")
+    end
+
+    local staged, unstaged = {}, {}
+    local labels = {A = "new file:   ", M = "modified:   ", D = "deleted:    "}
+    for _, e in ipairs(sorted) do
+        if e.x ~= " " then table.insert(staged, "\t\27[32m" .. labels[e.x] .. e.path .. "\27[0m") end
+        if e.y ~= " " then table.insert(unstaged, "\t\27[31m" .. labels[e.y] .. e.path .. "\27[0m") end
+    end
+
+    if #staged > 0 then
+        print("Changes to be committed:")
+        print('  (use "git restore --staged <file>..." to unstage)')
+        for _, line in ipairs(staged) do print(line) end
+        print("")
+    end
+
+    if #conflicts > 0 then
+        print("Unmerged paths:")
+        print('  (use "git add <file>..." to mark resolution)')
+        for _, conflict in ipairs(conflicts) do
+            local label = conflict_label(conflict.reason)
+            print("\t\27[31m" .. label .. ":" .. string.rep(" ", math.max(1, 16 - #label)) .. conflict.path .. "\27[0m")
+        end
+        print("")
+    end
+
+    if #unstaged > 0 then
+        print("Changes not staged for commit:")
+        print('  (use "git add <file>..." to update what will be committed)')
+        print('  (use "git restore <file>..." to discard changes in working directory)')
+        for _, line in ipairs(unstaged) do print(line) end
+        print("")
+    end
+
     if #untracked > 0 then
         print("Untracked files:")
+        print('  (use "git add <file>..." to include in what will be committed)')
         local limit = 50
         for i, path in ipairs(untracked) do
             if i > limit then
@@ -2338,21 +2533,19 @@ arguments.createArgument("git", "status", "st", function()
             end
             print("\t\27[31m" .. path .. "\27[0m")
         end
-        print("(use \"git add .\" to track them)")
+        print("")
     end
 
-    if not has_staged and not has_unstaged then
-        print(#untracked > 0 and "nothing added to commit but untracked files present" or "nothing to commit, working tree clean")
+    if #staged == 0 and #conflicts == 0 then
+        if #unstaged > 0 then
+            print('no changes added to commit (use "git add" and/or "git commit -a")')
+        elseif #untracked > 0 then
+            print('nothing added to commit but untracked files present (use "git add" to track)')
+        else
+            print("nothing to commit, working tree clean")
+        end
     end
 end)
-
---[[
-Parses the committer timestamp of a commit object.
-]]
-local function commit_time(commit)
-    local line = commit.committer or commit.author or ""
-    return tonumber(line:match("(%d+) [+-]%d+$")) or 0
-end
 
 --[[
 Builds a map of sha -> list of decorations ("HEAD -> main", "origin/main", "tag: v1") for log output.
@@ -2399,44 +2592,6 @@ local function collect_decorations()
     return decorations
 end
 
---[[
-Walks the history reachable from `start_sha`, newest first (by commit time).
-Calls `visit(sha, commit)` for every commit, return false from it to stop.
-]]
-local function walk_history(start_sha, visit)
-    local frontier = {start_sha}
-    local seen = {[start_sha] = true}
-    local times = {}
-
-    while #frontier > 0 do
-        local best = 1
-        for i = 1, #frontier do
-            local sha = frontier[i]
-            if not times[sha] then
-                local commit = Handlers.read_commit(sha)
-                times[sha] = commit and commit_time(commit) or 0
-            end
-            if times[sha] > times[frontier[best]] then
-                best = i
-            end
-        end
-
-        local sha = table.remove(frontier, best)
-        local commit = Handlers.read_commit(sha)
-        if not commit then return end
-
-        if visit(sha, commit) == false then return end
-
-        for _, parent in ipairs(commit.parents) do
-            if not seen[parent] then
-                seen[parent] = true
-                table.insert(frontier, parent)
-            end
-        end
-        Utilities.roYield()
-    end
-end
-
 local function print_commit_header(sha, commit, decoration_list)
     local decoration = (decoration_list and #decoration_list > 0) and (" (" .. table.concat(decoration_list, ", ") .. ")") or ""
     print("\27[33mcommit " .. sha .. "\27[0m" .. decoration)
@@ -2457,24 +2612,96 @@ local function print_commit_header(sha, commit, decoration_list)
 end
 
 --[[
+Did a commit change anything under `filters` (compared to its first parent)?
+]]
+local function commit_touches(commit, filters)
+    if #filters == 0 then return true end
+    local parent = commit.parents[1] and Handlers.read_commit(commit.parents[1])
+    local old = parent and repo.tree_index(parent.tree) or {}
+    local new = repo.tree_index(commit.tree)
+    for path, data in pairs(new) do
+        if matches_filters(path, filters) and (not old[path] or old[path].sha ~= data.sha) then return true end
+    end
+    for path in pairs(old) do
+        if matches_filters(path, filters) and not new[path] then return true end
+    end
+    return false
+end
+
+--[[
+Expands a --format/--pretty placeholder string for one commit.
+]]
+local function format_commit(fmt, sha, commit, decorations)
+    local author_name, author_email, author_time = (commit.author or ""):match("^(.-) <(.-)> (%d+)")
+    local committer_name, committer_email, committer_time = (commit.committer or ""):match("^(.-) <(.-)> (%d+)")
+    local subject = commit.message:match("^[^\n]*") or ""
+    local body = commit.message:match("^[^\n]*\n\n(.*)$") or ""
+    local function date(t) return t and os.date("%a %b %d %H:%M:%S %Y", tonumber(t)) .. " +0000" or "" end
+    local short_parents = {}
+    for _, parent in ipairs(commit.parents) do table.insert(short_parents, parent:sub(1, 7)) end
+
+    local values = {
+        H = sha, h = sha:sub(1, 7),
+        T = commit.tree or "", t = (commit.tree or ""):sub(1, 7),
+        P = table.concat(commit.parents, " "), p = table.concat(short_parents, " "),
+        an = author_name or "", ae = author_email or "", ad = date(author_time), at = author_time or "",
+        cn = committer_name or "", ce = committer_email or "", cd = date(committer_time), ct = committer_time or "",
+        s = subject, b = body:gsub("\n+$", ""), B = commit.message:gsub("\n+$", ""),
+        d = (decorations and #decorations > 0) and (" (" .. table.concat(decorations, ", ") .. ")") or "",
+        D = decorations and table.concat(decorations, ", ") or "",
+        n = "\n", ["%"] = "%",
+    }
+    return (fmt:gsub("%%(%a%a?)", function(key)
+        if values[key] ~= nil then return values[key] end
+        local single = key:sub(1, 1)
+        if values[single] ~= nil then return values[single] .. key:sub(2) end
+        return "%" .. key
+    end):gsub("%%%%", "%%"))
+end
+
+--[[
 commands:
 log
 
-logs commits
+Shows commit logs.
 ]]
 arguments.createArgument("git", "log", "", function(...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    repo.require_root()
 
     local tuple = {...}
     local max_count = nil
-    local oneline = false
-    local rev = nil
+    local oneline, graph, all, reverse = false, false, false, false
+    local format = nil
+    local changes = nil --// nil, "patch", "stat", "name-only", "name-status"
+    local author, grep = nil, nil
+    local specs, filters = {}, {}
+    local after_dashes = false
 
     local i = 1
     while i <= #tuple do
         local arg = tuple[i]
-        if arg == "--oneline" then
+        if after_dashes then
+            table.insert(filters, normalize_user_path(arg))
+        elseif arg == "--" then
+            after_dashes = true
+        elseif arg == "--oneline" then
             oneline = true
+        elseif arg == "--graph" then
+            graph = true
+        elseif arg == "--all" then
+            all = true
+        elseif arg == "--reverse" then
+            reverse = true
+        elseif arg == "-p" or arg == "--patch" or arg == "-u" then
+            changes = "patch"
+        elseif arg == "--stat" then
+            changes = "stat"
+        elseif arg == "--name-only" then
+            changes = "name-only"
+        elseif arg == "--name-status" then
+            changes = "name-status"
+        elseif arg == "--decorate" or arg == "--no-decorate" or arg == "--abbrev-commit" then
+            --// always decorated
         elseif (arg == "-n" or arg == "--max-count") and tuple[i + 1] then
             max_count = tonumber(tuple[i + 1])
             i += 1
@@ -2482,103 +2709,202 @@ arguments.createArgument("git", "log", "", function(...)
             max_count = tonumber(arg:match("^%-%-max%-count=(%d+)$"))
         elseif arg:match("^%-(%d+)$") then
             max_count = tonumber(arg:match("^%-(%d+)$"))
+        elseif arg:match("^%-%-author=") then
+            author = arg:match("^%-%-author=(.*)$"):lower()
+        elseif arg:match("^%-%-grep=") then
+            grep = arg:match("^%-%-grep=(.*)$"):lower()
+        elseif arg:match("^%-%-pretty=") or arg:match("^%-%-format=") then
+            format = arg:match("^%-%-%a+=(.*)$")
+            format = format:gsub("^format:", ""):gsub("^tformat:", "")
+            if format == "oneline" then oneline, format = true, nil end
+            if format == "short" or format == "medium" or format == "full" then format = nil end
         elseif arg:sub(1, 1) ~= "-" then
-            rev = arg
+            if Handlers.resolve_revision(arg) or arg:find("..", 1, true) or arg:sub(1, 1) == "^" then
+                table.insert(specs, arg)
+            else
+                table.insert(filters, normalize_user_path(arg))
+            end
         end
         i += 1
     end
 
-    local sha
-    if rev then
-        sha = Handlers.resolve_revision(rev)
-        if not sha then
-            error("fatal: ambiguous argument '" .. rev .. "': unknown revision or path not in the working tree.")
-            return
-        end
-    else
-        sha = Handlers.get_ref("HEAD")
-        if not sha or sha == "" then
-            error("fatal: your current branch '" .. (Handlers.get_current_branch() or "master") .. "' does not have any commits yet")
-            return
-        end
+    if all then
+        for _, sha in pairs(Handlers.list_refs()) do table.insert(specs, sha) end
+        if repo.head_sha() then table.insert(specs, repo.head_sha()) end
+    end
+    if #specs == 0 and not repo.head_sha() then
+        error("fatal: your current branch '" .. (Handlers.get_current_branch() or repo.default_branch()) .. "' does not have any commits yet", 0)
     end
 
     local decorations = collect_decorations()
-    local count = 0
+    local list = {}
+    for _, item in ipairs(inspect().rev_list(specs)) do
+        local commit = item.commit
+        local keep = true
+        if author and not (commit.author or ""):lower():find(author, 1, true) then keep = false end
+        if keep and grep and not commit.message:lower():find(grep, 1, true) then keep = false end
+        if keep and not commit_touches(commit, filters) then keep = false end
+        if keep then table.insert(list, item) end
+        if max_count and #list >= max_count and not reverse then break end
+    end
+    if max_count then
+        while #list > max_count do table.remove(list) end
+    end
+    if reverse then
+        local reversed = {}
+        for n = #list, 1, -1 do table.insert(reversed, list[n]) end
+        list = reversed
+    end
 
-    walk_history(sha, function(commit_sha, commit)
-        if max_count and count >= max_count then return false end
-
-        local msg = commit.message:gsub("\n+$", "")
-        if oneline then
-            local decoration = decorations[commit_sha] and (" (" .. table.concat(decorations[commit_sha], ", ") .. ")") or ""
-            print(commit_sha:sub(1, 7) .. decoration .. " " .. (msg:match("^[^\n]*") or msg))
-        else
-            print_commit_header(commit_sha, commit, decorations[commit_sha])
-            print("")
-            for line in (msg .. "\n"):gmatch("([^\n]*)\n") do
-                print("    " .. line)
+    --// lanes for --graph: which commit each column is waiting for
+    local columns = {}
+    local function graph_prefix(sha)
+        if not graph then return "", nil end
+        local column = table.find(columns, sha)
+        if not column then
+            table.insert(columns, sha)
+            column = #columns
+        end
+        local cells = {}
+        for n = 1, #columns do cells[n] = n == column and "*" or "|" end
+        return table.concat(cells, " ") .. " ", column
+    end
+    local function graph_advance(column, commit)
+        if not graph then return end
+        local parents = commit.parents
+        if #parents == 0 then
+            table.remove(columns, column)
+            return
+        end
+        columns[column] = parents[1]
+        local added = 0
+        for n = 2, #parents do
+            if not table.find(columns, parents[n]) then
+                table.insert(columns, column + n - 1, parents[n])
+                added += 1
             end
-            print("")
+        end
+        if added > 0 then
+            local cells = {}
+            for n = 1, #columns - added do cells[n] = "|" end
+            print(table.concat(cells, " ") .. "\\")
+        end
+        --// two lanes waiting for the same commit join up
+        for a = 1, #columns do
+            for b = #columns, a + 1, -1 do
+                if columns[a] == columns[b] then
+                    table.remove(columns, b)
+                    local cells = {}
+                    for n = 1, #columns do cells[n] = "|" end
+                    print(table.concat(cells, " ") .. "/")
+                end
+            end
+        end
+    end
+
+    for _, item in ipairs(list) do
+        local sha, commit = item.sha, item.commit
+        local prefix, column = graph_prefix(sha)
+        local pad = graph and string.rep("| ", #columns) or ""
+
+        if format then
+            print(prefix .. format_commit(format, sha, commit, decorations[sha]))
+        elseif oneline then
+            local decoration = decorations[sha] and (" \27[33m(" .. table.concat(decorations[sha], ", ") .. ")\27[0m") or ""
+            print(prefix .. "\27[33m" .. sha:sub(1, 7) .. "\27[0m" .. decoration .. " " .. (commit.message:match("^[^\n]*") or ""))
+        else
+            if graph then
+                output.print(prefix .. "\27[33mcommit " .. sha .. "\27[0m")
+            else
+                print_commit_header(sha, commit, decorations[sha])
+            end
+            if graph then
+                local who, time = (commit.author or ""):match("^(.-) (%d+) [+-]%d+$")
+                print(pad .. "Author: " .. (who or ""))
+                print(pad .. "Date:   " .. (time and os.date("%a %b %d %H:%M:%S %Y", tonumber(time)) or "") .. " +0000")
+            end
+            print(pad)
+            for line in (commit.message:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do
+                print(pad .. "    " .. line)
+            end
+            print(pad)
         end
 
-        count += 1
-        return true
-    end)
+        if changes then
+            local parent = commit.parents[1] and Handlers.read_commit(commit.parents[1])
+            print_changes(compare_indexes(parent and repo.tree_index(parent.tree) or {}, repo.tree_index(commit.tree), nil, filters), changes)
+            if not oneline then print("") end
+        end
+
+        graph_advance(column, commit)
+    end
 end)
 
 --[[
 commands:
 show
 
-Shows one commit (HEAD by default): its message and which instances changed.
+Shows a commit (HEAD by default) and the instances it changed, a tag, or an object (<rev>:<path>).
 ]]
 arguments.createArgument("git", "show", "", function(...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    repo.require_root()
 
-    local rev = nil
-    local names_only = false
+    local revs = {}
+    local format = "patch"
+    local oneline = false
     for _, arg in ipairs({...}) do
-        if arg == "--name-only" or arg == "--stat" or arg == "--name-status" then
-            names_only = true
+        if arg == "--name-only" then
+            format = "name-only"
+        elseif arg == "--name-status" then
+            format = "name-status"
+        elseif arg == "--stat" then
+            format = "stat"
+        elseif arg == "--oneline" then
+            oneline = true
+        elseif arg == "-s" or arg == "--no-patch" then
+            format = nil
         elseif arg:sub(1, 1) ~= "-" then
-            rev = arg
+            table.insert(revs, arg)
         end
     end
+    if #revs == 0 then revs = {"HEAD"} end
 
-    local sha = Handlers.resolve_revision(rev or "HEAD")
-    local commit = sha and Handlers.read_commit(sha)
-    if not commit then
-        error("fatal: ambiguous argument '" .. tostring(rev or "HEAD") .. "': unknown revision or path not in the working tree.")
-        return
-    end
+    for _, rev in ipairs(revs) do
+        if rev:find(":", 1, true) then
+            inspect().show_object(rev)
+        else
+            local sha = Handlers.resolve_revision(rev)
+            if not sha then
+                error("fatal: ambiguous argument '" .. rev .. "': unknown revision or path not in the working tree.", 0)
+            end
 
-    print_commit_header(sha, commit, collect_decorations()[sha])
-    print("")
-    for line in (commit.message:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do
-        print("    " .. line)
-    end
-    print("")
+            --// annotated tag: show the tag itself first
+            local tagSha = Handlers.get_ref("refs/tags/" .. rev)
+            local tagObj = tagSha and Handlers.read_object(tagSha)
+            if tagObj and tagObj.type == "tag" then
+                print("\27[33mtag " .. rev .. "\27[0m")
+                local tagger = tagObj.content:match("\ntagger ([^\n]+)") or ""
+                print("Tagger: " .. (tagger:match("^(.-) %d+ [+-]%d+$") or tagger))
+                print("")
+                print((tagObj.content:match("\n\n(.*)$") or ""):gsub("\n+$", ""))
+                print("")
+            end
 
-    local parent = commit.parents[1] and Handlers.read_commit(commit.parents[1])
-    local old_index = parent and Handlers.tree_to_index(parent.tree) or {}
-    local new_index = Handlers.tree_to_index(commit.tree)
-
-    local paths, seen = {}, {}
-    for path in pairs(old_index) do seen[path] = true; table.insert(paths, path) end
-    for path in pairs(new_index) do if not seen[path] then table.insert(paths, path) end end
-    table.sort(paths)
-
-    local colors = {A = "\27[32m", M = "\27[33m", D = "\27[31m"}
-    for _, path in ipairs(paths) do
-        local old, new = old_index[path], new_index[path]
-        if not old or not new or old.sha ~= new.sha then
-            local status = (not old and "A") or (not new and "D") or "M"
-            print(colors[status] .. status .. "\27[0m  " .. path)
-            if status == "M" and not names_only then
-                for _, line in ipairs(diff.describe(read_blob_content(old.sha), read_blob_content(new.sha))) do
-                    print(line)
+            local commit = Handlers.read_commit(sha)
+            if oneline then
+                print("\27[33m" .. sha:sub(1, 7) .. "\27[0m " .. (commit.message:match("^[^\n]*") or ""))
+            else
+                print_commit_header(sha, commit, collect_decorations()[sha])
+                print("")
+                for line in (commit.message:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do
+                    print("    " .. line)
                 end
+                print("")
+            end
+
+            if format then
+                local parent = commit.parents[1] and Handlers.read_commit(commit.parents[1])
+                print_changes(compare_indexes(parent and repo.tree_index(parent.tree) or {}, repo.tree_index(commit.tree), nil, {}), format)
             end
         end
     end
@@ -2596,16 +2922,41 @@ arguments.createArgument("git", "branch", "br", function(...)
 
     local tuple = {...}
     local mode = "list"
-    local show_remotes, only_remotes, verbose, force = false, false, false, false
+    local show_remotes, only_remotes, verbose, very_verbose, force = false, false, false, false, false
+    local merged_filter, contains = nil, nil
+    local upstream_arg = nil
     local positional = {}
 
-    for _, arg in ipairs(tuple) do
+    local i = 1
+    while i <= #tuple do
+        local arg = tuple[i]
         if arg == "-a" or arg == "--all" then
             show_remotes = true
         elseif arg == "-r" or arg == "--remotes" then
             show_remotes, only_remotes = true, true
-        elseif arg == "-v" or arg == "-vv" or arg == "--verbose" then
+        elseif arg == "-v" or arg == "--verbose" then
             verbose = true
+        elseif arg == "-vv" then
+            verbose, very_verbose = true, true
+        elseif arg == "--merged" or arg == "--no-merged" then
+            merged_filter = {merged = arg == "--merged", rev = "HEAD"}
+            if tuple[i + 1] and tuple[i + 1]:sub(1, 1) ~= "-" and Handlers.resolve_revision(tuple[i + 1]) then
+                merged_filter.rev = tuple[i + 1]
+                i += 1
+            end
+        elseif arg == "--contains" and tuple[i + 1] then
+            contains = tuple[i + 1]
+            i += 1
+        elseif (arg == "-u" or arg == "--set-upstream-to") and tuple[i + 1] then
+            mode, upstream_arg = "upstream", tuple[i + 1]
+            i += 1
+        elseif arg:match("^%-%-set%-upstream%-to=") then
+            mode, upstream_arg = "upstream", arg:match("=(.*)$")
+        elseif arg == "--unset-upstream" then
+            mode = "unset-upstream"
+        elseif arg == "-c" or arg == "--copy" or arg == "-C" then
+            mode = "copy"
+            if arg == "-C" then force = true end
         elseif arg == "-d" or arg == "--delete" then
             mode = "delete"
         elseif arg == "-D" then
@@ -2619,12 +2970,42 @@ arguments.createArgument("git", "branch", "br", function(...)
         elseif arg:sub(1, 1) ~= "-" then
             table.insert(positional, arg)
         end
+        i += 1
     end
 
     local current_branch = Handlers.get_current_branch()
 
     if mode == "current" then
         if current_branch then print(current_branch) end
+        return
+    end
+
+    if mode == "upstream" then
+        local branch = positional[1] or current_branch
+        assert(branch, "fatal: could not set upstream of HEAD when it does not point to any branch.")
+        local remote, remote_branch = upstream_arg:match("^([^/]+)/(.+)$")
+        assert(remote and Handlers.get_ref("refs/remotes/" .. upstream_arg), "fatal: the requested upstream branch '" .. upstream_arg .. "' does not exist")
+        repo.set_upstream(branch, remote, remote_branch)
+        print("branch '" .. branch .. "' set up to track '" .. upstream_arg .. "'.")
+        return
+    end
+
+    if mode == "unset-upstream" then
+        local branch = positional[1] or current_branch
+        local conf = repo.read_config()
+        conf['branch "' .. tostring(branch) .. '"'] = nil
+        repo.write_config(conf)
+        return
+    end
+
+    if mode == "copy" then
+        local old_branch, new_branch = positional[1], positional[2]
+        if not new_branch then old_branch, new_branch = current_branch, old_branch end
+        local sha = old_branch and Handlers.get_ref("refs/heads/" .. old_branch)
+        assert(sha, "error: refname refs/heads/" .. tostring(old_branch) .. " not found")
+        assert(is_valid_branch_name(new_branch), "fatal: '" .. tostring(new_branch) .. "' is not a valid branch name.")
+        assert(force or not Handlers.get_ref("refs/heads/" .. new_branch), "fatal: a branch named '" .. new_branch .. "' already exists")
+        Handlers.update_ref("refs/heads/" .. new_branch, sha, "branch: Copied from " .. old_branch)
         return
     end
 
@@ -2645,13 +3026,38 @@ arguments.createArgument("git", "branch", "br", function(...)
         end
         table.sort(entries, function(x, y) return x.name < y.name end)
 
+        local merged_target = merged_filter and Handlers.resolve_revision(merged_filter.rev)
+        local contains_sha = contains and Handlers.resolve_revision(contains)
+        if contains and not contains_sha then
+            error("error: malformed object name " .. contains, 0)
+        end
+
         for _, entry in ipairs(entries) do
-            local line = (entry.is_current and "* " or "  ") .. (entry.is_current and ("\27[32m" .. entry.display .. "\27[0m") or entry.display)
-            if verbose and entry.sha then
-                local commit = Handlers.read_commit(entry.sha)
-                line = line .. " " .. entry.sha:sub(1, 7) .. " " .. (commit and commit.message:match("^[^\n]*") or "")
+            local show = true
+            if merged_filter and entry.sha then
+                show = is_ancestor_commit(entry.sha, merged_target) == merged_filter.merged
             end
-            print(line)
+            if show and contains_sha and entry.sha then
+                show = is_ancestor_commit(contains_sha, entry.sha)
+            end
+            if show then
+                local line = (entry.is_current and "* " or "  ") .. (entry.is_current and ("\27[32m" .. entry.display .. "\27[0m") or entry.display)
+                if verbose and entry.sha then
+                    local commit = Handlers.read_commit(entry.sha)
+                    local tracking = ""
+                    if very_verbose and not entry.name:match("^remotes/") then
+                        local upstream_name, ahead, behind = upstream_state(entry.name, entry.sha)
+                        if upstream_name then
+                            local parts = {}
+                            if ahead > 0 then table.insert(parts, "ahead " .. ahead) end
+                            if behind > 0 then table.insert(parts, "behind " .. behind) end
+                            tracking = "[\27[34m" .. upstream_name .. "\27[0m" .. (#parts > 0 and (": " .. table.concat(parts, ", ")) or "") .. "] "
+                        end
+                    end
+                    line = line .. " " .. entry.sha:sub(1, 7) .. " " .. tracking .. (commit and commit.message:match("^[^\n]*") or "")
+                end
+                print(line)
+            end
         end
 
         if #entries == 0 and current_branch then
@@ -2827,6 +3233,10 @@ local function switch_to(target_sha, branch, create)
     end
     assert(commit and commit.tree, "fatal: unable to read commit " .. target_sha .. " (try 'git fetch')")
 
+    if #repo.read_conflicts() > 0 then
+        error("error: you need to resolve your current index first", 0)
+    end
+
     local current_sha = Handlers.get_ref("HEAD")
     if target_sha ~= current_sha then
         local dirty = dirty_changes()
@@ -2836,10 +3246,12 @@ local function switch_to(target_sha, branch, create)
         end
     end
 
+    local from = Handlers.get_current_branch() or string.sub(current_sha or "", 1, 7)
+    local to = branch or string.sub(target_sha, 1, 7)
     if create then
-        Handlers.update_ref("refs/heads/" .. branch, target_sha)
+        Handlers.update_ref("refs/heads/" .. branch, target_sha, "branch: Created from " .. from)
     end
-    bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", branch and ("ref: refs/heads/" .. branch) or target_sha)
+    Handlers.set_head(branch and ("refs/heads/" .. branch) or target_sha, "checkout: moving from " .. from .. " to " .. to)
 
     if target_sha ~= current_sha then
         print("Checking out files: 100% done.")
@@ -2875,12 +3287,28 @@ arguments.createArgument("git", "switch", "", function(...)
 
     local name = positional[1]
     if not name or name == "" then
-        error("fatal: missing branch or commit argument")
-        print("usage: git switch [-c | --create] <branch> [<start-point>]")
-        return
+        error("fatal: missing branch or commit argument\nusage: git switch [-c | --create] <branch> [<start-point>]", 0)
     end
 
     local current_branch = Handlers.get_current_branch()
+
+    --// "-" is the branch you were on before (from the reflog)
+    if name == "-" or name == "@{-1}" then
+        name = nil
+        for _, entry in ipairs(Handlers.read_reflog("HEAD")) do
+            local previous = entry.message:match("^checkout: moving from (%S+) to ")
+            if previous then
+                name = previous
+                break
+            end
+        end
+        if not name then
+            error("fatal: invalid reference: @{-1}", 0)
+        end
+        if not Handlers.get_ref("refs/heads/" .. name) then
+            detach = true
+        end
+    end
 
     if detach then
         local sha = Handlers.resolve_revision(name)
@@ -2898,6 +3326,16 @@ arguments.createArgument("git", "switch", "", function(...)
         local start_sha = Handlers.resolve_revision(positional[2] or "HEAD")
         assert(start_sha and start_sha ~= "", positional[2] and ("fatal: invalid reference: " .. positional[2]) or "fatal: you are on a branch with no commits yet")
         if switch_to(start_sha, name, true) then
+            --// branching off a remote branch tracks it (branch.autoSetupMerge)
+            local start = positional[2]
+            local remote, remote_branch = nil, nil
+            if start then
+                remote, remote_branch = start:match("^([^/]+)/(.+)$")
+            end
+            if remote and Handlers.get_ref("refs/remotes/" .. start) then
+                repo.set_upstream(name, remote, remote_branch)
+                print("branch '" .. name .. "' set up to track '" .. start .. "'.")
+            end
             print("Switched to a new branch '" .. name .. "'")
         end
         return
@@ -2924,6 +3362,7 @@ arguments.createArgument("git", "switch", "", function(...)
 
     if switch_to(target_sha, name, created_tracking) then
         if created_tracking then
+            repo.set_upstream(name, "origin", name)
             print("branch '" .. name .. "' set up to track 'origin/" .. name .. "'.")
         end
         print("Switched to branch '" .. name .. "'")
@@ -2956,6 +3395,11 @@ arguments.createArgument("git", "checkout", "ck", function(...)
         return
     end
 
+    if first == "-" then
+        arguments.execute("git", "switch", "-")
+        return
+    end
+
     if first == "--detach" or first == "-d" then
         arguments.execute("git", "switch", "--detach", table.unpack(tuple, 2))
         return
@@ -2963,6 +3407,20 @@ arguments.createArgument("git", "checkout", "ck", function(...)
 
     if first == "--" then
         arguments.execute("git", "restore", table.unpack(tuple, 2))
+        return
+    end
+
+    --// git checkout <tree-ish> -- <paths>: take the paths from that commit (index and place)
+    if tuple[2] == "--" or (#tuple > 1 and Handlers.resolve_revision(first) and not Utilities.parse_path(first)) then
+        local paths = {}
+        for i = 2, #tuple do
+            if tuple[i] ~= "--" then table.insert(paths, tuple[i]) end
+        end
+        if Handlers.resolve_revision(first) then
+            arguments.execute("git", "restore", "--source=" .. first, "--staged", "--worktree", table.unpack(paths))
+        else
+            arguments.execute("git", "restore", first, table.unpack(paths))
+        end
         return
     end
 
@@ -2995,9 +3453,33 @@ fetches from repository.
 arguments.createArgument("git", "fetch", "", function(...)
     assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
 
-    local tuple = {...}
-    local remote_name = tuple[1] or "origin"
-    git_remote.fetch(remote_name)
+    local prune, all, quiet = repo.get_config("fetch.prune") == "true", false, false
+    local positional = {}
+    for _, arg in ipairs({...}) do
+        if arg == "-p" or arg == "--prune" then prune = true
+        elseif arg == "--no-prune" then prune = false
+        elseif arg == "--all" then all = true
+        elseif arg == "-q" or arg == "--quiet" then quiet = true
+        elseif arg == "--tags" or arg == "-t" then --// tags are always fetched
+        elseif arg:sub(1, 1) ~= "-" then table.insert(positional, arg)
+        end
+    end
+
+    local remotes = {}
+    if all then
+        for section in pairs(repo.read_config()) do
+            local name = section:match('^remote "(.+)"$')
+            if name then table.insert(remotes, name) end
+        end
+        table.sort(remotes)
+    else
+        local upstream_remote = repo.get_upstream(Handlers.get_current_branch())
+        table.insert(remotes, positional[1] or upstream_remote or "origin")
+    end
+
+    for _, remote_name in ipairs(remotes) do
+        git_remote.fetch(remote_name, quiet, {prune = prune})
+    end
 end)
 
 --[[
@@ -3007,146 +3489,53 @@ reset
 resets repository change/s
 ]]
 arguments.createArgument("git", "reset", "", function(...)
-    assert(bash.getGitFolderRoot(), "fatal: not a git repository (or any of the parent directories): .git")
+    repo.require_root()
 
     local tuple = {...}
     local mode = "--mixed"
     local commit_target = "HEAD"
-    local paths = {}
+    local positional, paths = {}, {}
+    local after_dashes, quiet = false, false
 
-    local i = 1
-    local positional = {}
-    while i <= #tuple do
-        local arg = tuple[i]
-        if arg == "--soft" or arg == "--mixed" or arg == "--hard" then
+    for _, arg in ipairs(tuple) do
+        if after_dashes then
+            table.insert(paths, arg)
+        elseif arg == "--" then
+            after_dashes = true
+        elseif arg == "--soft" or arg == "--mixed" or arg == "--hard" or arg == "--keep" or arg == "--merge" then
             mode = arg
+        elseif arg == "-q" or arg == "--quiet" then
+            quiet = true
         elseif arg:sub(1, 1) ~= "-" then
             table.insert(positional, arg)
         end
-        i += 1
     end
 
     if #positional > 0 then
         local first = positional[1]
-        local is_commit = Handlers.resolve_revision(first) ~= nil and not Utilities.parse_path(first)
-        
-        if is_commit then
+        if Handlers.resolve_revision(first) and (after_dashes or #positional > 1 or not Utilities.parse_path(first)) then
             commit_target = table.remove(positional, 1)
         end
-        
-        for _, p in ipairs(positional) do
-            table.insert(paths, p)
+        for _, path in ipairs(positional) do
+            table.insert(paths, path)
         end
-    end
-
-    if #paths > 0 then
-        local index = Handlers.read_index()
-        local tree_sha = ""
-        local head_commit = Handlers.get_ref("HEAD")
-        
-        if head_commit and head_commit ~= "" then
-            local commit_obj = Handlers.read_object(head_commit)
-            if commit_obj then
-                tree_sha = commit_obj.content:match("^tree (%x+)") or ""
-            end
-        end
-
-        local tree_objects = {}
-        if tree_sha ~= "" then
-            local function recurse_tree(current_sha, prefix)
-                local obj = Handlers.read_object(current_sha)
-                if not obj then return end
-                
-                local content = obj.content
-                local pos = 1
-                while pos <= #content do
-                    local spacePos = content:find(" ", pos, true)
-                    local mode_str = content:sub(pos, spacePos - 1)
-                    local nullPos = content:find("\0", spacePos, true)
-                    local name = content:sub(spacePos + 1, nullPos - 1)
-                    local rawSha = content:sub(nullPos + 1, nullPos + 20)
-                    local child_sha = ("%02x"):rep(20):format(rawSha:byte(1, 20))
-                    pos = nullPos + 21
-                    
-                    local full_path = prefix == "" and name or (prefix .. "/" .. name)
-                    if mode_str == "40000" then
-                        recurse_tree(child_sha, full_path)
-                    else
-                        tree_objects[full_path] = {sha = child_sha, mode = mode_str}
-                    end
-                end
-            end
-            pcall(recurse_tree, tree_sha, "")
-        end
-
-        for _, target_path in ipairs(paths) do
-            if target_path:sub(1, 5) == "game." or target_path:sub(1, 5) == "game/" then
-                target_path = target_path:sub(6)
-            end
-            target_path = target_path:gsub("%.", "/")
-
-            local found = false
-            for path, _ in pairs(index) do
-                if path == target_path or path:sub(1, #target_path + 1) == target_path .. "/" then
-                    found = true
-                    if tree_objects[path] then
-                        index[path] = {sha = tree_objects[path].sha, mode = tree_objects[path].mode}
-                    else
-                        index[path] = nil
-                    end
-                end
-            end
-            if not found then
-                error("fatal: pathspec '" .. target_path .. "' did not match any files")
-            end
-        end
-        
-        Handlers.write_index(index)
-        -- We only print this if not doing a broad switch checkout
-        if not (mode == "--hard" and commit_target == "HEAD" and #paths == 0) then
-            print("Unstaged changes after reset:")
-        end
-        return
     end
 
     local target_sha = Handlers.resolve_revision(commit_target)
-    if not target_sha or target_sha == "" then
-        error("fatal: ambiguous argument '" .. commit_target .. "': unknown revision or path not in the working tree.")
-        return
+    if not target_sha then
+        if commit_target == "HEAD" and #paths > 0 then
+            target_sha = nil --// unborn branch: unstaging means dropping from the index
+        else
+            error("fatal: ambiguous argument '" .. commit_target .. "': unknown revision or path not in the working tree.", 0)
+        end
     end
+    local target_commit = target_sha and Handlers.read_commit(target_sha)
 
-    local target_commit = Handlers.read_commit(target_sha)
-    if not target_commit or not target_commit.tree then
-        error("fatal: Could not parse object '" .. commit_target .. "'.")
-        return
-    end
-
-    local current_branch = Handlers.get_current_branch()
-    if current_branch then
-        Handlers.update_ref("refs/heads/" .. current_branch, target_sha)
-    else
-        bash.modifyFileContents(bash.getGitFolderRoot(), "HEAD", target_sha)
-    end
-
-    if mode == "--hard" then
-        --// discards everything: instances are rebuilt from the target tree
-        local ok, err = Remote.checkout(target_commit.tree)
-        assert(ok, err)
-        print("HEAD is now at " .. target_sha:sub(1, 7) .. " " .. (target_commit.message:match("^[^\n]*") or ""))
-        return
-    end
-
-    --// --soft keeps the index (so the undone changes show up as staged), --mixed resets it as well
-    local new_index = Handlers.tree_to_index(target_commit.tree)
-    if mode == "--mixed" then
-        Handlers.write_index(new_index)
-    end
-    bash.writeFile(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
-
-    if mode == "--mixed" then
+    local function list_unstaged()
+        if quiet then return end
         local unstaged = {}
         for _, change in ipairs(git.get_changes()) do
-            if change.status ~= "U" then
+            if change.status ~= "U" and not change.staged then
                 table.insert(unstaged, change.status .. "\t" .. change.path)
             end
         end
@@ -3155,6 +3544,68 @@ arguments.createArgument("git", "reset", "", function(...)
             for _, line in ipairs(unstaged) do print(line) end
         end
     end
+
+    --// git reset [<commit>] -- <paths>: copy those entries from the commit into the index
+    if #paths > 0 then
+        if mode ~= "--mixed" then
+            error("fatal: Cannot do " .. mode:sub(3) .. " reset with paths.", 0)
+        end
+        local filters = {}
+        for _, path in ipairs(paths) do table.insert(filters, path == "." and "." or normalize_user_path(path)) end
+
+        local source = target_commit and repo.tree_index(target_commit.tree) or {}
+        local index = Handlers.read_index()
+        for path in pairs(table.clone(index)) do
+            if matches_filters(path, filters) and not source[path] then index[path] = nil end
+        end
+        for path, data in pairs(source) do
+            if matches_filters(path, filters) then index[path] = {sha = data.sha, mode = data.mode} end
+        end
+        Handlers.write_index(index)
+        repo.resolve_conflicts(filters)
+        list_unstaged()
+        return
+    end
+
+    if not target_commit or not target_commit.tree then
+        error("fatal: Could not parse object '" .. commit_target .. "'.", 0)
+    end
+
+    if mode == "--keep" or mode == "--merge" then
+        repo.ensure_clean("reset")
+        mode = "--hard"
+    end
+
+    repo.save_orig_head()
+    local current_branch = Handlers.get_current_branch()
+    local message = "reset: moving to " .. commit_target
+    if current_branch then
+        Handlers.update_ref("HEAD", target_sha, message)
+    else
+        Handlers.set_head(target_sha, message)
+    end
+
+    if mode == "--soft" then
+        return
+    end
+
+    --// a reset ends any merge/cherry-pick/revert that was waiting
+    if not repo.read_file("ROGIT_SEQUENCER") then
+        repo.clear_operation_state()
+    else
+        repo.write_conflicts({})
+    end
+
+    if mode == "--hard" then
+        repo.checkout_tree(target_commit.tree)
+        if not quiet then
+            print("HEAD is now at " .. target_sha:sub(1, 7) .. " " .. (target_commit.message:match("^[^\n]*") or ""))
+        end
+        return
+    end
+
+    Handlers.write_index(repo.tree_index(target_commit.tree))
+    list_unstaged()
 end)
 
 --[[
@@ -3267,67 +3718,122 @@ change/set configurations for repository/global
 ]]
 arguments.createArgument("git", "config", "", function(...)
     local tuple = {...}
-    local is_global = false
-    local args_start = 1
-    
-    if tuple[1] == "--global" then
-        is_global = true
-        args_start = 2
+    local scope = nil --// nil = local for writes, both for reads
+    local action = nil
+    local positional = {}
+
+    for _, arg in ipairs(tuple) do
+        if arg == "--global" or arg == "--system" then scope = "global"
+        elseif arg == "--local" then scope = "local"
+        elseif arg == "-l" or arg == "--list" then action = "list"
+        elseif arg == "--get" then action = "get"
+        elseif arg == "--unset" then action = "unset"
+        elseif arg == "--get-all" then action = "get"
+        elseif arg:sub(1, 1) ~= "-" then table.insert(positional, arg)
+        end
     end
-    
-    local key = tuple[args_start]
-    local value = tuple[args_start + 1]
-    
-    if not key or key == "" then
-        print("usage: git config [<options>]")
-        return
+
+    local key, value = positional[1], positional[2]
+    if not action then
+        action = value ~= nil and "set" or (key and "get" or nil)
     end
-    
-    local key_parts = string.split(key, ".")
-    local section = key_parts[1]
-    local property = key_parts[2]
-    
+    if not action then
+        error("usage: git config [<options>] <name> [<value>]\n       git config --list | --get <name> | --unset <name>", 0)
+    end
+
+    --// Credentials and identity live in the plugin settings (per user, never inside the place)
     local sensitive_keys = {
-        ["user.name"] = true,
-        ["user.email"] = true,
-        ["user.token"] = true,
-        ["user.password"] = true,
-        ["user_name"] = true,
-        ["user_email"] = true,
-        ["user_token"] = true,
-        ["user_password"] = true
+        ["user.name"] = true, ["user.email"] = true, ["user.token"] = true, ["user.password"] = true,
+        ["user_name"] = true, ["user_email"] = true, ["user_token"] = true, ["user_password"] = true,
     }
+    local GLOBAL_KEYS = {"user.name", "user.email", "init.defaultBranch", "pull.rebase", "fetch.prune", "clean.requireForce"}
 
-    if value then
-        if (is_global or sensitive_keys[key]) and ACTIVE_PLUGIN then
-            local sanitized_key = key:gsub("%.", "_")
-            ACTIVE_PLUGIN:SetSetting(sanitized_key, value)
-            print("Set '" .. sanitized_key .. "' in plugin settings")
-            return
-        end
+    local function global_get(name)
+        return Auth.getConfigValue((name:gsub("%.", "_"))) or Auth.getConfigValue(name)
+    end
+    local function global_set(name, v)
+        assert(ACTIVE_PLUGIN, "fatal: global settings need the plugin to be running")
+        ACTIVE_PLUGIN:SetSetting((name:gsub("%.", "_")), v)
     end
 
-    local root = bash.getGitFolderRoot()
-    if not root then
-        error("fatal: not in a git directory")
+    local function is_global(name)
+        return scope == "global" or (scope == nil and sensitive_keys[name])
+    end
+
+    if action == "list" then
+        if scope ~= "local" then
+            for _, name in ipairs(GLOBAL_KEYS) do
+                local v = global_get(name)
+                if v ~= nil and name ~= "user.token" then print(name .. "=" .. tostring(v)) end
+            end
+        end
+        if scope ~= "global" and bash.getGitFolderRoot() then
+            local conf = repo.read_config()
+            local sections = {}
+            for section in pairs(conf) do table.insert(sections, section) end
+            table.sort(sections)
+            for _, section in ipairs(sections) do
+                local base, sub = section:match('^(%S+) "(.*)"$')
+                local prefix = base and (base .. "." .. sub) or section
+                local names = {}
+                for name in pairs(conf[section]) do table.insert(names, name) end
+                table.sort(names)
+                for _, name in ipairs(names) do
+                    print(prefix .. "." .. name .. "=" .. tostring(conf[section][name]))
+                end
+            end
+        end
         return
     end
-    
-    local config_content = bash.getFileContents(root, "config")
-    local loaded_conf = ini_parser.parseIni(config_content)
-    
-    if value then
-        if not loaded_conf[section] then
-            loaded_conf[section] = {}
+
+    assert(key and key:find(".", 1, true), "error: key does not contain a section: " .. tostring(key))
+
+    if action == "get" then
+        local v = nil
+        if scope ~= "global" and bash.getGitFolderRoot() and not sensitive_keys[key] then
+            local section, name = repo.config_section(key)
+            local conf = repo.read_config()
+            v = conf[section] and conf[section][name]
         end
-        loaded_conf[section][property] = value
-        bash.modifyFileContents(root, "config", ini_parser.serializeIni(loaded_conf))
-    else
-        local val = Auth.getConfigValue(key)
-        if val then
-            print(val)
+        if v == nil and scope ~= "local" then
+            v = global_get(key)
         end
+        if v == nil then
+            error("", 0) --// like git: nothing printed, failure
+        end
+        if key == "user.token" or key == "user.password" then
+            v = "<hidden>"
+        end
+        print(tostring(v))
+        return
     end
+
+    if is_global(key) then
+        if action == "unset" then
+            global_set(key, nil)
+        else
+            global_set(key, value)
+        end
+        if action == "set" then
+            print("Set '" .. key .. "' in plugin settings")
+        end
+        return
+    end
+
+    repo.require_root()
+    local section, name = repo.config_section(key)
+    local conf = repo.read_config()
+    if action == "unset" then
+        if not (conf[section] and conf[section][name] ~= nil) then
+            error("", 0)
+        end
+        conf[section][name] = nil
+        if next(conf[section]) == nil then conf[section] = nil end
+    else
+        conf[section] = conf[section] or {}
+        conf[section][name] = value
+    end
+    repo.write_config(conf)
 end)
 
 --[[
@@ -3359,5 +3865,10 @@ arguments.createArgument("git", "credential", "", function(...)
         print("usage: git credential (fill|approve|reject)")
     end
 end)
+
+--// Commands that live in their own modules (they register themselves)
+require(script.Parent.commands.history)
+require(script.Parent.commands.inspect)
+require(script.Parent.commands.stash)
 
 return git

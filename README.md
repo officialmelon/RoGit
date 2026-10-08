@@ -34,49 +34,79 @@ We have implemented a console to give the user a native git feel if they are adv
 
 - [ ] Union/Combined-Instance support *(binary properties such as `ChildData`/`MeshData` are stored (base64) instead of breaking the commit, but whether Studio lets a plugin read/write them still needs testing. `git doctor` tells you what is and isn't saved in your place)*
 
-- [ ] Implement MInstance instead of custom solution! (better support)
-
-- [x] Make branching much better *(real three-way `git merge`, `git tag`, detached HEAD, `HEAD~1`-style revisions, remote branches, `git switch` creating tracking branches)*
+- [x] Make branching much better *(three-way merges with git-style conflicts, rebase, cherry-pick, revert, stash, tags, reflog, bisect)*
 
 - [x] Improve speeds
 
 ## Features & Supported Commands
 
-`roGit` supports a large subset of standard Git commands, adapted for the Roblox `Instance` tree:
+`roGit` aims to behave like git, adapted for the Roblox `Instance` tree (every instance is a "file").
+Run `git help` for the list, `git <command> --help` for the options of one command.
 
-- `git clone <url>` - Clone remote repositories directly into your place (`-b <branch>`, `--single-branch`). Understands `https://`, `git@host:user/repo.git` and `host/user/repo` style URLs.
-- `git status` - Staged, unstaged and untracked Instances, plus how far you are ahead/behind `origin`.
-- `git add <path>` / `git rm` / `git mv` / `git restore` / `git reset` - Stage, remove, move and restore Instances.
-- `git commit -m "..."` (`-a`, `--amend`, `--allow-empty`) - Create local commits natively.
-- `git diff [--cached]` - See *what* changed: every modified property, and a line diff for scripts.
-- `git log [--oneline] [-n N] [<rev>]` / `git show [<rev>]` - Browse history, including merge commits.
-- `git fetch`, `git pull` and `git push` - Sync with remote HTTPS repositories (GitHub, GitLab, etc.). Only the objects you don't have are downloaded/uploaded. `push` supports `-u`, `-f`, `--all`, `--tags`, `--delete` and `src:dst` refspecs.
-- `git branch` (`-a`, `-r`, `-v`, `-d/-D`, `-m`) / `git switch` / `git checkout` - Work with branches, tags, commits (detached HEAD) and files.
-- `git merge <branch>` - Fast-forwards when possible, otherwise does a real three-way merge (see below).
-- `git tag` - Lightweight and annotated (`-a -m`) tags.
-- `git doctor` - Scans your place and lists everything roGit can't store (unknown property types, known limits such as terrain voxels).
-- `git remote`, `git config` and more! Run `git help` to see everything.
+**Start a repository**
+- `git init [-b <branch>]`, `git clone [-b <branch>] [--single-branch] <url>` (https, `git@host:user/repo.git` and `host/user/repo` URLs).
+
+**Day to day**
+- `git status [-s] [-b] [--porcelain]` - staged, unstaged, untracked and unmerged instances, ahead/behind your upstream, merges/rebases in progress.
+- `git add [-u] [-A] [-n] <path>`, `git rm [-r] [--cached] [-f]`, `git mv`, `git restore [--staged] [--source=<rev>]`, `git clean [-n] [-f]`.
+- `git commit [-m] [-a] [--amend] [--no-edit] [--allow-empty] [--author=] [-C <commit>]`.
+- `git diff [--cached] [<commit>] [<a> <b> | <a>..<b> | <a>...<b>] [--stat | --name-only | --name-status] [-- <path>]` - every changed property, and a line diff for scripts.
+- `git stash [push -u -m] | list | show [-p] | pop | apply | drop | clear | branch`.
+
+**History**
+- `git log [--oneline] [--graph] [--all] [-n] [-p | --stat] [--author=] [--grep=] [--format=] [--reverse] [<range>] [-- <path>]`.
+- `git show [<rev>] [<rev>:<path>]`, `git blame <path>`, `git grep <pattern> [<rev>]`, `git shortlog [-sne]`, `git describe [--tags]`.
+- `git reflog`, and `HEAD@{n}`, `ORIG_HEAD`, `HEAD~2`, `main^2`, `@{u}`, `@{-1}` as revisions anywhere.
+
+**Branches and merging**
+- `git branch [-a] [-r] [-v] [-vv] [-d/-D] [-m] [-c] [-u <upstream>] [--merged] [--no-merged] [--contains]`.
+- `git switch [-c] [--detach] [-] <branch>`, `git checkout [-b] <branch> | <commit> | [<rev>] -- <path>`.
+- `git merge [--no-ff] [--ff-only] [--squash] [--no-commit] [-X ours|theirs] [--abort | --continue]`.
+- `git rebase [--onto] <upstream>`, `git cherry-pick [-x] [-n] <commits>`, `git revert <commits>` - all with `--continue`, `--skip`, `--abort`.
+- `git reset [--soft | --mixed | --hard] [<commit>] [-- <path>]`, `git tag [-a] [-m] [-d] [-l]`, `git bisect`.
+
+**Remotes**
+- `git fetch [--all] [--prune]`, `git pull [--rebase] [--ff-only]`, `git push [-u] [-f] [--force-with-lease] [--all] [--tags] [--delete] [-n] [src:dst]`, `git remote add | remove | rename | set-url | get-url | show | prune`.
+- Only the objects you don't have yet are downloaded or uploaded.
+
+**Plumbing**
+- `git cat-file`, `ls-files`, `ls-tree`, `rev-parse`, `rev-list`, `merge-base`, `show-ref`, `symbolic-ref`, `update-ref`, `count-objects`, `git config [--global] [--list] [--get] [--unset]`.
+
+**roGit specific**
+- `git doctor` - scans your place and lists everything roGit can't store.
 
 ### What gets saved
 
 Every property Studio reports as serialized, attributes, tags and scripts are stored. On top of that:
 
-- **`EditableImage`** (pixels) and **`EditableMesh`** (vertices, normals, UVs, colors, triangles) are stored with their data, and `Content` properties that point at them (e.g. `ImageLabel.ImageContent`) are re-linked on checkout. `MeshPart.MeshContent` too.
+- **Terrain**: the voxels (materials, occupancy and water, in 128 stud chunks) and the terrain material colors.
+  roGit finds the terrain by itself; for huge maps set a `RoGitTerrainBounds` attribute on Terrain (`"x1,y1,z1,x2,y2,z2"` in studs).
+- **`EditableImage`** (pixels) and **`EditableMesh`** (vertices, normals, UVs, colors, triangles), and `Content` properties that point at them (e.g. `ImageLabel.ImageContent`, `MeshPart.MeshContent`).
 - **`Path2D`** control points, `Model.WorldPivot`, `buffer` and binary-string properties.
+- Cleared values: an attribute, tag, reference (`ObjectValue.Value`, `Model.PrimaryPart`...) or custom physical properties removed on a branch are removed again when you check it out.
+- Scripts open in the editor are read from (and written through) the script editor.
 - Awkward instance names (`A/B`, empty names, `.git`, ...) are escaped so they can live in a git tree.
 - Properties of a type roGit doesn't understand are skipped rather than saved as junk; `git doctor` lists them.
 
-Not stored: terrain voxels, and properties that were set back to `nil`.
-
 ### How merging works
 
-Instances are stored as property lists, so `git merge` (and `git pull` when the branches diverged) merges in layers:
+Instances are stored as property lists, so `git merge`, `git pull`, `git rebase`, `git cherry-pick`, `git revert` and `git stash pop` merge in layers:
 
 1. **Instances**: added/removed/changed on only one side - taken as is.
 2. **Properties**: an instance edited on both sides is merged property by property (attributes and tags too).
-3. **Scripts**: if both sides edited the same script, the lines are merged like Git does. Edits to different parts of the file merge cleanly.
+3. **Scripts**: if both sides edited the same script, the lines are merged like git does. Edits to different parts of the file merge cleanly.
 
-If the two sides really changed the same thing, the merge **stops without touching your place** and lists the conflicts. Re-run with `-X ours` or `-X theirs` to settle conflicts in favour of one side.
+When both sides really changed the same thing, you get a git-style conflict: scripts get `<<<<<<<` / `=======` / `>>>>>>>` markers,
+other instances keep your version, and `git status` lists the unmerged paths. Fix them, `git add` them and `git commit`
+(or `git rebase --continue`, `git cherry-pick --continue`, ...). `git merge --abort` (and friends) puts everything back.
+`-X ours` / `-X theirs` settles conflicts automatically.
+
+### Differences from git
+
+- There is no editor: commands that would open one need `-m` (and interactive rebase isn't available).
+- `git grep` patterns are plain text (`-E` switches to Lua patterns, not regular expressions).
+- Only the smart HTTP(S) protocol is supported; SSH URLs are converted to HTTPS.
+- Submodules, worktrees, hooks, sparse checkout and signed commits aren't supported.
 
 ---
 
@@ -121,7 +151,7 @@ The plugin is plain Luau and builds with [Rojo](https://rojo.space) (`rojo build
 `tests/` contains a small Roblox mock so the real command code can be exercised outside Studio with the [Luau CLI](https://github.com/luau-lang/luau):
 
 ```
-python3 tests/build.py tests/merge_test.lua && luau tests/_run.lua
-python3 tests/build.py tests/workflow_test.lua && luau tests/_run.lua
-python3 tests/build.py tests/serialize_test.lua && luau tests/_run.lua
+for t in merge workflow serialize history parity; do
+  python3 tests/build.py tests/${t}_test.lua && luau tests/_run.lua
+done
 ```

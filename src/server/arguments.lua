@@ -98,11 +98,29 @@ function arguments.createArgument(command, argument, alias, callback, ...)
     }
 end
 
+--// Called once before every top level command (not for commands that run other commands)
+arguments.onExecute = nil
+local depth = 0
+
 --[[
 Executes a 'command'
 ]]
 function arguments.execute(command, argument, ...)
     assert(type(command) == "string", "command must be a string")
+
+    if depth == 0 and arguments.onExecute then
+        arguments.onExecute(command, argument)
+    end
+    depth += 1
+    local results = table.pack(pcall(arguments.executeInner, command, argument, ...))
+    depth -= 1
+    if not results[1] then
+        error(results[2], 0)
+    end
+    return table.unpack(results, 2, results.n)
+end
+
+function arguments.executeInner(command, argument, ...)
 
     local cmd = arguments.existingCommands[command]
     if not cmd then
@@ -119,6 +137,17 @@ function arguments.execute(command, argument, ...)
                 print("        " .. name)
             end
         end
+        return
+    end
+
+    --// git --help / git -h, and git <command> --help
+    if (argument == "--help" or argument == "-h") and arguments.retrieveArgument(command, "help") then
+        arguments.retrieveArgument(command, "help").callback(...)
+        return
+    end
+    local first = ...
+    if (first == "--help" or first == "-h") and arguments.retrieveArgument(command, "help") and argument ~= "help" then
+        arguments.retrieveArgument(command, "help").callback(argument)
         return
     end
 

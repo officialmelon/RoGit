@@ -252,6 +252,18 @@ function Remote.peekPropertiesBlob(objectsBySha, treeSha)
 end
 
 --[[
+Gives a MeshPart the mesh behind `content` (a Content value). MeshParts can't simply be assigned a new mesh.
+]]
+local function applyMeshContent(meshPart, content)
+    local AssetService = game:GetService("AssetService")
+    local loaded = AssetService:CreateMeshPartAsync(content, {
+        CollisionFidelity = meshPart.CollisionFidelity,
+        RenderFidelity = meshPart.RenderFidelity,
+    })
+    meshPart:ApplyMesh(loaded)
+end
+
+--[[
 Resolves the references for instances.
 ]]
 function Remote.resolve_instance_refs()
@@ -295,18 +307,6 @@ end
 --[[
 applies properties to an instance.
 ]]
---[[
-Gives a MeshPart the mesh behind `content` (a Content value). MeshParts can't simply be assigned a new mesh.
-]]
-local function applyMeshContent(meshPart, content)
-    local AssetService = game:GetService("AssetService")
-    local loaded = AssetService:CreateMeshPartAsync(content, {
-        CollisionFidelity = meshPart.CollisionFidelity,
-        RenderFidelity = meshPart.RenderFidelity,
-    })
-    meshPart:ApplyMesh(loaded)
-end
-
 function Remote.applyProperties(instance, props)
     Utilities.roYield()
 
@@ -387,8 +387,18 @@ function Remote.applyProperties(instance, props)
                         end
                     elseif propData.name == "Source" and instance:IsA("LuaSourceContainer") then
                         pcall(function()
-                            (instance :: any).Source = val
+                            if (instance :: any).Source == val then return end
+                            --// a script open in the editor has to be changed through the editor, or the edit is lost
+                            local editor = game:GetService("ScriptEditorService")
+                            if editor:FindScriptDocument(instance) then
+                                editor:UpdateSourceAsync(instance, function() return val end)
+                            else
+                                (instance :: any).Source = val
+                            end
                         end)
+                        if (instance :: any).Source ~= val then
+                            pcall(function() (instance :: any).Source = val end)
+                        end
                     else
                         local name = propData.name
                         if name == "Color3uint8" then name = "Color" end
@@ -409,8 +419,40 @@ function Remote.applyProperties(instance, props)
             end
         end
     end
-end
 
+    --// The blob is the whole truth about the instance: drop what it no longer has
+    local keepAttributes, keepTags, present = {[ROGIT_ID] = true}, {}, {}
+    for _, propData in ipairs(props) do
+        present[propData.name] = true
+        if propData.name == "_attributes" and type(propData.value) == "table" then
+            if propData.value[1] ~= nil then
+                for _, attrData in ipairs(propData.value) do
+                    if type(attrData) == "table" and attrData.name then keepAttributes[attrData.name] = true end
+                end
+            else
+                for attrName in pairs(propData.value) do keepAttributes[attrName] = true end
+            end
+        elseif propData.name == "_tags" and type(propData.value) == "table" then
+            for _, tag in ipairs(propData.value) do keepTags[tag] = true end
+        end
+    end
+
+    for attrName in pairs(instance:GetAttributes()) do
+        if not keepAttributes[attrName] then
+            pcall(function() instance:SetAttribute(attrName, nil) end)
+        end
+    end
+    for _, tag in ipairs(instance:GetTags()) do
+        if not keepTags[tag] then
+            pcall(function() instance:RemoveTag(tag) end)
+        end
+    end
+    for _, name in ipairs(instances.nullable_properties(instance)) do
+        if not present[name] then
+            pcall(function() instance[name] = nil end)
+        end
+    end
+end
 --[[
 find instances by rogit_id (e.g. for properties with instance type)
 ]]
@@ -596,7 +638,8 @@ Fetches remote based off name.
 Downloads everything we don't have yet in a single pack and updates the remote-tracking refs and tags.
 Returns the remote refs and the discovery info.
 ]]
-function Remote.fetch(remote_name, quiet)
+function Remote.fetch(remote_name, quiet, opts)
+    opts = opts or {}
     local say = quiet and function() end or function(...) Remote.print(...) end
     say("Fetching " .. remote_name)
 
@@ -662,6 +705,17 @@ function Remote.fetch(remote_name, quiet)
             if _Handlers.get_ref(name) ~= sha then
                 table.insert(output, string.format(" * [new tag]         %-15s -> %s", tag_name, tag_name))
                 _Handlers.update_ref(name, sha)
+            end
+        end
+    end
+
+    --// --prune: forget remote branches that are gone
+    if opts.prune then
+        for refName in pairs(_Handlers.list_refs()) do
+            local branch = refName:match("^refs/remotes/" .. remote_name:gsub("%p", "%%%0") .. "/(.+)$")
+            if branch and branch ~= "HEAD" and not refs["refs/heads/" .. branch] then
+                _Handlers.delete_ref(refName)
+                table.insert(output, " - [deleted]         (none)     -> " .. remote_name .. "/" .. branch)
             end
         end
     end

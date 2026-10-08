@@ -52,7 +52,8 @@ function initDesktop(gui)
             ["M"] = Color3.fromRGB(210, 153, 34),  -- Modified
             ["A"] = Color3.fromRGB(63, 185, 80),   -- Added
             ["D"] = Color3.fromRGB(248, 81, 73),   -- Deleted
-            ["U"] = Color3.fromRGB(139, 148, 158)  -- Untracked
+            ["U"] = Color3.fromRGB(139, 148, 158), -- Untracked
+            ["C"] = Color3.fromRGB(248, 81, 73),   -- Conflicted
         }
 
         local Frame = Instance.new("Frame")
@@ -379,7 +380,8 @@ function initDesktop(gui)
         end)
         discardBtn.Activated:Connect(function()
             local succ, err = pcall(function()
-                arguments.execute("git", "restore", ".")
+                arguments.execute("git", "restore", "--staged", "--worktree", ".")
+                arguments.execute("git", "clean", "-f")
             end)
             if succ then
                 populateChangesList()
@@ -816,9 +818,16 @@ function handleCommandCallback(TextBox:TextBox, parent)
                 local status, err = pcall(function()
                     arguments.execute(cmdName, table.unpack(toProcess))
                 end)
-                if not status then
+                if not status and tostring(err) ~= "" then
                     local cleanErr = tostring(err):gsub("^.-:%d+: ", "")
-                    if not cleanErr:match("^fatal:") and not cleanErr:match("^error:") then
+                    --// git's own messages already say what they are (fatal:, error:, CONFLICT ...)
+                    local known = cleanErr:find("\n", 1, true)
+                        or cleanErr:match("^%a[%a%-]*:")
+                        or cleanErr:match("^CONFLICT")
+                        or cleanErr:match("^Automatic")
+                        or cleanErr:match("^Aborting")
+                        or cleanErr:match("^On branch")
+                    if not known then
                         cleanErr = "fatal: " .. cleanErr
                     end
                     createCommandOutput(parent, cleanErr, Color3.fromRGB(255, 90, 90))

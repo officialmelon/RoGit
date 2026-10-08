@@ -16,9 +16,19 @@ end
 ------------------------------------------------------------------ mocks for the datatypes involved
 local function datatype(name, fields) fields.__typeof = name return fields end
 Vector2 = { new = function(x, y) return datatype("Vector2", {X = x, Y = y}) end }
-Vector3 = { new = function(x, y, z) return datatype("Vector3", {X = x, Y = y, Z = z}) end }
+local V3MT = {}
+V3MT.__add = function(a, b) return Vector3.new(a.X + b.X, a.Y + b.Y, a.Z + b.Z) end
+Vector3 = { new = function(x, y, z) return setmetatable(datatype("Vector3", {X = x, Y = y, Z = z}), V3MT) end }
+Region3 = { new = function(min, max) return datatype("Region3", {Min = min, Max = max}) end }
 Color3 = { new = function(r, g, b) return datatype("Color3", {R = r, G = g, B = b}) end }
-Enum = { ContentSourceType = { None = "None", Uri = "Uri", Object = "Object" } }
+local materialCache = {}
+Enum = {
+	ContentSourceType = { None = "None", Uri = "Uri", Object = "Object" },
+	Material = setmetatable({}, {__index = function(_, name)
+		materialCache[name] = materialCache[name] or datatype("EnumItem", {Name = name})
+		return materialCache[name]
+	end}),
+}
 Content = {
 	none = datatype("Content", {SourceType = "None"}),
 	fromUri = function(uri) return datatype("Content", {SourceType = "Uri", Uri = uri}) end,
@@ -282,6 +292,94 @@ check("reset restores awkward names", run("reset", "--hard"))
 local values = {}
 for _, child in ipairs(ws.Names:GetChildren()) do values[child.Name] = child.Value end
 check("all awkward names came back", values["A/B"] == "v1" and values[""] == "v2" and values[".git"] == "v3" and values[".properties"] == "v4" and values["50%2F"] == "v5")
+
+------------------------------------------------------------------ terrain voxels + material colors
+local voxels = {} -- "x,y,z" (cells) -> {m, o, l}
+local materialColors = {}
+classMethods.Terrain = {
+	CountCells = function() local n = 0 for _ in pairs(voxels) do n += 1 end return n end,
+	ReadVoxelChannels = function(_, region, _, _)
+		local min, max = region.Min, region.Max
+		local M, S, L = {}, {}, {}
+		for x = min.X / 4, max.X / 4 - 1 do
+			local mx, sx, lx = {}, {}, {}
+			for y = min.Y / 4, max.Y / 4 - 1 do
+				local my, sy, ly = {}, {}, {}
+				for z = min.Z / 4, max.Z / 4 - 1 do
+					local v = voxels[(x + 0) .. "," .. (y + 0) .. "," .. (z + 0)]
+					table.insert(my, Enum.Material[v and v.m or "Air"])
+					table.insert(sy, v and v.o or 0)
+					table.insert(ly, v and v.l or 0)
+				end
+				table.insert(mx, my) table.insert(sx, sy) table.insert(lx, ly)
+			end
+			table.insert(M, mx) table.insert(S, sx) table.insert(L, lx)
+		end
+		return {SolidMaterial = M, SolidOccupancy = S, LiquidOccupancy = L}
+	end,
+	WriteVoxelChannels = function(_, region, _, ch)
+		local min = region.Min
+		for xi, mx in ipairs(ch.SolidMaterial) do
+			for yi, my in ipairs(mx) do
+				for zi, m in ipairs(my) do
+					local key = (min.X / 4 + xi - 1 + 0) .. "," .. (min.Y / 4 + yi - 1 + 0) .. "," .. (min.Z / 4 + zi - 1 + 0)
+					local o, l = ch.SolidOccupancy[xi][yi][zi], ch.LiquidOccupancy[xi][yi][zi]
+					if m.Name == "Air" and l == 0 then voxels[key] = nil else voxels[key] = {m = m.Name, o = o, l = l} end
+				end
+			end
+		end
+	end,
+	GetMaterialColor = function(_, material) return materialColors[material.Name] or Color3.new(0.5, 0.5, 0.5) end,
+	SetMaterialColor = function(_, material, color) materialColors[material.Name] = color end,
+}
+local terrain = plainNew("Terrain")
+terrain.Name = "Terrain"
+terrain.Parent = ws
+for x = 0, 5 do for z = 0, 5 do
+	voxels[x .. ",0," .. z] = {m = "Grass", o = 1, l = 0}
+	voxels[x .. ",1," .. z] = {m = "Rock", o = 0.5, l = 0}
+end end
+voxels["2,2,2"] = {m = "Air", o = 0, l = 1} -- water
+materialColors.Grass = Color3.new(0, 1, 0)
+local snapshot = {}
+for k, v in pairs(voxels) do snapshot[k] = v.m .. ":" .. math.floor(v.o * 255 + 0.5) .. ":" .. math.floor(v.l * 255 + 0.5) end
+
+check("add terrain", run("add", "."))
+check("commit terrain", run("commit", "-m", "terrain"))
+local terrainEntry = find_prop(props_of(instances.serialize_instance(terrain)), "_terrain")
+check("terrain stored", terrainEntry and #terrainEntry.value.Chunks == 1 and terrainEntry.value.Colors.Grass ~= nil)
+
+voxels["0,0,0"] = nil
+voxels["40,0,40"] = {m = "Sand", o = 1, l = 0} -- in another chunk
+materialColors.Grass = Color3.new(1, 0, 0)
+instances.invalidate_terrain()
+check("terrain edit shows up", select(2, run("status", "--porcelain")):find("Workspace/Terrain", 1, true))
+check("reset terrain", run("reset", "--hard"))
+local restored = {}
+for k, v in pairs(voxels) do restored[k] = v.m .. ":" .. math.floor(v.o * 255 + 0.5) .. ":" .. math.floor(v.l * 255 + 0.5) end
+local same = true
+for k, v in pairs(snapshot) do if restored[k] ~= v then same = false end end
+for k in pairs(restored) do if not snapshot[k] then same = false end end
+check("voxels restored exactly", same)
+check("material color restored", materialColors.Grass.G == 1 and materialColors.Grass.R == 0)
+
+------------------------------------------------------------------ cleared values come back cleared
+extraProps.ObjectValue = {"Value"}
+local holder = plainNew("Folder"); holder.Name = "Refs"; holder.Parent = ws
+local target = plainNew("Folder"); target.Name = "Target"; target.Parent = holder
+local pointer = plainNew("ObjectValue"); pointer.Name = "Pointer"; pointer.Parent = holder
+pointer:SetAttribute("keep", 1)
+pointer:AddTag("Kept")
+run("add", ".")
+run("commit", "-m", "refs")
+
+rawset(pointer, "Value", target)
+pointer:SetAttribute("extra", true)
+pointer:AddTag("Extra")
+check("reset --hard after adding things", run("reset", "--hard"))
+check("reference cleared again", rawget(pointer, "Value") == nil)
+check("new attribute removed", pointer:GetAttribute("extra") == nil and pointer:GetAttribute("keep") == 1)
+check("new tag removed", pointer:HasTag("Kept") and not pointer:HasTag("Extra"))
 
 print = realPrint
 if failures > 0 then error(failures .. " check(s) failed") end

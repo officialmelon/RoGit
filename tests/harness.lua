@@ -155,7 +155,9 @@ function methods.GetAttribute(self, k) return rawget(self, "_attrs")[k] end
 function methods.SetAttribute(self, k, v) rawget(self, "_attrs")[k] = v end
 function methods.GetAttributes(self) return table.clone(rawget(self, "_attrs")) end
 function methods.GetTags(self) return table.clone(rawget(self, "_tags")) end
-function methods.AddTag(self, t) table.insert(rawget(self, "_tags"), t) end
+function methods.AddTag(self, t) if not table.find(rawget(self, "_tags"), t) then table.insert(rawget(self, "_tags"), t) end end
+function methods.RemoveTag(self, t) local tags = rawget(self, "_tags") local i = table.find(tags, t) if i then table.remove(tags, i) end end
+function methods.HasTag(self, t) return table.find(rawget(self, "_tags"), t) ~= nil end
 
 -- class specific methods, filled in by tests (e.g. EditableImage:ReadPixelsBuffer)
 classMethods = {}
@@ -263,7 +265,7 @@ local function proxyFor(path, isDir)
 				for _, ext in ipairs({".lua", ".luau"}) do
 					if SOURCES[path .. "/" .. k .. ext] then return proxyFor(path .. "/" .. k .. ext, false) end
 				end
-				if k == "libs" then return proxyFor(path .. "/" .. k, true) end
+				if k == "libs" or k == "commands" then return proxyFor(path .. "/" .. k, true) end
 			end
 			return nil
 		end,

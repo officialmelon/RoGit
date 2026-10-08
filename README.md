@@ -34,12 +34,6 @@ We have implemented a console to give the user a native git feel if they are adv
 
 - [ ] Union/Combined-Instance support *(binary properties such as `ChildData`/`MeshData` are stored (base64) instead of breaking the commit, but whether Studio lets a plugin read/write them still needs testing. `git doctor` tells you what is and isn't saved in your place)*
 
-- [x] Make branching much better *(three-way merges with git-style conflicts, rebase, cherry-pick, revert, stash, tags, reflog, bisect)*
-
-- [x] Improve speeds
-
-- [x] Editor, hooks, signed commits, worktrees, submodules, activity log and tracing
-
 ## Features & Supported Commands
 
 `roGit` aims to behave like git, adapted for the Roblox `Instance` tree (every instance is a "file").

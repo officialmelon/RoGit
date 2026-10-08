@@ -40,9 +40,19 @@ check("git --version", out("--version"):find("git version", 1, true))
 check("git log --help", out("log", "--help"):find("git-log", 1, true))
 check("commit without message refused", not run("init") or not run("commit", "-m", ""))
 run("add", ".")
+-- the "editor": a temporary script in Studio, here a function that edits the text
+local editor = loadModule("libs/editor.lua")
+local edited = nil
+editor.provider = function(text, name)
+	edited = {text = text, name = name}
+	return text -- unchanged: only comments, so the message is empty
+end
 local ok, msg = run("commit")
-check("commit without -m aborts like git", not ok and msg:find("empty commit message", 1, true))
-run("commit", "-m", "first")
+check("commit without -m opens the editor", edited and edited.name == "COMMIT_EDITMSG" and edited.text:find("-- Changes to be committed:", 1, true))
+check("empty message from the editor aborts like git", not ok and msg:find("empty commit message", 1, true))
+editor.provider = function(text) return "first\n\nwritten in the editor\n" .. text end
+check("commit message from the editor", run("commit"))
+check("editor message used, comments stripped", Handlers.read_commit(Handlers.get_ref("HEAD")).message == "first\n\nwritten in the editor\n")
 run("tag", "-a", "v1.0", "-m", "first release")
 
 ------------------------------------------------------------------ commit messages

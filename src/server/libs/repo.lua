@@ -15,6 +15,8 @@ local Remote = require(script.Parent.git_remote)
 local merge = require(script.Parent.merge)
 local ini_parser = require(script.Parent.ini_parser)
 local output = require(script.Parent.output)
+local sshsig = require(script.Parent.sshsig)
+local hashlib = require(script.Parent.hashlib)
 
 local ROGIT_ID = "_rogit_id"
 repo.ZERO_SHA = ("0"):rep(40)
@@ -138,6 +140,84 @@ function repo.make_signature()
     return string.format("%s <%s> %d +0000", user_name, user_email, os.time())
 end
 
+--// ------------------------------------------------------------------ signing
+
+--[[
+The signing key's 32 byte seed (from the plugin settings), or nil.
+]]
+function repo.signing_seed()
+    local encoded = Auth.getConfigValue("user_signingkey_seed")
+    if type(encoded) ~= "string" or encoded == "" then return nil end
+    local ok, seed = pcall(hashlib.base64_to_bin, encoded)
+    if ok and #seed == 32 then return seed end
+    return nil
+end
+
+--[[
+Should this commit be signed? opts.sign wins, otherwise commit.gpgsign decides.
+]]
+function repo.wants_signature(explicit, config_key)
+    if explicit ~= nil then return explicit end
+    return repo.get_config(config_key or "commit.gpgsign") == "true"
+end
+
+--[[
+Adds a `gpgsig` header (SSH signature over the unsigned object) to a commit body.
+]]
+function repo.sign_commit_content(content)
+    local seed = repo.signing_seed()
+    if not seed then
+        error("error: no signing key configured\nhint: create one with 'git signing-key generate' (or import yours with 'git signing-key import')", 0)
+    end
+    local armored = sshsig.sign(seed, content):gsub("\n$", "")
+    local header = "gpgsig " .. armored:gsub("\n", "\n ")
+    local headers, message = content:match("^(.-\n)(\n.*)$")
+    return headers .. header .. "\n" .. message
+end
+
+--[[
+Splits a signed commit/tag into (payload, armored signature). Nil signature when unsigned.
+]]
+function repo.extract_signature(obj)
+    if obj.type == "tag" then
+        local start = obj.content:find("-----BEGIN SSH SIGNATURE-----", 1, true)
+        if not start then return obj.content, nil end
+        return obj.content:sub(1, start - 1), obj.content:sub(start)
+    end
+    local headers, message = obj.content:match("^(.-\n)(\n.*)$")
+    if not headers then return obj.content, nil end
+    local signature_lines = {}
+    local kept = {}
+    local in_signature = false
+    for line in headers:gmatch("([^\n]*)\n") do
+        if line:match("^gpgsig ") then
+            in_signature = true
+            table.insert(signature_lines, line:sub(8))
+        elseif in_signature and line:sub(1, 1) == " " then
+            table.insert(signature_lines, line:sub(2))
+        else
+            in_signature = false
+            table.insert(kept, line)
+        end
+    end
+    if #signature_lines == 0 then return obj.content, nil end
+    return table.concat(kept, "\n") .. "\n" .. message, table.concat(signature_lines, "\n") .. "\n"
+end
+
+--[[
+Checks the signature of a commit or tag. Returns status ("G" good, "B" bad, "N" none, "E" can't check), fingerprint, details.
+]]
+function repo.verify_signature(sha)
+    local obj = Handlers.read_object(sha)
+    if not obj then return "E", nil, "object not found" end
+    local payload, armored = repo.extract_signature(obj)
+    if not armored then return "N", nil, "no signature" end
+    if not armored:find("BEGIN SSH SIGNATURE", 1, true) then return "E", nil, "only SSH signatures can be checked" end
+    local ok, public_key, reason = sshsig.verify(armored, payload, "git")
+    local fingerprint = public_key and sshsig.fingerprint(public_key) or nil
+    return ok and "G" or "B", fingerprint, reason
+end
+
 --[[
 Writes a commit object without moving any ref. Returns its sha.
 ]]
@@ -173,7 +253,11 @@ function repo.create_commit(tree_sha, parents, message, opts)
         message ..= "\n"
     end
 
-    local sha = Handlers.write_object("commit", table.concat(lines, "\n") .. "\n\n" .. message)
+    local content = table.concat(lines, "\n") .. "\n\n" .. message
+    if repo.wants_signature(opts.sign) then
+        content = repo.sign_commit_content(content)
+    end
+    local sha = Handlers.write_object("commit", content)
     local subject = message:match("^[^\n]*")
     Handlers.update_ref("HEAD", sha, (opts.reflog or (#parents == 0 and "commit (initial)" or "commit")) .. ": " .. subject)
     return sha

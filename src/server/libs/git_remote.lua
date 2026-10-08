@@ -796,7 +796,7 @@ function Remote.checkout(treeSha)
     end
 
     _Handlers.write_index(new_index)
-    bash.modifyFileContents(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
+    bash.writeFile(bash.getGitFolderRoot(), "last_commit_index", HttpService:JSONEncode(new_index))
     
     return true
 end

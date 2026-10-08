@@ -12,6 +12,8 @@ local Handlers = require(script.Parent.Parent.libs.git_handlers)
 local repo = require(script.Parent.Parent.libs.repo)
 local output = require(script.Parent.Parent.libs.output)
 local Utilities = require(script.Parent.Parent.libs.utilities)
+local hooks = require(script.Parent.Parent.libs.hooks)
+local editor = require(script.Parent.Parent.libs.editor)
 
 local function print(...)
     output.print(...)
@@ -59,18 +61,88 @@ local function message_for(kind, sha, commit, opts)
 end
 
 --[[
-Applies one commit on top of HEAD. Returns true when done, false when it stopped on conflicts.
+Turns old style todo entries (plain shas) into steps: {cmd = "pick" | "revert" | "reword" | "edit" | "squash" | "fixup" | "exec" | "break", sha, arg}.
 ]]
-local function apply_commit(kind, sha, opts)
+local function as_step(kind, entry)
+    if type(entry) == "table" then return entry end
+    return {cmd = kind == "revert" and "revert" or "pick", sha = entry}
+end
+
+local function changed_since_head()
+    local index = Handlers.read_index()
+    local head_index = repo.read_last_index()
+    for path, data in pairs(index) do
+        if not head_index[path] or head_index[path].sha ~= data.sha then return true end
+    end
+    for path in pairs(head_index) do
+        if not index[path] then return true end
+    end
+    return false
+end
+
+--[[
+Records `tree_sha` for a step: a new commit (pick/revert/reword/edit) or folded into HEAD (squash/fixup).
+]]
+local function commit_step(state, step, tree_sha, message, author)
+    local reflog = state.kind == "rebase" and ("rebase (" .. step.cmd .. ")") or state.kind
+
+    if step.cmd == "squash" or step.cmd == "fixup" then
+        local head = Handlers.read_commit(repo.head_sha())
+        local combined = head.message
+        if step.cmd == "squash" then
+            combined = editor.message(
+                editor.COMMENT .. " This is a combination of 2 commits.\n" .. editor.COMMENT .. " This is the 1st commit message:\n\n"
+                    .. head.message:gsub("\n+$", "") .. "\n\n" .. editor.COMMENT .. " This is the commit message #2:\n\n" .. message,
+                {"Please enter the commit message for your changes. Lines starting", "with '--' will be ignored, and an empty message aborts the commit."},
+                "COMMIT_EDITMSG"
+            )
+            if combined == "" then combined = head.message end
+        end
+        repo.create_commit(tree_sha, head.parents, combined, {author = head.author, reflog = reflog})
+    else
+        if step.cmd == "reword" then
+            local edited = editor.message((message:gsub("\n+$", "")), {"Please enter the commit message for your changes.", "Lines starting with '--' will be ignored."}, "COMMIT_EDITMSG")
+            if edited ~= "" then message = edited end
+        end
+        local new_sha = repo.create_commit(tree_sha, {repo.head_sha()}, message, {author = author, reflog = reflog, sign = state.opts.sign})
+        if state.kind ~= "rebase" then
+            print(string.format("[%s %s] %s", Handlers.get_current_branch() or "detached HEAD", short(new_sha), (message:match("^[^\n]*"))))
+        end
+    end
+    repo.checkout_tree(tree_sha)
+end
+
+--[[
+Applies one step on top of HEAD. Returns "done", "conflict" or "stop" (edit/break: hand control back to the user).
+]]
+local function apply_step(state, step)
+    local kind, opts = state.kind, state.opts
+
+    if step.cmd == "break" then
+        return "stop"
+    elseif step.cmd == "exec" then
+        local args = {}
+        for word in tostring(step.arg or ""):gmatch("%S+") do table.insert(args, word) end
+        if args[1] == "git" then table.remove(args, 1) end
+        local ok, err = pcall(arguments.execute, "git", table.unpack(args))
+        if not ok then
+            error("warning: execution failed: git " .. tostring(step.arg) .. "\n" .. tostring(err) .. "\nYou can fix the problem, and then run\n\n  git rebase --continue", 0)
+        end
+        return "done"
+    elseif step.cmd == "drop" then
+        return "done"
+    end
+
+    local sha = step.sha
     local commit = Handlers.read_commit(sha)
     if not commit then
-        error("fatal: bad revision '" .. sha .. "'", 0)
+        error("fatal: bad revision '" .. tostring(sha) .. "'", 0)
     end
 
     local parent = commit.parents[opts.mainline or 1]
     if #commit.parents > 1 and not opts.mainline then
         if kind == "rebase" then
-            return true --// merge commits are dropped by a rebase, like git does
+            return "done" --// merge commits are dropped by a rebase, like git does
         end
         error("error: commit " .. sha .. " is a merge but no -m option was given.", 0)
     end
@@ -78,48 +150,43 @@ local function apply_commit(kind, sha, opts)
     local parent_tree = parent_commit and parent_commit.tree or nil
 
     local base, theirs = parent_tree, commit.tree
-    if kind == "revert" then
+    if step.cmd == "revert" then
         base, theirs = commit.tree, parent_tree
     end
 
     local label = short(sha) .. " (" .. subject_of(commit) .. ")"
-    local message = message_for(kind, sha, commit, opts)
-    local author = kind ~= "revert" and commit.author or nil
+    local message = message_for(step.cmd == "revert" and "revert" or kind, sha, commit, opts)
+    local author = step.cmd ~= "revert" and commit.author or nil
 
     local tree_sha = repo.three_way(base, theirs, {
         prefer = opts.prefer,
         ours_label = "HEAD",
-        theirs_label = (kind == "revert" and "parent of " or "") .. label,
+        theirs_label = (step.cmd == "revert" and "parent of " or "") .. label,
     })
 
     if not tree_sha then
-        repo.write_file(kind == "revert" and "REVERT_HEAD" or "CHERRY_PICK_HEAD", sha)
+        repo.write_file(step.cmd == "revert" and "REVERT_HEAD" or "CHERRY_PICK_HEAD", sha)
         repo.write_file("MERGE_MSG", message)
         if author then repo.write_file("ROGIT_PICK_AUTHOR", author) end
-        return false
+        return "conflict"
     end
 
-    if tree_sha == repo.head_tree() then
+    if tree_sha == repo.head_tree() and step.cmd ~= "squash" and step.cmd ~= "fixup" then
         if kind == "rebase" then
             print("dropping " .. sha .. " " .. subject_of(commit) .. " -- patch contents already upstream")
         else
             print("The previous " .. kind .. " is now empty, skipping " .. short(sha))
         end
-        return true
+        return step.cmd == "edit" and "stop" or "done"
     end
 
     if opts.no_commit then
         repo.checkout_tree(tree_sha)
-        return true
+        return "done"
     end
 
-    local reflog = kind == "rebase" and "rebase (pick)" or kind
-    local new_sha = repo.create_commit(tree_sha, {repo.head_sha()}, message, {author = author, reflog = reflog})
-    repo.checkout_tree(tree_sha)
-    if kind ~= "rebase" then
-        print(string.format("[%s %s] %s", Handlers.get_current_branch() or "detached HEAD", short(new_sha), (message:match("^[^\n]*"))))
-    end
-    return true
+    commit_step(state, step, tree_sha, message, author)
+    return step.cmd == "edit" and "stop" or "done"
 end
 
 local function finish(state)
@@ -128,6 +195,7 @@ local function finish(state)
         Handlers.update_ref(state.head_name, head, "rebase (finish): " .. state.head_name .. " onto " .. state.onto)
         Handlers.set_head(state.head_name, "rebase (finish): returning to " .. state.head_name)
         print("Successfully rebased and updated " .. state.head_name .. ".")
+        hooks.notify("post-rewrite", {args = {"rebase"}})
     elseif state.kind == "rebase" then
         print("Successfully rebased.")
     end
@@ -137,16 +205,17 @@ end
 
 local function stop_message(state)
     local verb = state.kind
-    local commit = Handlers.read_commit(state.current)
+    local sha = state.current and state.current.sha
+    local commit = sha and Handlers.read_commit(sha)
     local lines = {}
     if state.kind == "rebase" then
-        table.insert(lines, "error: could not apply " .. short(state.current) .. "... " .. (commit and subject_of(commit) or ""))
+        table.insert(lines, "error: could not apply " .. short(sha) .. "... " .. (commit and subject_of(commit) or ""))
         table.insert(lines, "hint: Resolve all conflicts manually, mark them as resolved with")
         table.insert(lines, 'hint: "git add <conflicted_files>", then run "git rebase --continue".')
         table.insert(lines, 'hint: You can instead skip this commit: run "git rebase --skip".')
         table.insert(lines, 'hint: To abort and get back to the state before "git rebase", run "git rebase --abort".')
     else
-        table.insert(lines, "error: could not " .. verb .. " " .. short(state.current) .. "... " .. (commit and subject_of(commit) or ""))
+        table.insert(lines, "error: could not " .. verb .. " " .. short(sha) .. "... " .. (commit and subject_of(commit) or ""))
         table.insert(lines, "hint: After resolving the conflicts, mark them with")
         table.insert(lines, 'hint: "git add <paths>", then run "git ' .. verb .. ' --continue".')
         table.insert(lines, 'hint: You can instead skip this commit with "git ' .. verb .. ' --skip".')
@@ -157,18 +226,30 @@ end
 
 local function run_sequence(state)
     while #state.todo > 0 do
-        local sha = table.remove(state.todo, 1)
-        state.current = sha
+        local step = as_step(state.kind, table.remove(state.todo, 1))
+        state.current = step
         save_state(state)
 
-        if not apply_commit(state.kind, sha, state.opts) then
+        local result = apply_step(state, step)
+        if result == "conflict" then
             save_state(state)
             error(stop_message(state), 0)
         end
 
-        table.insert(state.done, sha)
+        table.insert(state.done, step)
         state.current = nil
         save_state(state)
+
+        if result == "stop" then
+            if step.cmd == "edit" then
+                local commit = Handlers.read_commit(repo.head_sha())
+                print("Stopped at " .. short(step.sha) .. "...  " .. (commit and subject_of(commit) or ""))
+                print("You can amend the commit now, with\n\n  git commit --amend\n\nOnce you are satisfied with your changes, run\n\n  git rebase --continue")
+            else
+                print("Stopped at " .. short(repo.head_sha()) .. "... (break)\nRun 'git rebase --continue' when you're done.")
+            end
+            return
+        end
         Utilities.roYield()
     end
     finish(state)
@@ -188,30 +269,18 @@ local function continue_sequence(kind)
     end
 
     if state.current then
+        local step = as_step(kind, state.current)
         --// commit what was resolved, unless `git commit` already did
-        local index = Handlers.read_index()
-        local head_index = repo.read_last_index()
-        local changed = false
-        for path, data in pairs(index) do
-            if not head_index[path] or head_index[path].sha ~= data.sha then changed = true break end
-        end
-        if not changed then
-            for path in pairs(head_index) do
-                if not index[path] then changed = true break end
-            end
-        end
-
-        if changed and not state.opts.no_commit then
+        if changed_since_head() and not state.opts.no_commit then
             local message = repo.read_file("MERGE_MSG") or ""
             local author = repo.read_file("ROGIT_PICK_AUTHOR")
-            local tree_sha = Handlers.write_tree(index)
-            repo.create_commit(tree_sha, {repo.head_sha()}, message, {
-                author = author,
-                reflog = kind == "rebase" and "rebase (continue)" or kind,
-            })
+            commit_step(state, step, Handlers.write_tree(Handlers.read_index()), message, author)
         end
-        table.insert(state.done, state.current)
+        table.insert(state.done, step)
         state.current = nil
+    elseif changed_since_head() then
+        --// stopped by "edit"/"break" and then changed without committing: git refuses too
+        error("error: you have staged changes in your working tree.\nIf these changes are meant to be squashed into the previous commit, run:\n\n  git commit --amend\n\nThen run git rebase --continue", 0)
     end
 
     clear_step_files()
@@ -384,6 +453,7 @@ arguments.createArgument("git", "rebase", "", function(...)
     local opts = {}
     local onto_rev = nil
     local positional = {}
+    local interactive, exec_after = false, nil
 
     local i = 1
     while i <= #tuple do
@@ -399,7 +469,12 @@ arguments.createArgument("git", "rebase", "", function(...)
         elseif arg:match("^%-X(%a+)$") then
             opts.prefer = arg:match("^%-X(%a+)$")
         elseif arg == "-i" or arg == "--interactive" then
-            error("fatal: interactive rebase needs an editor, which roGit doesn't have. Use cherry-pick/reset to rewrite history by hand.", 0)
+            interactive = true
+        elseif arg == "--root" then
+            error("fatal: --root isn't supported by roGit, rebase onto a commit instead (e.g. git rebase -i <first commit>)", 0)
+        elseif (arg == "-x" or arg == "--exec") and tuple[i + 1] then
+            exec_after = tuple[i + 1]
+            i += 1
         elseif arg:sub(1, 1) ~= "-" then
             table.insert(positional, arg)
         end
@@ -459,7 +534,89 @@ arguments.createArgument("git", "rebase", "", function(...)
 
     local head_name = branch and ("refs/heads/" .. branch) or nil
 
-    if #commits == 0 then
+    hooks.run_blocking("pre-rebase", {args = {upstream_rev, branch}})
+
+    --// the todo list: picks, or whatever the user turned it into
+    local steps = {}
+    for _, sha in ipairs(commits) do
+        table.insert(steps, {cmd = "pick", sha = sha})
+        if exec_after then
+            table.insert(steps, {cmd = "exec", arg = exec_after})
+        end
+    end
+
+    if interactive then
+        if #commits == 0 then
+            steps = {}
+        end
+        local lines = {}
+        for _, step in ipairs(steps) do
+            if step.cmd == "pick" then
+                local commit = Handlers.read_commit(step.sha)
+                table.insert(lines, "pick " .. short(step.sha) .. " " .. subject_of(commit))
+            else
+                table.insert(lines, "exec " .. step.arg)
+            end
+        end
+        if #lines == 0 then table.insert(lines, "noop") end
+        local c = editor.COMMENT
+        local help = {
+            "",
+            c .. " Rebase " .. short(upstream) .. ".." .. short(head) .. " onto " .. short(onto) .. " (" .. #steps .. " command" .. (#steps == 1 and "" or "s") .. ")",
+            c,
+            c .. " Commands:",
+            c .. " p, pick <commit> = use commit",
+            c .. " r, reword <commit> = use commit, but edit the commit message",
+            c .. " e, edit <commit> = use commit, but stop for amending",
+            c .. " s, squash <commit> = use commit, but meld into previous commit",
+            c .. " f, fixup <commit> = like \"squash\" but keep only the previous commit's log message",
+            c .. " x, exec <command> = run a git command (e.g. exec git status)",
+            c .. " b, break = stop here (continue rebase later with 'git rebase --continue')",
+            c .. " d, drop <commit> = remove commit",
+            c,
+            c .. " These lines can be re-ordered; they are executed from top to bottom.",
+            c,
+            c .. " If you remove a line here THAT COMMIT WILL BE LOST.",
+            c,
+            c .. " However, if you remove everything, the rebase will be aborted.",
+        }
+        local text = editor.edit(table.concat(lines, "\n") .. "\n" .. table.concat(help, "\n") .. "\n", "git-rebase-todo")
+
+        local ALIASES = {p = "pick", r = "reword", e = "edit", s = "squash", f = "fixup", x = "exec", b = "break", d = "drop"}
+        steps = {}
+        for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+            line = line:match("^%s*(.-)%s*$")
+            if line ~= "" and line:sub(1, #c) ~= c and line:sub(1, 1) ~= "#" and line ~= "noop" then
+                local word, rest = line:match("^(%S+)%s*(.*)$")
+                local cmd = ALIASES[word] or word
+                if cmd == "exec" then
+                    table.insert(steps, {cmd = "exec", arg = rest})
+                elseif cmd == "break" then
+                    table.insert(steps, {cmd = "break"})
+                elseif cmd == "pick" or cmd == "reword" or cmd == "edit" or cmd == "squash" or cmd == "fixup" or cmd == "drop" then
+                    local ref = rest:match("^(%S+)")
+                    local sha = ref and Handlers.resolve_revision(ref)
+                    if not sha then
+                        error("error: invalid line: " .. line .. "\nYou can fix this with 'git rebase --edit-todo' after aborting... (nothing was changed)", 0)
+                    end
+                    if (cmd == "squash" or cmd == "fixup") and #steps == 0 then
+                        error("error: cannot '" .. cmd .. "' without a previous commit", 0)
+                    end
+                    if cmd ~= "drop" then
+                        table.insert(steps, {cmd = cmd, sha = sha})
+                    end
+                else
+                    error("error: invalid command '" .. tostring(word) .. "' in: " .. line, 0)
+                end
+            end
+        end
+        if #steps == 0 then
+            print("Nothing to do")
+            return
+        end
+    end
+
+    if #commits == 0 and not interactive then
         if repo.is_ancestor(onto, head) then
             print("Current branch " .. (branch or "HEAD") .. " is up to date.")
             return
@@ -472,7 +629,7 @@ arguments.createArgument("git", "rebase", "", function(...)
         return
     end
 
-    if onto == upstream and Handlers.merge_base(head, onto) == onto then
+    if not interactive and not exec_after and onto == upstream and Handlers.merge_base(head, onto) == onto then
         print("Current branch " .. (branch or "HEAD") .. " is up to date.")
         return
     end
@@ -480,7 +637,7 @@ arguments.createArgument("git", "rebase", "", function(...)
     repo.save_orig_head()
     local state = {
         kind = "rebase",
-        todo = commits,
+        todo = steps,
         done = {},
         orig_head = head,
         head_name = head_name,

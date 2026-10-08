@@ -23,6 +23,8 @@ local Remote = require(script.Parent.libs.git_remote)
 local merge = require(script.Parent.libs.merge)
 local diff = require(script.Parent.libs.diff)
 local repo = require(script.Parent.libs.repo)
+local editor = require(script.Parent.libs.editor)
+local hooks = require(script.Parent.libs.hooks)
 local output = require(script.Parent.libs.output)
 
 
@@ -98,6 +100,14 @@ arguments.onExecute = function(_, argument)
     if not READ_ONLY_COMMANDS[argument or ""] then
         instances.invalidate_terrain()
     end
+end
+
+--// hooks can run git commands and live where core.hooksPath says
+hooks.run_git = function(...)
+    return arguments.execute("git", ...)
+end
+hooks.config_path = function()
+    return repo.get_config("core.hooksPath")
 end
 
 -- Create command
@@ -472,6 +482,7 @@ local function perform_merge(target_sha, label, opts)
         Handlers.update_ref("HEAD", target_sha, "merge " .. name .. ": Fast-forward")
         repo.checkout_tree(target_commit.tree)
         print("Fast-forward")
+        hooks.notify("post-merge", {args = {"0"}})
         return true
     end
 
@@ -511,9 +522,25 @@ local function perform_merge(target_sha, label, opts)
         return true
     end
 
-    create_commit(tree_sha, {head_sha, target_sha}, message, {reflog = "merge " .. name})
+    if not opts.no_verify then
+        hooks.run_blocking("pre-merge-commit")
+    end
+    if opts.edit then
+        message = editor.message(message, {
+            "Please enter a commit message to explain why this merge is necessary,",
+            "especially if it merges an updated upstream into a topic branch.",
+            "",
+            "Lines starting with '--' will be ignored, and an empty message aborts",
+            "the commit.",
+        }, "MERGE_MSG")
+        if message == "" then
+            error("Not committing merge; use 'git commit' to complete the merge.", 0)
+        end
+    end
+    create_commit(tree_sha, {head_sha, target_sha}, message, {reflog = "merge " .. name, sign = opts.sign})
     repo.checkout_tree(tree_sha)
     print("Merge made by the 'ort' strategy.")
+    hooks.notify("post-merge", {args = {"0"}})
     return true
 end
 
@@ -559,6 +586,16 @@ arguments.createArgument("git", "merge", "", function(...)
             opts.no_commit = true
         elseif arg == "--squash" then
             opts.squash = true
+        elseif arg == "-e" or arg == "--edit" then
+            opts.edit = true
+        elseif arg == "--no-edit" then
+            opts.edit = false
+        elseif arg == "--no-verify" then
+            opts.no_verify = true
+        elseif arg == "-S" or arg == "--gpg-sign" then
+            opts.sign = true
+        elseif arg == "--no-gpg-sign" then
+            opts.sign = false
         elseif (arg == "-m" or arg == "--message") and tuple[i + 1] then
             opts.message = tuple[i + 1]
             i += 1
@@ -1150,8 +1187,11 @@ arguments.createArgument("git", "commit", "", function(...)
     local amend = false
     local stage_all = false
     local no_edit = false
+    local no_verify = false
+    local force_edit = false
     local author_override = nil
     local quiet = false
+    local sign = nil
 
     local i = 1
     while i <= #tuple do
@@ -1175,8 +1215,16 @@ arguments.createArgument("git", "commit", "", function(...)
             amend = true
         elseif arg == "--no-edit" then
             no_edit = true
+        elseif arg == "-n" or arg == "--no-verify" then
+            no_verify = true
+        elseif arg == "-e" or arg == "--edit" then
+            force_edit = true
         elseif arg == "-q" or arg == "--quiet" then
             quiet = true
+        elseif arg == "-S" or arg:match("^%-%-gpg%-sign") or arg:match("^%-S.") then
+            sign = true
+        elseif arg == "--no-gpg-sign" then
+            sign = false
         elseif arg:match("^%-%-author=") then
             author_override = arg:match("^%-%-author=(.*)$")
         elseif (arg == "-C" or arg == "--reuse-message") and tuple[i + 1] then
@@ -1203,27 +1251,26 @@ arguments.createArgument("git", "commit", "", function(...)
         error(table.concat(lines, "\n"), 0)
     end
 
+    if stage_all then
+        arguments.execute("git", "add", "-u")
+    end
+
     local merge_head = repo.read_file("MERGE_HEAD")
     local pick_author = repo.read_file("ROGIT_PICK_AUTHOR")
     local message = table.concat(messages, "\n\n")
+    local open_editor = (#messages == 0 and not no_edit) or force_edit
 
-    if message == "" then
+    --// what the editor starts with (and what --no-edit keeps)
+    local prefill = ""
+    if #messages == 0 then
         local prepared = repo.read_file("MERGE_MSG")
         if prepared then
-            message = prepared:gsub("\n#[^\n]*", ""):gsub("^#[^\n]*\n?", "")
+            prefill = prepared
+        elseif amend then
+            local old_commit = Handlers.read_commit(repo.head_sha())
+            prefill = old_commit and old_commit.message or ""
         end
-    end
-    if message == "" and amend then
-        local old_commit = Handlers.read_commit(repo.head_sha())
-        message = old_commit and old_commit.message or ""
-    end
-    if message:match("^%s*$") and not allow_empty_message then
-        error("Aborting commit due to empty commit message.\nhint: use 'git commit -m \"<message>\"' to give the commit a message.", 0)
-    end
-    local _ = no_edit
-
-    if stage_all then
-        arguments.execute("git", "add", "-u")
+        message = editor.strip(prefill)
     end
 
     local index = Handlers.read_index()
@@ -1300,6 +1347,42 @@ arguments.createArgument("git", "commit", "", function(...)
         error(table.concat(lines, "\n"), 0)
     end
 
+    if not no_verify then
+        hooks.run_blocking("pre-commit")
+        local source = merge_head and "merge" or (amend and "commit" or (#messages > 0 and "message" or ""))
+        local prepared = hooks.run_message_hook("prepare-commit-msg", #messages > 0 and message or prefill, {source})
+        if #messages > 0 then
+            message = prepared
+        else
+            prefill = prepared
+            message = editor.strip(prefill)
+        end
+    end
+
+    if open_editor then
+        local help = {
+            "Please enter the commit message for your changes. Lines starting",
+            "with '--' will be ignored, and an empty message aborts the commit.",
+            "",
+            "On branch " .. (Handlers.get_current_branch() or "HEAD (detached)"),
+            "Changes to be committed:",
+        }
+        local changed = {}
+        for _, entry in ipairs(files_added) do table.insert(changed, "\tnew file:   " .. entry.path) end
+        for _, entry in ipairs(files_modified) do table.insert(changed, "\tmodified:   " .. entry.path) end
+        for _, entry in ipairs(files_deleted) do table.insert(changed, "\tdeleted:    " .. entry.path) end
+        for _, entry in ipairs(files_renamed) do table.insert(changed, "\trenamed:    " .. entry.old_path .. " -> " .. entry.new_path) end
+        table.sort(changed)
+        for _, line in ipairs(changed) do table.insert(help, line) end
+        message = editor.message(prefill ~= "" and editor.strip(prefill) or table.concat(messages, "\n\n"), help, "COMMIT_EDITMSG")
+    end
+    if message:match("^%s*$") and not allow_empty_message then
+        error("Aborting commit due to empty commit message.", 0)
+    end
+    if not no_verify then
+        message = hooks.run_message_hook("commit-msg", message)
+    end
+
     local parent_sha = Handlers.get_ref("HEAD")
     if parent_sha == "" then parent_sha = nil end
 
@@ -1322,7 +1405,7 @@ arguments.createArgument("git", "commit", "", function(...)
     if repo.read_file("CHERRY_PICK_HEAD") then reflog = "commit (cherry-pick)" end
 
     local tree_sha = Handlers.write_tree(index)
-    local commit_sha = create_commit(tree_sha, parents, message, {author = author, reflog = reflog})
+    local commit_sha = create_commit(tree_sha, parents, message, {author = author, reflog = reflog, sign = sign})
 
     --// a concluded merge/cherry-pick/revert (a running sequence keeps its own state)
     for _, name in ipairs({"MERGE_HEAD", "MERGE_MSG", "CHERRY_PICK_HEAD", "REVERT_HEAD", "ROGIT_PICK_AUTHOR"}) do
@@ -1374,6 +1457,10 @@ arguments.createArgument("git", "commit", "", function(...)
     end
     if not quiet then
         print(final_output)
+    end
+    hooks.notify("post-commit")
+    if amend then
+        hooks.notify("post-rewrite", {args = {"amend"}})
     end
 end)
 
@@ -1956,12 +2043,15 @@ arguments.createArgument("git", "push", "", function(...)
     local push_tags = false
     local delete = false
     local dry_run = false
+    local no_verify = false
     local lease = nil
     local positional = {}
 
     for _, arg in ipairs(tuple) do
         if arg == "-n" or arg == "--dry-run" then
             dry_run = true
+        elseif arg == "--no-verify" then
+            no_verify = true
         elseif arg == "--force-with-lease" then
             lease = {}
         elseif arg:match("^%-%-force%-with%-lease=") then
@@ -2109,6 +2199,14 @@ arguments.createArgument("git", "push", "", function(...)
     if #updates == 0 then
         print("Everything up-to-date")
         return
+    end
+
+    if not no_verify then
+        local hook_updates = {}
+        for _, update in ipairs(updates) do
+            table.insert(hook_updates, {ref = update.ref, old = update.old, new = update.new, delete = update.delete == true})
+        end
+        hooks.run_blocking("pre-push", {args = {remote_name, url}, updates = hook_updates})
     end
 
     if dry_run then
@@ -2632,6 +2730,10 @@ end
 Expands a --format/--pretty placeholder string for one commit.
 ]]
 local function format_commit(fmt, sha, commit, decorations)
+    if fmt:find("%G", 1, true) then
+        fmt = fmt:gsub("%%G%?", function() return (repo.verify_signature(sha)) end)
+            :gsub("%%GK", function() return select(2, repo.verify_signature(sha)) or "" end)
+    end
     local author_name, author_email, author_time = (commit.author or ""):match("^(.-) <(.-)> (%d+)")
     local committer_name, committer_email, committer_time = (commit.committer or ""):match("^(.-) <(.-)> (%d+)")
     local subject = commit.message:match("^[^\n]*") or ""
@@ -2674,6 +2776,7 @@ arguments.createArgument("git", "log", "", function(...)
     local format = nil
     local changes = nil --// nil, "patch", "stat", "name-only", "name-status"
     local author, grep = nil, nil
+    local show_signature = false
     local specs, filters = {}, {}
     local after_dashes = false
 
@@ -2700,6 +2803,8 @@ arguments.createArgument("git", "log", "", function(...)
             changes = "name-only"
         elseif arg == "--name-status" then
             changes = "name-status"
+        elseif arg == "--show-signature" then
+            show_signature = true
         elseif arg == "--decorate" or arg == "--no-decorate" or arg == "--abbrev-commit" then
             --// always decorated
         elseif (arg == "-n" or arg == "--max-count") and tuple[i + 1] then
@@ -2817,6 +2922,13 @@ arguments.createArgument("git", "log", "", function(...)
                 output.print(prefix .. "\27[33mcommit " .. sha .. "\27[0m")
             else
                 print_commit_header(sha, commit, decorations[sha])
+            end
+            if show_signature then
+                local status = repo.verify_signature(sha)
+                if status ~= "N" then
+                    local _, text = require(script.Parent.commands.signing).describe(sha)
+                    print(pad .. text)
+                end
             end
             if graph then
                 local who, time = (commit.author or ""):match("^(.-) (%d+) [+-]%d+$")
@@ -3144,6 +3256,7 @@ arguments.createArgument("git", "tag", "", function(...)
 
     local tuple = {...}
     local annotated, delete, list = false, false, false
+    local sign_tag = nil
     local message = nil
     local force = false
     local positional = {}
@@ -3155,6 +3268,10 @@ arguments.createArgument("git", "tag", "", function(...)
             annotated = true
         elseif arg == "-d" or arg == "--delete" then
             delete = true
+        elseif arg == "-s" or arg == "--sign" then
+            annotated, sign_tag = true, true
+        elseif arg == "--no-sign" then
+            sign_tag = false
         elseif arg == "-l" or arg == "--list" then
             list = true
         elseif arg == "-f" or arg == "--force" then
@@ -3213,8 +3330,25 @@ arguments.createArgument("git", "tag", "", function(...)
 
     local ref_sha = target
     if annotated then
-        local tag_message = message or "Tag " .. name
+        local tag_message = message
+        if not tag_message then
+            tag_message = editor.message("", {
+                "Write a message for tag:",
+                "  " .. name,
+                "Lines starting with '--' will be ignored.",
+            }, "TAG_EDITMSG")
+            if tag_message == "" then
+                error("fatal: no tag message?", 0)
+            end
+        end
         local content = string.format("object %s\ntype commit\ntag %s\ntagger %s\n\n%s\n", target, name, make_signature(), tag_message)
+        if repo.wants_signature(sign_tag, "tag.gpgSign") then
+            local seed = repo.signing_seed()
+            if not seed then
+                error("error: no signing key configured\nhint: create one with 'git signing-key generate'", 0)
+            end
+            content ..= require(script.Parent.libs.sshsig).sign(seed, content)
+        end
         ref_sha = Handlers.write_object("tag", content)
     end
     Handlers.update_ref("refs/tags/" .. name, ref_sha)
@@ -3258,6 +3392,7 @@ local function switch_to(target_sha, branch, create)
         local ok, err = Remote.checkout(commit.tree)
         assert(ok, err)
     end
+    hooks.notify("post-checkout", {args = {current_sha or repo.ZERO_SHA, target_sha, "1"}})
     return true
 end
 
@@ -3869,6 +4004,8 @@ end)
 --// Commands that live in their own modules (they register themselves)
 require(script.Parent.commands.history)
 require(script.Parent.commands.inspect)
+require(script.Parent.commands.signing)
+require(script.Parent.commands.hooks)
 require(script.Parent.commands.stash)
 
 return git

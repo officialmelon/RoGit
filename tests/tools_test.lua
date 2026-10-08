@@ -198,6 +198,26 @@ check("continue after edit", ok and msg:find("Successfully rebased", 1, true))
 check("amended message kept", subject("HEAD~1") == "step 2 (amended)" and subject("HEAD") == "step 3")
 editor.provider = nil
 
+------------------------------------------------------------------ trace / activity log
+local traced = out("-c", "rogit.trace=1", "commit", "--allow-empty", "-m", "traced")
+check("trace shows commands", traced:find("built-in: git commit --allow-empty -m traced", 1, true) ~= nil)
+check("trace shows timing", traced:find("trace perf:", 1, true) ~= nil)
+check("trace kinds filter", not out("-c", "rogit.trace=http", "status"):find("trace run", 1, true))
+check("no trace by default", not out("status"):find("trace", 1, true))
+
+run("this-is-not-a-command")
+run("switch", "does-not-exist")
+local activity = out("activity", "-n", "3")
+check("activity lists recent commands", activity:find("git switch does-not-exist", 1, true) and activity:find("failed", 1, true))
+check("activity newest first", activity:find("git switch does%-not%-exist") < activity:find("git this%-is%-not%-a%-command"))
+check("activity --failed", not out("activity", "--failed"):find("  ok  ", 1, true))
+check("activity --grep", out("activity", "--grep=traced"):find("-m traced", 1, true) ~= nil)
+run("config", "rogit.activityLog", "false")
+local before = out("activity", "--all")
+run("status")
+check("activity can be turned off", out("activity", "--all") == before)
+check("activity --clear", run("activity", "--clear") and out("activity") == "No activity recorded yet.")
+
 print = realPrint
 if failures > 0 then error(failures .. " check(s) failed") end
 print("all tools checks passed")

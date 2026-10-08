@@ -26,6 +26,7 @@ local repo = require(script.Parent.libs.repo)
 local editor = require(script.Parent.libs.editor)
 local hooks = require(script.Parent.libs.hooks)
 local output = require(script.Parent.libs.output)
+local trace = require(script.Parent.libs.trace)
 
 
 local ACTIVE_PLUGIN = nil
@@ -101,6 +102,19 @@ arguments.onExecute = function(_, argument)
         instances.invalidate_terrain()
     end
 end
+
+--// rogit.trace (see libs/trace.lua)
+arguments.onRun = function(depth, command, ...)
+    if trace.enabled("run") then
+        trace.log("run", "%sbuilt-in: %s", string.rep("  ", depth), trace.command_line(command, ...))
+    end
+end
+bash.onContextChanged(function()
+    if trace.enabled("context") then
+        local context = bash.context
+        trace.log("context", "now in %s", context and (context.kind .. " '" .. tostring(context.name) .. "' (" .. context.root:GetFullName() .. ")") or "the place")
+    end
+end)
 
 --// hooks can run git commands and live where core.hooksPath says
 hooks.run_git = function(...)
@@ -179,13 +193,13 @@ arguments.createArgument("git", "help", "h", function (...)
         local cmd = args[1]
         local help_messages = {
             add = "git-add - Add file contents to the index.\n\nUsage: git add [options] [--] <pathspec>...\n\n    -n, --dry-run     dry run\n    -f, --force       allow adding otherwise ignored files",
-            commit = "git-commit - Record changes to the repository.\n\nUsage: git commit [-a] [-m <msg>] [--amend] [--allow-empty]\n\n    -m, --message <msg>   commit message\n    -a, --all             stage all changes first\n    --amend               replace the last commit",
+            commit = "git-commit - Record changes to the repository.\n\nUsage: git commit [-a] [-m <msg>] [--amend] [--allow-empty] [-S] [-n]\n\n    -m, --message <msg>   commit message (without it, a script opens in Studio to write one)\n    -a, --all             stage all changes first\n    --amend               replace the last commit\n    -e, --edit            edit the message in the editor script\n    -S, --gpg-sign        sign the commit (see git signing-key)\n    -n, --no-verify       skip the pre-commit and commit-msg hooks",
             push = "git-push - Update remote refs along with associated objects.\n\nUsage: git push [<options>] [<repository> [<refspec>...]]\n\n    -u, --set-upstream    set upstream for git pull/status\n    -f, --force           allow non-fast-forward updates\n    --all                 push all branches\n    --tags                push all tags\n    -d, --delete          delete the given remote refs",
             pull = "git-pull - Fetch from and integrate with another repository or a local branch.\n\nUsage: git pull [<options>] [<repository> [<branch>]]\n\n    --ff-only             refuse to merge, only fast-forward\n    -X ours|theirs        settle merge conflicts in favour of one side",
             status = "git-status - Show the working tree status.\n\nUsage: git status",
             branch = "git-branch - List, create, or delete branches.\n\nUsage: git branch [-a | -r] [-v]\n       git branch <branchname> [<start-point>]\n       git branch -d | -D <branchname>\n       git branch -m [<oldbranch>] <newbranch>",
             switch = "git-switch - Switch branches.\n\nUsage: git switch [<options>] <branch>\n\n    -c, --create <branch>  create and switch to a new branch\n    -d, --detach <commit>  switch to a commit in detached HEAD mode",
-            clone = "git-clone - Clone a repository into a new directory.\n\nUsage: git clone [<options>] <repository>\n\n    -b, --branch <branch>  checkout <branch> instead of the remote's HEAD\n    --single-branch        only download the history of one branch",
+            clone = "git-clone - Clone a repository into a new directory.\n\nUsage: git clone [<options>] <repository>\n\n    -b, --branch <branch>  checkout <branch> instead of the remote's HEAD\n    --single-branch        only download the history of one branch\n    --recurse-submodules   also clone the submodules",
             fetch = "git-fetch - Download objects and refs from another repository.\n\nUsage: git fetch [<repository>]",
             reset = "git-reset - Reset current HEAD to the specified state.\n\nUsage: git reset [--soft | --mixed | --hard] [<commit>]\n\n    --hard       reset HEAD, index and working tree",
             rm = "git-rm - Remove files from the working tree and from the index.\n\nUsage: git rm [-r] <file>...",
@@ -198,7 +212,7 @@ arguments.createArgument("git", "help", "h", function (...)
             init = "git-init - Create an empty Git repository or reinitialize an existing one.\n\nUsage: git init [-q | --quiet] [-b <branch-name>]",
             log = "git-log - Show commit logs.\n\nUsage: git log [--oneline] [--graph] [--all] [-n <number>] [-p | --stat | --name-status]\n               [--author=<name>] [--grep=<text>] [--format=<format>] [--reverse] [<revision range>] [-- <path>...]",
             doctor = "git-doctor - Check what roGit cannot store.\n\nUsage: git doctor [-v]\n\nScans every tracked instance and lists property types, instances and data roGit can't save.",
-            tag = "git-tag - Create, list, delete tags.\n\nUsage: git tag [-l [<pattern>]]\n       git tag [-a -m <msg>] <tagname> [<commit>]\n       git tag -d <tagname>",
+            tag = "git-tag - Create, list, delete tags.\n\nUsage: git tag [-l [<pattern>]]\n       git tag [-a | -s] [-m <msg>] <tagname> [<commit>]\n       git tag -d <tagname>\n\n    -s, --sign    make a signed tag (see git signing-key)",
             config = "git-config - Get and set repository or global options.\n\nUsage: git config [--global] <name> [<value>]",
             version = "git-version - Show the RoGit version information.\n\nUsage: git version",
             credential = "git-credential - Prompt for and cache user credentials.\n\nUsage: git credential (fill|approve|reject)",
@@ -206,7 +220,7 @@ arguments.createArgument("git", "help", "h", function (...)
             ["cherry-pick"] = "git-cherry-pick - Apply the changes introduced by some existing commits.\n\nUsage: git cherry-pick [-n] [-x] [-m <parent>] [-X ours|theirs] <commit>...\n       git cherry-pick (--continue | --skip | --abort | --quit)",
             bisect = "git-bisect - Use binary search to find the commit that introduced a bug.\n\nUsage: git bisect start [<bad> [<good>...]]\n       git bisect (bad | good | skip) [<rev>]\n       git bisect reset | log",
             revert = "git-revert - Revert some existing commits.\n\nUsage: git revert [-n] [-m <parent>] <commit>...\n       git revert (--continue | --skip | --abort | --quit)",
-            rebase = "git-rebase - Reapply commits on top of another base tip.\n\nUsage: git rebase [-X ours|theirs] [--onto <newbase>] [<upstream> [<branch>]]\n       git rebase (--continue | --skip | --abort | --quit)",
+            rebase = "git-rebase - Reapply commits on top of another base tip.\n\nUsage: git rebase [-i] [-x <git command>] [-X ours|theirs] [--onto <newbase>] [<upstream> [<branch>]]\n       git rebase (--continue | --skip | --abort | --quit)\n\n    -i, --interactive   edit the todo list (pick, reword, edit, squash, fixup, exec, break, drop) in a Studio script",
             reflog = "git-reflog - Show where HEAD (or a branch) has been.\n\nUsage: git reflog [show] [-n <number>] [<ref>]\n\nEntries can be used as revisions, e.g. git reset --hard HEAD@{1}",
             clean = "git-clean - Remove untracked instances.\n\nUsage: git clean [-n] [-f] [<path>...]",
             grep = "git-grep - Search script sources.\n\nUsage: git grep [-i] [-n] [-c] [-l] [-v] [-w] [-E] <pattern> [<rev>] [-- <path>...]\n\nPatterns are plain text; -E makes them Lua patterns.",
@@ -223,6 +237,13 @@ arguments.createArgument("git", "help", "h", function (...)
             ["symbolic-ref"] = "git-symbolic-ref - Read or change HEAD.\n\nUsage: git symbolic-ref [--short] HEAD [<ref>]",
             ["update-ref"] = "git-update-ref - Update a ref safely.\n\nUsage: git update-ref [-d] <ref> [<commit>]",
             ["count-objects"] = "git-count-objects - Count stored objects.\n\nUsage: git count-objects",
+            worktree = "git-worktree - Manage multiple working trees.\n\nUsage: git worktree add [-f] [--detach] [-b <new-branch>] <name> [<commit-ish>]\n       git worktree list [--porcelain]\n       git worktree lock [--reason <string>] <name> | unlock <name>\n       git worktree move <name> <new-name>\n       git worktree prune [-n] [-v]\n       git worktree remove [-f] <name>\n\nWorktrees are folders in ServerStorage/RoGitWorktrees. Work in one with git -C <name> <command> or 'cd <name>'.",
+            submodule = "git-submodule - Initialize, update or inspect submodules.\n\nUsage: git submodule [status] [--cached] [--recursive]\n       git submodule add [-b <branch>] [--name <name>] <repository> <path>\n       git submodule init | update [--init] [--remote] [--recursive] [-f] [<path>...]\n       git submodule deinit [-f] (--all | <path>...)\n       git submodule foreach [--recursive] <git command>\n       git submodule sync | summary | set-url <path> <url> | set-branch -b <branch> <path>\n\nA submodule is a folder holding another roGit repository, pinned to a commit. Settings are in ServerStorage/.gitmodules.",
+            hook = "git-hook - Manage hooks (ModuleScripts in .git/hooks).\n\nUsage: git hook list\n       git hook create <name>\n       git hook run <name> [-- <args>...]\n       git hook remove <name>\n\nA hook returns function(context); returning false (and a reason) stops the command.",
+            ["signing-key"] = "git-signing-key - Manage the SSH key used to sign commits and tags.\n\nUsage: git signing-key generate [--force]\n       git signing-key import [<private key>]\n       git signing-key show | remove\n\nAdd the public key on GitHub as a Signing Key to get Verified commits. The key is kept in your plugin settings.",
+            ["verify-commit"] = "git-verify-commit - Check the SSH signature of commits.\n\nUsage: git verify-commit <commit>...",
+            ["verify-tag"] = "git-verify-tag - Check the SSH signature of tags.\n\nUsage: git verify-tag <tag>...",
+            activity = "git-activity - Show the commands run in this place.\n\nUsage: git activity [-n <count> | --all] [--failed] [--author=<name>] [--grep=<text>] [--clear]\n\nTurn it off with git config rogit.activityLog false. For live tracing: git config --global rogit.trace true (or run, http, hook, context, perf).",
             checkout = "git-checkout - Switch branches or restore working tree files.\n\nUsage: git checkout [-b] <branchname>\n       git checkout <commit-or-tag>   (detached HEAD)\n       git checkout -- <pathspec>..."
         }
 
@@ -297,6 +318,11 @@ Other commands:
    init      Create an empty Git repository or reinitialize an existing one
    config    Get and set repository or global options
    doctor    Check what roGit cannot store in this place
+   worktree  Manage multiple working trees
+   submodule Initialize, update or inspect submodules
+   hook      Manage hooks
+   signing-key, verify-commit, verify-tag   Signed commits and tags
+   activity  Show the commands run in this place (see also rogit.trace)
    describe, shortlog, cat-file, ls-files, ls-tree, rev-parse, rev-list,
    merge-base, show-ref, symbolic-ref, update-ref, count-objects
 
@@ -3929,7 +3955,8 @@ arguments.createArgument("git", "config", "", function(...)
         ["user.name"] = true, ["user.email"] = true, ["user.token"] = true, ["user.password"] = true,
         ["user_name"] = true, ["user_email"] = true, ["user_token"] = true, ["user_password"] = true,
     }
-    local GLOBAL_KEYS = {"user.name", "user.email", "init.defaultBranch", "pull.rebase", "fetch.prune", "clean.requireForce"}
+    local GLOBAL_KEYS = {"user.name", "user.email", "init.defaultBranch", "pull.rebase", "fetch.prune", "clean.requireForce",
+        "commit.gpgsign", "tag.gpgSign", "core.hooksPath", "rogit.trace", "rogit.activityLog"}
 
     local function global_get(name)
         return Auth.getConfigValue((name:gsub("%.", "_"))) or Auth.getConfigValue(name)
@@ -4057,5 +4084,6 @@ require(script.Parent.commands.hooks)
 require(script.Parent.commands.stash)
 require(script.Parent.commands.worktree)
 require(script.Parent.commands.submodule)
+require(script.Parent.commands.activity)
 
 return git

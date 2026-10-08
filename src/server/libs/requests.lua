@@ -3,6 +3,7 @@ local Requests = {}
 local HttpService = game:GetService("HttpService")
 local Auth = require(script.Parent.localstore)
 local Utilities = require(script.Parent.utilities)
+local trace = require(script.Parent.trace)
 
 local prompt_callback = nil
 
@@ -26,8 +27,20 @@ end
 --[[
 Makes a request to anything that we need to.
 ]]
-function Requests.url_request_with_retry(req_options)
+local function request(req_options)
+    local started = os.clock()
+    trace.log("http", "> %s %s (%d bytes)", req_options.Method or "GET", trace.redact(req_options.Url), req_options.Body and #req_options.Body or 0)
     local ok, res = pcall(function() return HttpService:RequestAsync(req_options) end)
+    if ok then
+        trace.log("http", "< %d %s (%d bytes, %d ms)", res.StatusCode, tostring(res.StatusMessage or ""), res.Body and #res.Body or 0, (os.clock() - started) * 1000)
+    else
+        trace.log("http", "< failed: %s (%d ms)", tostring(res), (os.clock() - started) * 1000)
+    end
+    return ok, res
+end
+
+function Requests.url_request_with_retry(req_options)
+    local ok, res = request(req_options)
     if not ok then return false, res end
 
     if res.StatusCode == 401 or res.StatusCode == 404 then
@@ -67,7 +80,7 @@ function Requests.url_request_with_retry(req_options)
             req_options.Headers = req_options.Headers or {}
             req_options.Headers["Authorization"] = "Basic " .. Utilities.b64Encode(username .. ":" .. password)
             
-            ok, res = pcall(function() return HttpService:RequestAsync(req_options) end)
+            ok, res = request(req_options)
             if not ok then return false, res end
         end
     end

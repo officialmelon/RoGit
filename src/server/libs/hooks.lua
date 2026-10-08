@@ -17,6 +17,7 @@ local hooks = {}
 local bash = require(script.Parent.Parent.bash)
 local Utilities = require(script.Parent.utilities)
 local output = require(script.Parent.output)
+local trace = require(script.Parent.trace)
 
 hooks.NAMES = {
     "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit",
@@ -87,7 +88,10 @@ function hooks.run(name, context)
         return false, "the " .. name .. " hook must return a function"
     end
 
+    trace.log("hook", "running %s (%s)", name, module:GetFullName())
+    local started = os.clock()
     local ok, result, reason = pcall(fn, context)
+    trace.log("hook", "%s finished: %s (%d ms)", name, not ok and ("error: " .. tostring(result)) or (result == false and "declined" or "ok"), (os.clock() - started) * 1000)
     if not ok then
         return false, tostring(result)
     end

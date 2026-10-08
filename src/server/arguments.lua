@@ -100,6 +100,10 @@ end
 
 --// Called once before every top level command (not for commands that run other commands)
 arguments.onExecute = nil
+--// Called before every command, nested ones included: (depth, command, ...)
+arguments.onRun = nil
+--// Called when a command finished, nested ones included: (depth, ok, error, seconds, command, ...)
+arguments.onFinish = nil
 local depth = 0
 
 --[[
@@ -111,9 +115,16 @@ function arguments.execute(command, argument, ...)
     if depth == 0 and arguments.onExecute then
         arguments.onExecute(command, argument)
     end
+    if arguments.onRun then
+        arguments.onRun(depth, command, argument, ...)
+    end
+    local started = os.clock()
     depth += 1
     local results = table.pack(pcall(arguments.executeInner, command, argument, ...))
     depth -= 1
+    if arguments.onFinish then
+        pcall(arguments.onFinish, depth, results[1], results[2], os.clock() - started, command, argument, ...)
+    end
     if not results[1] then
         error(results[2], 0)
     end

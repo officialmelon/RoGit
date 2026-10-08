@@ -38,6 +38,8 @@ We have implemented a console to give the user a native git feel if they are adv
 
 - [x] Improve speeds
 
+- [x] Editor, hooks, signed commits, worktrees, submodules, activity log and tracing
+
 ## Features & Supported Commands
 
 `roGit` aims to behave like git, adapted for the Roblox `Instance` tree (every instance is a "file").
@@ -49,7 +51,7 @@ Run `git help` for the list, `git <command> --help` for the options of one comma
 **Day to day**
 - `git status [-s] [-b] [--porcelain]` - staged, unstaged, untracked and unmerged instances, ahead/behind your upstream, merges/rebases in progress.
 - `git add [-u] [-A] [-n] <path>`, `git rm [-r] [--cached] [-f]`, `git mv`, `git restore [--staged] [--source=<rev>]`, `git clean [-n] [-f]`.
-- `git commit [-m] [-a] [--amend] [--no-edit] [--allow-empty] [--author=] [-C <commit>]`.
+- `git commit [-m] [-a] [--amend] [--no-edit] [-e] [--allow-empty] [--author=] [-C <commit>] [-S] [-n]` - without `-m` the message is written in a Studio script (see [The editor](#the-editor)).
 - `git diff [--cached] [<commit>] [<a> <b> | <a>..<b> | <a>...<b>] [--stat | --name-only | --name-status] [-- <path>]` - every changed property, and a line diff for scripts.
 - `git stash [push -u -m] | list | show [-p] | pop | apply | drop | clear | branch`.
 
@@ -62,8 +64,10 @@ Run `git help` for the list, `git <command> --help` for the options of one comma
 - `git branch [-a] [-r] [-v] [-vv] [-d/-D] [-m] [-c] [-u <upstream>] [--merged] [--no-merged] [--contains]`.
 - `git switch [-c] [--detach] [-] <branch>`, `git checkout [-b] <branch> | <commit> | [<rev>] -- <path>`.
 - `git merge [--no-ff] [--ff-only] [--squash] [--no-commit] [-X ours|theirs] [--abort | --continue]`.
-- `git rebase [--onto] <upstream>`, `git cherry-pick [-x] [-n] <commits>`, `git revert <commits>` - all with `--continue`, `--skip`, `--abort`.
-- `git reset [--soft | --mixed | --hard] [<commit>] [-- <path>]`, `git tag [-a] [-m] [-d] [-l]`, `git bisect`.
+- `git rebase [-i] [-x <cmd>] [--onto] <upstream>`, `git cherry-pick [-x] [-n] <commits>`, `git revert <commits>` - all with `--continue`, `--skip`, `--abort`.
+  `rebase -i` supports `pick`, `reword`, `edit`, `squash`, `fixup`, `exec`, `break` and `drop`.
+- `git reset [--soft | --mixed | --hard] [<commit>] [-- <path>]`, `git tag [-a] [-s] [-m] [-d] [-l]`, `git bisect`.
+- `git worktree add | list | remove | prune | lock | unlock | move`, `git submodule add | status | init | update | deinit | foreach | sync | summary`.
 
 **Remotes**
 - `git fetch [--all] [--prune]`, `git pull [--rebase] [--ff-only]`, `git push [-u] [-f] [--force-with-lease] [--all] [--tags] [--delete] [-n] [src:dst]`, `git remote add | remove | rename | set-url | get-url | show | prune`.
@@ -71,6 +75,15 @@ Run `git help` for the list, `git <command> --help` for the options of one comma
 
 **Plumbing**
 - `git cat-file`, `ls-files`, `ls-tree`, `rev-parse`, `rev-list`, `merge-base`, `show-ref`, `symbolic-ref`, `update-ref`, `count-objects`, `git config [--global] [--list] [--get] [--unset]`.
+
+**Global options**
+- `git -C <worktree | submodule> <command>` runs a command in another worktree or a submodule (`cd <name>` does the same for every command in the terminal, `cd` alone goes back).
+- `git -c <name>=<value> <command>` sets a config value for one command.
+
+**Signing, hooks and logs**
+- `git signing-key generate | import | show | remove`, `git verify-commit`, `git verify-tag`, `git log --show-signature`, `%G?` / `%GK` in `--format`.
+- `git hook list | create | run | remove`.
+- `git activity` (what was run in this place, by whom, and whether it worked), `rogit.trace` for live tracing.
 
 **roGit specific**
 - `git doctor` - scans your place and lists everything roGit can't store.
@@ -101,12 +114,98 @@ other instances keep your version, and `git status` lists the unmerged paths. Fi
 (or `git rebase --continue`, `git cherry-pick --continue`, ...). `git merge --abort` (and friends) puts everything back.
 `-X ours` / `-X theirs` settles conflicts automatically.
 
+### The editor
+
+Commands that open an editor in git (`git commit` without `-m`, `git merge -e`, `git tag -a` without `-m`, `git rebase -i`,
+`git signing-key import`) open a temporary script in Studio instead. Lines starting with `--` are comments and are dropped,
+like `#` lines in git. Write the message (or edit the rebase todo list), then **close the script tab** to continue.
+An empty message aborts the commit, like git.
+
+### Hooks
+
+Hooks are `ModuleScript`s in `ServerStorage/.git/hooks` (or the folder `core.hooksPath` names) that return a function:
+
+```lua
+-- ServerStorage/.git/hooks/commit-msg
+return function(context)
+    -- context.name, context.args, and context.git(...) to run git commands
+    if not context.message:match("^%u") then
+        return false, "start the commit message with a capital letter" -- stops the commit
+    end
+    return true
+end
+```
+
+`git hook create pre-commit` makes one from a template and opens it. Supported: `pre-commit`, `prepare-commit-msg`, `commit-msg`
+(return a string to change the message), `post-commit`, `pre-merge-commit`, `post-merge`, `pre-rebase`, `post-rewrite`,
+`post-checkout` and `pre-push` (`context.updates` lists the refs). `--no-verify` skips them. Hooks live in the place, so
+everyone in Team Create runs the same ones.
+
+### Signed commits
+
+roGit signs commits and tags with SSH keys (ed25519), the same format as `git config gpg.format ssh`, so GitHub and GitLab
+show them as **Verified**:
+
+```
+git signing-key generate                 # prints the public key
+git config --global commit.gpgsign true  # sign every commit (or use git commit -S, git tag -s)
+```
+
+Add the printed public key on GitHub under *Settings > SSH and GPG keys > New SSH key*, with *Key type: Signing Key*, and make sure
+`git config --global user.email` is an email of that account. `git signing-key import` uses an existing unencrypted OpenSSH ed25519 key
+instead. The private key is kept in your plugin settings, never inside the place. Check signatures with `git verify-commit`,
+`git verify-tag` or `git log --show-signature`.
+
+### Worktrees
+
+```
+git worktree add hotfix              # new branch "hotfix", checked out into ServerStorage/RoGitWorktrees/hotfix
+git -C hotfix status                 # or: cd hotfix, then plain git commands
+git -C hotfix commit -am "Fix spawn"
+git merge hotfix                     # back in the place
+git worktree remove hotfix
+```
+
+A worktree is a folder holding a copy of the services (`Workspace`, `ReplicatedStorage`, ...) at another commit, so you can look at
+or fix another branch without touching the place. It has its own `HEAD`, index and merge/rebase state; branches, tags, config and
+objects are shared. A branch can only be checked out in one worktree at a time. Worktree folders are never tracked by the place.
+Service properties (like `Lighting.ClockTime`) are kept as they are in a worktree, since the folders aren't real services.
+
+### Submodules
+
+```
+git submodule add https://github.com/you/your-lib.git ReplicatedStorage/Packages/YourLib
+git commit -m "Add YourLib"
+git submodule update --remote        # move to the library's newest commit
+git submodule update --init          # after cloning a place that has submodules (or: git clone --recurse-submodules)
+```
+
+A submodule is a folder holding another roGit repository, pinned to a commit. The place's tree records just that commit (a real
+git "gitlink", mode `160000`, so it shows as a submodule on GitHub too). The library's contents go inside the folder:
+its `ReplicatedStorage/Lib` becomes `ReplicatedStorage/Packages/YourLib/ReplicatedStorage/Lib`. Its repository lives in
+`.git/modules/<name>`, and the settings in `ServerStorage/.gitmodules`. Use `git -C <path> <command>` or
+`git submodule foreach <command>` to work inside it. Submodules must be roGit repositories.
+
+### Logs and tracing
+
+- `git activity` shows the last commands run in the place: when, by whom, how long they took and the error if they failed
+  (`--failed`, `--author=`, `--grep=`, `-n`, `--clear`). It is kept in `.git/logs/activity` (the last 500 commands), so Team Create
+  collaborators see each other's commands. `git config rogit.activityLog false` turns it off.
+- `git config --global rogit.trace true` (or `git -c rogit.trace=1 <command>` once) prints what roGit is doing, like `GIT_TRACE`:
+  every command (including ones run by other commands and hooks), every HTTP request with its status, size and time, hooks,
+  worktree/submodule switches and timings. `rogit.trace` can also be a list of kinds: `run`, `http`, `hook`, `context`, `perf`.
+- `git reflog` still records where `HEAD` and each branch have been.
+
 ### Differences from git
 
-- There is no editor: commands that would open one need `-m` (and interactive rebase isn't available).
+- **No SSH transport.** Roblox plugins can only make HTTP(S) requests (`HttpService`); there are no raw sockets, so the SSH
+  protocol can't be spoken. SSH URLs (`git@github.com:user/repo.git`) are converted to HTTPS, use a personal access token to
+  authenticate. (SSH *keys* are supported for signing, see above.)
+- The editor is a Studio script you close when done, instead of `$EDITOR`.
+- Hooks are Luau ModuleScripts instead of shell scripts; `exec` in `rebase -i` and `submodule foreach` run git commands, not shell commands.
 - `git grep` patterns are plain text (`-E` switches to Lua patterns, not regular expressions).
-- Only the smart HTTP(S) protocol is supported; SSH URLs are converted to HTTPS.
-- Submodules, worktrees, hooks, sparse checkout and signed commits aren't supported.
+- Worktrees live in `ServerStorage/RoGitWorktrees`; submodules must be roGit repositories.
+- Sparse checkout, LFS, GPG/X.509 signing and the dumb HTTP protocol aren't supported.
 
 ---
 
@@ -151,7 +250,10 @@ The plugin is plain Luau and builds with [Rojo](https://rojo.space) (`rojo build
 `tests/` contains a small Roblox mock so the real command code can be exercised outside Studio with the [Luau CLI](https://github.com/luau-lang/luau):
 
 ```
-for t in merge workflow serialize history parity; do
+for t in merge workflow serialize history parity tools worktree; do
   python3 tests/build.py tests/${t}_test.lua && luau tests/_run.lua
 done
 ```
+
+`tests/verify_signature.py` checks roGit's commit signatures independently (with Python's `cryptography`):
+`luau tests/_run.lua > out.txt` after building `tools_test.lua`, then `python3 tests/verify_signature.py out.txt`.
